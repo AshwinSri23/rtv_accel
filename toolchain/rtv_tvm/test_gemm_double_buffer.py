@@ -40,7 +40,7 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
-from npu_compiler import NPUCompiler, DType, _padded  # noqa: E402
+from compiler_state import NPUCompiler, DType, _padded  # noqa: E402
 import tvm_backend                                     # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(_HERE))

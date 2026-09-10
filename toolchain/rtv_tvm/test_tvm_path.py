@@ -31,7 +31,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
 from tvm.script import tirx as T                      # noqa: E402
-from npu_compiler import NPUCompiler, SRAMMap         # noqa: E402
+from compiler_state import NPUCompiler, SRAMMap         # noqa: E402
 from rtv_tvm.schedule import (schedule_matmul, schedule_elemwise,  # noqa: E402
                               schedule_mul, schedule_sumsq,
                               schedule_rms_scale, schedule_rowmax,
