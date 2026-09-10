@@ -151,7 +151,17 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
     all_ids = list(prompt_ids)
     next_input_id = None
     with tempfile.TemporaryDirectory(prefix="rtv_generate_state_") as wd:
-        cur_path = os.path.join(wd, "step_-1.img")
+        # ONE state file, overwritten in place every step -- not a fresh
+        # step_N.img per step. Safe because rtv_sim fully reads --dram-image
+        # into its own in-memory buffer (and closes the file) BEFORE it
+        # writes any --dump output, so the same path can be both input and
+        # output. This matters at real scale: Qwen3-0.6B's DRAM image is
+        # ~1.7+ GB, and a fresh copy per step exhausted a 16 GB tmpfs /tmp
+        # by step 5 of a real run (confirmed directly hitting this) --
+        # accumulating one such file per generated token doesn't stay
+        # small just because test_decode_loop.py's tiny random-weight
+        # configs never grew large enough to reveal it.
+        cur_path = os.path.join(wd, "state.img")
         open(cur_path, "wb").write(bytes(dram))
 
         for pos in range(total_steps):
@@ -180,12 +190,10 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                 step_dram[addr:addr + len(data)] = data
             open(cur_path, "wb").write(bytes(step_dram))
 
-            next_path = os.path.join(wd, f"step_{pos}.img")
             (out_raw,) = _run_sim(
-                sim, hal, comp.instruction_stream, cur_path, next_path,
+                sim, hal, comp.instruction_stream, cur_path, cur_path,
                 extra_dumps=[(final_addr, M * hidden * 4, "out")],
             )
-            cur_path = next_path
 
             if pos >= P - 1:
                 hidden_row = np.frombuffer(out_raw, dtype=np.float32).reshape(
