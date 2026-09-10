@@ -1,0 +1,134 @@
+Week 1: Memory Controller Implementation Guide
+==============================================
+
+FILES TO CREATE
+---------------
+  inc/memory_controller.hpp   (already done)
+  src/memory_controller.cpp   (yours to implement)
+  tests/memory_controller_test.cpp
+
+Add both to CMakeLists.txt the same way rtv_decoder and rtv_dispatcher are structured.
+
+
+THE DATA MODEL
+--------------
+Two buffers:
+
+  DRAM — a std::vector<uint8_t>. The caller sizes it at startup via resize_dram(n_bytes).
+  This is just host RAM pretending to be DRAM. The Pi 5 has 4-8 GB so you can easily
+  allocate 700 MB for Qwen3-0.6B's weights. Writes to it are done by the weight loader;
+  reads are done by load_tile.
+
+  SRAM — a fixed std::array<uint8_t, 65536> (64 KiB, matches hal_config.json).
+  Zero-initialised on construction. The PE array will read and write this directly,
+  so expose a uint8_t* sram_ptr(uint16_t offset) accessor.
+
+
+THE INTERFACE — FOUR THINGS TO IMPLEMENT
+-----------------------------------------
+  load_tile(dram_addr, sram_addr, rows, cols, stride)
+  store_tile(sram_addr, dram_addr, rows, cols, stride)
+  sram_ptr(offset)
+  cycle_count()
+
+
+THE SUBTLE PART: WHAT stride MEANS
+------------------------------------
+When a weight matrix lives in DRAM it is stored row-major. A 1024-column matrix has
+its rows laid out contiguously — each row is 1024 bytes wide. When you load a 16x16
+tile from somewhere in the middle of that matrix, you want 16 rows of 16 bytes each,
+but in DRAM those 16 bytes are followed by 1008 bytes of other data before the next
+row starts.
+
+So load_tile is NOT a single memcpy. It is a loop:
+
+  for each of the 16 rows:
+      memcpy(sram + sram_addr + row * 16,
+             dram + dram_addr + row * stride,
+             16 bytes)
+
+The stride value in the instruction is the byte distance between the start of one row
+and the start of the next row in DRAM. For a 1024-column INT8 matrix that is 1024.
+For a 576-column matrix it is 576. After the JIT swizzler is applied in Week 4, blocks
+become contiguous so stride becomes 16 — but the load_tile code does not need to change.
+
+store_tile is the same loop in reverse.
+
+
+CYCLE COUNTER
+-------------
+The cycle model is just addition — no threading, no sleeping:
+
+  Each load_tile call:  add 120 + (rows * cols) to the uint64_t _cycles member.
+                        120 is the DRAM latency from hal_config.json;
+                        rows*cols approximates bus transfer time at one cycle per byte.
+  Each store_tile call: same.
+  SRAM-only operations: add 1 per call, or skip — doesn't matter much at this stage.
+
+This gives you a free running cycle estimate you can print at the end of a benchmark run.
+
+
+WRITING THE TEST — THE IMPORTANT ONE
+--------------------------------------
+The most valuable test is a cross-check against Python.
+
+  1. In Python, build a small known matrix (e.g. 32x32, values = range(1024) reshaped).
+  2. Manually compute what a load_tile of the top-left 16x16 block should produce in
+     SRAM — just slice matrix[0:16, 0:16] and flatten row-major.
+  3. In the C++ test, write those same 1024 bytes into the DRAM buffer at address 0,
+     then call load_tile(0, 0, 16, 16, 32)  (stride=32 because the matrix is 32 cols wide).
+  4. Check that sram_ptr(0) matches the expected bytes exactly.
+
+Do the same for a tile that is NOT at the top-left — e.g. the tile starting at row 16,
+col 16 — to verify the stride arithmetic is correct for non-zero offsets. That is where
+off-by-one errors in the row loop tend to hide.
+
+
+THINGS TO WATCH FOR
+--------------------
+  Bounds checking: load_tile should throw std::out_of_range if
+    dram_addr + (rows-1)*stride + cols  exceeds _dram.size(), or if
+    sram_addr + rows*cols               exceeds 65536.
+  Catching this early prevents silent corruption later.
+
+  SRAM zones: nothing enforces zone boundaries in hardware — the MemoryController
+  doesn't need to either. But your tests should use the SRAMMap constants
+  (0x0000, 0x0400, 0x0800) as addresses so the conventions are established from the start.
+
+  No copying the HAL config into the class: take dram_latency_cycles as a constructor
+  parameter rather than re-reading the JSON. The compiler already owns the config.
+
+
+HEADER DESIGN DECISIONS (inc/memory_controller.hpp)
+-----------------------------------------------------
+  resize_dram + write_dram / read_dram — separate management from transfer.
+  The weight loader calls write_dram to fill DRAM before the simulator runs;
+  load_tile / store_tile are only called during instruction dispatch.
+
+  stride on both tile functions — same parameter name and meaning in both directions
+  so the asymmetry doesn't surprise you. On store_tile it means: byte distance between
+  destination rows in DRAM.
+
+  sram_ptr with both const and non-const overloads — the PE array needs mutable access
+  to write outputs; a future inspector or test that only reads can use the const version
+  without casting.
+
+  SRAM_BYTES as a file-scope static constexpr — lets your test file use it for bounds
+  arithmetic without needing to instantiate a MemoryController.
+
+  _sram{} member initializer — zero-initialises the array at construction with no extra
+  work needed in your .cpp.
+
+  _dram_latency as a constructor parameter — keeps the HAL config values outside the
+  class. Pass json["dram_latency_cycles"] when you later instantiate it from the simulator.
+
+
+DEFINITION OF DONE FOR WEEK 1
+-------------------------------
+  - load_tile and store_tile pass the cross-check tests for at least three cases:
+      top-left tile, mid-matrix tile, and a tile at the SRAM Output zone address.
+  - cycle_count() returns a non-zero value after any tile operation.
+  - An intentionally out-of-bounds load_tile throws rather than corrupting memory.
+
+Once those pass you have a solid foundation for Week 2's PE array, which will call
+sram_ptr() to read its inputs and write its outputs.
