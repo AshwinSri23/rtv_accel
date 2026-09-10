@@ -47,7 +47,8 @@ import struct
 # ── Opcodes ───────────────────────────────────────────────────────────────────
 
 class Opcode(IntEnum):
-    # Values match NPUOpcodes in npu_compiler.py and Decoder::Opcode in decoder.hpp.
+    # Values match Decoder::Opcode in decoder.hpp (and compiler_state.py's
+    # NPUOpcodes alias, kept identical on purpose).
     # 0x0 is reserved / unassigned.
     LOAD_TILE    = 0x1   # DMA: DRAM → SRAM
     STORE_TILE   = 0x2   # DMA: SRAM → DRAM

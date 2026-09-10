@@ -11,9 +11,9 @@ add_library(rtv_decoder STATIC src/decoder.cpp)
 target_include_directories(rtv_decoder PUBLIC inc)
 
 # ─── Dispatcher static library ────────────────────────────────────────────────
-# Reads binary payloads produced by toolchain/npu_compiler.py,
-# byte-swaps from big-endian to native, and routes decoded instructions
-# to registered per-opcode handlers via InstructionDispatcher.
+# Reads binary payloads produced by the compiler (see the "Compiler" section
+# below), byte-swaps from big-endian to native, and routes decoded
+# instructions to registered per-opcode handlers via InstructionDispatcher.
 
 add_library(rtv_dispatcher STATIC src/instruction_dispatcher.cpp)
 target_include_directories(rtv_dispatcher PUBLIC inc)
@@ -77,15 +77,20 @@ target_link_libraries(pe_array_test PRIVATE rtv_pe rtv_memory)
 add_test(NAME pe_array_test COMMAND pe_array_test)
 
 # ─── Compiler ────────────────────────────────────────────────────────────────
-# The compiler is toolchain/npu_compiler.py. A C++ frontend (SLMAllocator,
-# ir.hpp, Emitter, compiler.cpp, compiler_main) was built here in parallel and
-# has been removed: it duplicated the Python compiler's job while lagging it in
-# capability, and having two lowering paths meant every ISA change had to be
-# made twice. The Python compiler is the single source of truth for lowering;
-# what remains in C++ is the ISA and the simulator that executes it.
-#
-# The e2e_test target below is the compiler's test suite -- it drives
-# npu_compiler.py, runs the result on rtv_sim, and checks it against numpy.
+# The compiler is the TVM path (toolchain/tvm_backend.py, composing
+# toolchain/rtv_tvm/{patterns,schedule,codegen,intrin}.py): a Relax graph is
+# pattern-matched, scheduled and tensorized against this ISA's intrinsics,
+# then walked straight to instructions -- TVM owns addressing, this project
+# owns only the ISA and the simulator that executes it. A hand-written
+# Python compiler (npu_compiler.py) and, earlier still, a C++ frontend
+# (SLMAllocator, ir.hpp, Emitter, compiler.cpp, compiler_main) both preceded
+# this and have been removed in turn, each for the same reason: a second
+# lowering path meant every ISA change had to be made twice, and TVM's typed
+# IR computes the addressing arithmetic that produced several of this
+# project's bugs when done by hand. toolchain/compiler_state.py carries what
+# both the old and new paths needed regardless of which was doing the
+# lowering (HAL config loading, the DRAM staging allocator, RoPE's host-side
+# table math) -- not a compiler itself, just shared device/runtime state.
 
 # ─── Top-level simulator ──────────────────────────────────────────────────────
 
@@ -93,49 +98,40 @@ add_executable(rtv_sim src/simulator.cpp)
 target_include_directories(rtv_sim PRIVATE inc)
 target_link_libraries(rtv_sim PRIVATE rtv_dispatcher rtv_pe rtv_memory)
 
-# ─── End-to-end numeric verification ──────────────────────────────────────────
-# Compiles operations with toolchain/npu_compiler.py, executes them on rtv_sim
-# against a real DRAM image, and compares the stored result to a numpy
-# reference. This is the loop the Python compiler previously lacked -- every
-# correctness bug found by hand-auditing it produces visibly wrong numbers
-# here on the first run. Needs python3 + numpy; skipped if absent.
-
 # ─── TVM compilation path ─────────────────────────────────────────────────────
-# The Version-B pipeline: a matmul in TVM's TIR, scheduled and tensorized
-# against the rtv.gemm_16x16 intrinsic, lowered to instructions by
-# toolchain/rtv_tvm/codegen.py, executed on rtv_sim and checked against numpy.
+# Each test below compiles operations through the TVM path (TIR scheduled
+# and tensorized against this ISA's intrinsics, lowered to instructions by
+# toolchain/rtv_tvm/codegen.py), executes them on rtv_sim against a real
+# DRAM image, and compares the result to a numpy reference -- the loop that
+# makes a lowering bug visible as a wrong number on the very first run.
 #
 # Needs TVM, which lives in its own venv because the wheel's API differs
-# substantially from the system Python's other packages. Registered only when
-# that venv exists, so a checkout without it still configures and tests
-# cleanly -- the TVM path is additive and nothing else depends on it.
+# substantially from the system Python's other packages. Registered only
+# when that venv exists, so a checkout without it still configures and
+# tests cleanly -- the TVM path is additive and nothing else depends on it.
 
 set(RTV_TVM_PY ${CMAKE_CURRENT_SOURCE_DIR}/.venv-tvm/bin/python)
 if(EXISTS ${RTV_TVM_PY})
-    add_test(NAME tvm_path
-             COMMAND ${RTV_TVM_PY}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/rtv_tvm/test_tvm_path.py)
-    message(STATUS "tvm_path test enabled (.venv-tvm)")
+    set(RTV_TVM_TESTS
+        test_tvm_path            # 11 hardware intrinsics, INT8 and FP32
+        test_composite_dispatch  # BYOC pattern -> composite -> emit_composite
+        e2e_migrated             # e2e_test.py's FP32 cases, re-verified here
+        test_gqa_attention       # multi-head / GQA, one real query replicated
+        test_gemm_double_buffer  # K-tile double buffering, real cycle-count win
+        test_attention_multitile # seq_k/head_dim spanning >1 tile
+        test_transformer_layer   # full layer(s), ping-ponged DRAM buffers
+        test_dram_builder        # build_model_dram_image/finalize_dram_image
+        test_rope_attention      # RoPE wired into the attention block
+        test_swiglu_resident     # SwiGLU intermediates kept resident in SRAM
+        test_attention_batched   # genuinely different rows, real per-row softmax
+        test_kv_cache            # growing multi-tile KV-cache, append + tail mask
+    )
+    foreach(RTV_TVM_TEST ${RTV_TVM_TESTS})
+        add_test(NAME ${RTV_TVM_TEST}
+                 COMMAND ${RTV_TVM_PY}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/rtv_tvm/${RTV_TVM_TEST}.py)
+    endforeach()
+    message(STATUS "TVM path tests enabled (.venv-tvm): ${RTV_TVM_TESTS}")
 else()
-    message(STATUS "tvm_path test skipped: .venv-tvm not present")
-endif()
-
-find_program(RTV_PYTHON3 python3)
-if(RTV_PYTHON3)
-    execute_process(
-        COMMAND ${RTV_PYTHON3} -c "import numpy"
-        RESULT_VARIABLE RTV_NUMPY_CHECK
-        OUTPUT_QUIET ERROR_QUIET)
-    if(RTV_NUMPY_CHECK EQUAL 0)
-        add_test(NAME e2e_test
-                 COMMAND ${RTV_PYTHON3}
-                         ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/e2e_test.py
-                         --sim $<TARGET_FILE:rtv_sim>
-                         --hal ${CMAKE_CURRENT_SOURCE_DIR}/toolchain/hal_config.json)
-        message(STATUS "e2e_test enabled (${RTV_PYTHON3})")
-    else()
-        message(STATUS "e2e_test skipped: numpy not available for ${RTV_PYTHON3}")
-    endif()
-else()
-    message(STATUS "e2e_test skipped: python3 not found")
+    message(STATUS "TVM path tests skipped: .venv-tvm not present")
 endif()

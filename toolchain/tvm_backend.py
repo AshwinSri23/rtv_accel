@@ -20,8 +20,9 @@ anywhere), so the reason to keep `npu_compiler.py` in the loop is gone.
 `emit_composite` below now composes `rtv_tvm.schedule`/`codegen` primitives
 directly against the FP32 `TensorIntrin`s in `rtv_tvm.intrin` -- TVM owns
 addressing AND instruction emission, `npu_compiler.py` is not called at all.
-(`offloaded_matmuls`/`emit` below still delegate to `NPUCompiler.compile_linear`
-for the standalone-matmul path; not yet migrated to the same scheme.)
+`offloaded_matmuls`/`emit` below (the original, matmul-only BYOC path,
+predating `emit_composite`) follow the same scheme now too -- `npu_compiler.py`
+is not imported or called anywhere in this module.
 
 Design. This is deliberately NOT a `RunCodegen` backend producing a TVM
 runtime module -- that needs a C++ runtime and would make TVM own execution,
@@ -50,7 +51,7 @@ from tvm.relax.dpl import pattern as dpl            # noqa: E402
 from tvm.relax.backend.pattern_registry import register_patterns  # noqa: E402
 from tvm.script import tirx as T                    # noqa: E402
 
-from npu_compiler import NPUCompiler, DType, SRAMMap, _padded, _align   # noqa: E402
+from compiler_state import NPUCompiler, DType, SRAMMap, _padded, _align   # noqa: E402
 
 from rtv_tvm import patterns, schedule, codegen, intrin
 from rtv_isa import DType, Opcode, ActivationMode, encode
@@ -126,35 +127,41 @@ def offloaded_matmuls(mod):
 
 
 def emit(shapes, compiler, addrs):
-    """Emit RTV-Accel instructions for each offloaded matmul."""
+    """Emit RTV-Accel instructions for each offloaded matmul, entirely via
+    TVM schedule+codegen -- NPUCompiler.compile_linear is NOT called.
+
+    Used to delegate to compile_linear whenever the compiler object had
+    one (i.e. always, for a real NPUCompiler); the direct-TVM branch below
+    was dead code for real usage, kept only as a fallback for a mock
+    compiler lacking that method. Once npu_compiler.py's FP32 scale
+    semantics stopped being the reason to keep it in the loop (see the
+    module docstring's precision note), that fallback became the only
+    path worth having -- emit_composite's "matmul" dispatch (_emit_matmul_
+    fp32) already covers this exact case with zero npu_compiler.py
+    involvement, so this now does the same for FP32. INT8 keeps its own
+    inline PrimFunc (never delegated to compile_linear even before this
+    change's `else` branch existed) -- moot in practice post the FP32-only
+    pivot, but harmless to leave in place rather than special-case away.
+    """
     for (m, k, n, dtype) in shapes:
-        if hasattr(compiler, "compile_linear"):
-            compiler.compile_linear(
-                dram_weight=addrs["w"], m=m, n=n, k=k,
-                out_dram=addrs["out"], dram_activation=addrs["x"],
-                dtype=DType.FP32 if dtype == "float32" else DType.INT8,
-            )
-        else:
-            # Direct TVM schedule & codegen emission
-            from tvm.script import tirx as T
-            @T.prim_func(s_tir=True)
-            def matmul_prim(a: T.handle, b: T.handle, c: T.handle) -> None:
-                A = T.match_buffer(a, (m, k), "float32" if dtype == "float32" else "int8")
-                B = T.match_buffer(b, (k, n), "float32" if dtype == "float32" else "int8")
-                C = T.match_buffer(c, (m, n), "float32" if dtype == "float32" else "int32")
-                for i, j, k_idx in T.grid(m, n, k):
-                    with T.sblock("update"):
-                        vi, vj, vk = T.axis.remap("SSR", [i, j, k_idx])
-                        with T.init():
-                            C[vi, vj] = 0
-                        C[vi, vj] = C[vi, vj] + T.Cast(
-                            "float32" if dtype == "float32" else "int32", A[vi, vk]
-                        ) * T.Cast(
-                            "float32" if dtype == "float32" else "int32", B[vk, vj]
-                        )
-            sch = schedule.schedule_matmul(matmul_prim)
-            dram_map = {"A": addrs["x"], "B": addrs["w"], "C": addrs["out"]}
-            codegen.emit(compiler, sch, dram_map, dtype=DType.FP32 if dtype == "float32" else DType.INT8)
+        if dtype == "float32":
+            _emit_matmul_fp32(compiler, m, n, k, addrs["x"], addrs["w"], addrs["out"])
+            continue
+        from tvm.script import tirx as T
+        @T.prim_func(s_tir=True)
+        def matmul_prim(a: T.handle, b: T.handle, c: T.handle) -> None:
+            A = T.match_buffer(a, (m, k), "int8")
+            B = T.match_buffer(b, (k, n), "int8")
+            C = T.match_buffer(c, (m, n), "int32")
+            for i, j, k_idx in T.grid(m, n, k):
+                with T.sblock("update"):
+                    vi, vj, vk = T.axis.remap("SSR", [i, j, k_idx])
+                    with T.init():
+                        C[vi, vj] = 0
+                    C[vi, vj] = C[vi, vj] + T.Cast("int32", A[vi, vk]) * T.Cast("int32", B[vk, vj])
+        sch = schedule.schedule_matmul(matmul_prim)
+        dram_map = {"A": addrs["x"], "B": addrs["w"], "C": addrs["out"]}
+        codegen.emit(compiler, sch, dram_map, dtype=DType.INT8)
 
 
 # ── Generalized composite dispatch ────────────────────────────────────────────
@@ -1940,19 +1947,20 @@ def emit_composite(compiler, info, addrs):
       below). Multi-head/GQA IS implemented (_emit_gqa_attention_fp32,
       including seq_k/head_dim spanning multiple tiles), but as a SEPARATE
       directly-callable entry point, not reachable through pattern
-      inference -- see that function's docstring for why. RoPE and
-      KV-cache are still not implemented at all (no position information
-      anywhere in this path yet).
+      inference -- see that function's docstring for why. RoPE
+      (_emit_rope_fp32/_emit_rope_batched_fp32) and a real KV-cache
+      (_emit_kv_cache_append_fp32/_emit_kv_cache_tail_mask_fp32) are both
+      implemented too, same status: directly-callable, not pattern-matched.
 
     * "matmul" -- a standalone matmul composite, via _emit_matmul_fp32
       directly (same primitive attention's own Q@K and P@V steps use).
       NOTE this is a SEPARATE path from offloaded_matmuls()/emit() above,
-      which still calls NPUCompiler.compile_linear -- that one hasn't been
-      migrated off npu_compiler.py yet. Prefer THIS path (via
-      offloaded_composites()/emit_composite()) for new callers; the other
-      one is kept only because something might still depend on its exact
-      calling convention (addrs keyed differently: "x"/"w" here too, but
-      offloaded_matmuls()'s shape tuples are positional).
+      which reaches the same _emit_matmul_fp32 through its own, older
+      calling convention (shape tuples, not a param dict) -- both are on
+      the TVM path now, kept as two entry points because something might
+      still depend on offloaded_matmuls()'s exact calling convention
+      (addrs keyed the same way -- "x"/"w" here too -- but its shape
+      tuples are positional, not a params dict).
 
     * Everything else -- "linear_bias", "softmax", "silu", "add", "mul" --
       has no dispatch written yet. (Unlike before the FP32-only pivot, this

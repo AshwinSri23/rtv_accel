@@ -68,7 +68,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 import tvm                                  # noqa: E402
 from tvm.script import relax as R           # noqa: E402
 
-from npu_compiler import NPUCompiler, DType, _padded  # noqa: E402
+from compiler_state import NPUCompiler, DType, _padded  # noqa: E402
 import tvm_backend                           # noqa: E402
 from rtv_tvm import patterns                 # noqa: E402
 
