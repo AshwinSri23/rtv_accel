@@ -44,9 +44,12 @@ class SafeTensorsModel:
     NPUCompiler expects, yielding objects with .shape and a torch-like
     .detach().cpu().numpy() chain.
 
-    Tensors are read lazily and one at a time: materialising all of Qwen3-0.6B
-    as float32 at once would be ~2.4 GB, and the compiler quantises each tensor
-    to INT8 immediately after reading it.
+    Tensors are read lazily and one at a time via mmap, not materialized
+    all at once -- Qwen3-0.6B's full weight set is ~2.4 GB as float32.
+    (This class itself has always been dtype-agnostic; only its original
+    caller was INT8-specific -- see toolchain/checkpoint_loader.py for
+    the current FP32 caller, and TODO.md/rtv-accel-fp32-only-target in
+    project memory for the precision pivot.)
     """
 
     def __init__(self, path: str):
