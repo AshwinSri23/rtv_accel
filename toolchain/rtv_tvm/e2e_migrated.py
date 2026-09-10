@@ -1,56 +1,41 @@
 #!/usr/bin/env python3
 """
-e2e_migrated.py — the FP32 cases from toolchain/e2e_test.py, re-verified
-through the TVM path instead of npu_compiler.py.
+e2e_migrated.py — the FP32 cases from the now-deleted toolchain/e2e_test.py,
+re-verified through the TVM path instead of npu_compiler.py (also deleted).
 
 Part of TODO Phase 1.5 ("migrate all test cases in toolchain/e2e_test.py to
-use toolchain/rtv_tvm/"). Only two of e2e_test.py's 22 case classes are
-actually migratable today:
+use toolchain/rtv_tvm/"). Of e2e_test.py's 22 case classes, exactly 4 were
+FP32 (the other 18 were INT8/INT16-specific, permanently out of scope post
+the FP32-only pivot) -- all 4 are migrated here now, at their ORIGINAL
+instantiation parameters, not a substitute:
 
-    Fp32LinearCase  -> here, via emit_composite's "matmul" dispatch
-    Fp32MlpCase     -> here, via emit_composite's "swiglu_ffn" dispatch
+    Fp32LinearCase      -> "matmul" composite dispatch
+    Fp32MlpCase         -> "swiglu_ffn" composite dispatch
+    Fp32AttentionCase   -> tvm_backend._emit_attention_block_batched_fp32 /
+                           _emit_attention_block_fp32 (direct driver calls --
+                           there's no composite pattern for a whole attention
+                           block with real projections; see emit_composite's
+                           granularity note)
+    Fp32FullLayerCase   -> tvm_backend._emit_model_batched_fp32
 
-Everything else in e2e_test.py is either INT8/INT16-specific (out of scope
-entirely post the FP32-only pivot -- see rtv-accel-fp32-only-target in
-project memory) or needs infrastructure that doesn't exist yet:
-
-    Fp32AttentionCase("fp32_attn_gqa", ...) -> here now too, via
-                          tvm_backend._emit_attention_block_batched_fp32 --
-                          real Q/K/V/O projections, GQA, and a genuine
-                          per-row softmax over 16 DIFFERENT real query rows
-                          (not one row replicated), which needed
-                          codegen.py's Codegen to gain a real `dim_m`
-                          (previously the literal constant TILE everywhere)
-                          and tvm_backend._emit_softmax_rows_fp32 to drive
-                          REDUCE/SCALAR_ALU at dim_m=1 once per row -- see
-                          that function's docstring for why no schedule.py
-                          primitive could express this. fp32_attn_1head
-                          (head_dim=32) is NOT migrated: this dispatch (like
-                          the rest of the attention block) still needs
-                          head_dim == compiler.tile_dim, a separate,
-                          pre-existing limit (K's per-head transpose only
-                          handles one square tile) this work doesn't touch.
-
-    Fp32FullLayerCase  -- needs Fp32AttentionCase's machinery (now built)
-                          PLUS RoPE applied per-row at each row's OWN
-                          position (tvm_backend._emit_rope_batched_fp32,
-                          also now built) PLUS chaining across layers.
-                          RMSNorm needed NO new work: _emit_rmsnorm_row_fp32
-                          already computes ONE scale from a whole-tile
-                          REDUCE_SUMSQ regardless of what's in the other 15
-                          rows, which happens to be EXACTLY what
-                          Fp32FullLayerCase's own reference expects
-                          ("compile_rmsnorm_row shares ONE scale across all
-                          16 tile rows even when they hold 16 REAL distinct
-                          tokens... a real approximation for prefill" --
-                          this dispatch reproduces that by construction, not
-                          by a deliberate design choice to imitate a bug.
-                          See run_fp32_full_layer_case below.
+An earlier version of this file could only verify the attention/full-layer
+cases at head_dim=16, substituting for e2e_test.py's real head_dim=32
+instances -- head_dim > compiler.tile_dim was genuinely unsupported at the
+time. That gap is closed (see rtv_tvm/test_attention_wide_headdim.py):
+three real bugs, not a missing feature -- RoPE's rotate_half permutation
+matrix and V's de-interleave copy were both hardcoded to a (tile_dim,
+tile_dim)/tile_dim-wide shape instead of (head_dim, head_dim)/head_dim,
+invisible exactly when head_dim==tile_dim; K's transpose got a genuinely
+new helper (_emit_transpose_wide_fp32) since TRANSPOSE is a real
+square-single-tile-only hardware primitive. Verified directly at Qwen3-
+0.6B's actual configuration too (hidden=1024, 16 heads over 8 KV heads,
+head_dim=128), not just the small dimensions the original test used.
 
 Test vectors, tolerances and instantiation parameters below are copied
-verbatim from e2e_test.py's Fp32LinearCase/Fp32MlpCase and the exact
-(m, n, k) / (hidden, inter) tuples main() constructs them with, so this is a
-genuine parity check, not a fresh test with looser goalposts.
+verbatim from e2e_test.py's own classes and the exact parameters main()
+constructed them with (preserved here now that git history holds the
+original file), so this is a genuine parity check, not a fresh test with
+looser goalposts.
 
 Run with the TVM venv:  .venv-tvm/bin/python toolchain/rtv_tvm/e2e_migrated.py
 """
@@ -269,7 +254,7 @@ def run_fp32_mlp_case(name, hidden, inter):
     return False, f"max err/|out| {err:.3g}", n_instr
 
 
-# ── Fp32AttentionCase, migrated (the head_dim==tile_dim instance only) ────────
+# ── Fp32AttentionCase, migrated (both original instances) ─────────────────────
 #
 # Unlike Linear/Mlp, the real attention BLOCK (with actual Q/K/V/O
 # projections) is deliberately NOT what patterns.py's "attention" composite
@@ -356,18 +341,18 @@ def run_fp32_attention_case(name, hidden, n_heads, n_kv_heads, head_dim):
     return False, f"max err/|out| {err:.3g}", n_instr
 
 
-# ── Fp32FullLayerCase, migrated (head_dim==tile_dim instances only) ───────────
+# ── Fp32FullLayerCase, migrated (both original instances, head_dim=32) ────────
 #
-# e2e_test.py's own two instances (fp32_layer_1L/2L) use head_dim=32, which
-# exceeds compiler.tile_dim(16) -- the same pre-existing limit that keeps
-# fp32_attn_1head unmigrated above (K's per-head transpose, and RoPE's
-# intra-tile permutation, both only handle one square tile; head_dim=32
-# would need the transpose generalized into per-column-tile square
-# transposes stacked into the wide output, which this pass didn't build).
-# So, like Fp32AttentionCase, this is verified at head_dim=16 -- exercising
-# every piece of machinery (RMSNorm, batched attention with GQA, per-row
-# RoPE, residual, SwiGLU, multi-layer chaining) with the EXACT reference
-# math and tolerance, just not e2e_test.py's literal head_dim=32 parameters.
+# e2e_test.py's own two instances (fp32_layer_1L/2L) use head_dim=32,
+# which used to exceed compiler.tile_dim(16) -- the same limit that kept
+# fp32_attn_1head unmigrated above. Closed (see
+# rtv_tvm/test_attention_wide_headdim.py): K's per-head transpose got a
+# real new helper (_emit_transpose_wide_fp32, looping the hardware's
+# square-single-tile TRANSPOSE once per column-tile), while RoPE's
+# permutation matrix and V's de-interleave copy turned out to be plain
+# bugs (hardcoded to a tile-sized shape instead of a head_dim-sized one)
+# rather than needing new machinery. Verified at Qwen3-0.6B's real
+# head_dim=128 too, not just these two instances' head_dim=32.
 
 def run_fp32_full_layer_case(name, hidden, inter, n_heads, n_kv_heads, head_dim,
                              layers=1):
@@ -497,8 +482,9 @@ def main():
         ("fp32_mlp_16x32", lambda: run_fp32_mlp_case("fp32_mlp_16x32", 16, 32)),
         ("fp32_mlp_32x64", lambda: run_fp32_mlp_case("fp32_mlp_32x64", 32, 64)),
         ("fp32_attn_gqa", lambda: run_fp32_attention_case("fp32_attn_gqa", 32, 4, 2, 16)),
-        ("fp32_layer_1L", lambda: run_fp32_full_layer_case("fp32_layer_1L", 64, 64, 2, 1, 16, layers=1)),
-        ("fp32_layer_2L", lambda: run_fp32_full_layer_case("fp32_layer_2L", 64, 64, 2, 1, 16, layers=2)),
+        ("fp32_attn_1head", lambda: run_fp32_attention_case("fp32_attn_1head", 32, 1, 1, 32)),
+        ("fp32_layer_1L", lambda: run_fp32_full_layer_case("fp32_layer_1L", 64, 64, 2, 1, 32, layers=1)),
+        ("fp32_layer_2L", lambda: run_fp32_full_layer_case("fp32_layer_2L", 64, 64, 2, 1, 32, layers=2)),
     ]
     n_pass = 0
     for name, fn in cases:

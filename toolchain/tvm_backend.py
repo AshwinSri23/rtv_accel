@@ -842,15 +842,26 @@ def _emit_attention_core_batched_fp32(compiler, seq_k, head_dim, q_addr, k_addr,
     rowsum/sdiv go through _emit_softmax_rows_fp32 instead -- see its
     docstring for why a genuine per-row pass is unavoidable here.
 
-    Scoped to seq_k == head_dim == compiler.tile_dim (one tile each,
-    exactly what Fp32AttentionCase needs) -- _emit_softmax_rows_fp32
-    doesn't handle a wider seq_k, so neither does this.
+    Scoped to seq_k == compiler.tile_dim (one tile) -- _emit_softmax_rows_
+    fp32 doesn't handle a wider seq_k, so neither does this. head_dim has
+    no such restriction: it only ever appears as a GEMM dimension here
+    (Q@K^T's reduction depth, P@V's output width), and GEMM already tiles
+    M/N/K generically -- the earlier `head_dim == M` check was copied
+    defensively from the non-batched core's own (real, GEMM-unrelated)
+    restriction rather than reflecting an actual requirement of this
+    function; head_dim only needs to be a multiple of compiler.tile_dim,
+    same as everywhere else GEMM-tiled.
     """
     M = compiler.tile_dim
-    if seq_k != M or head_dim != M:
+    if seq_k != M:
         raise NotImplementedError(
-            f"_emit_attention_core_batched_fp32 needs seq_k == head_dim == "
-            f"compiler.tile_dim ({M}); got seq_k={seq_k}, head_dim={head_dim}"
+            f"_emit_attention_core_batched_fp32 needs seq_k == "
+            f"compiler.tile_dim ({M}); got seq_k={seq_k}"
+        )
+    if head_dim % M != 0:
+        raise NotImplementedError(
+            f"_emit_attention_core_batched_fp32 needs head_dim as a "
+            f"multiple of compiler.tile_dim ({M}); got {head_dim}"
         )
 
     scores_stage = compiler.alloc_staging(M * seq_k * 4)
@@ -1172,9 +1183,14 @@ def _emit_transpose_fp32(compiler, in_addr, out_addr, in_stride=None, out_stride
                  {"A": in_addr, "C": out_addr}, dtype=DType.FP32, kind="elemwise")
 
 
-def _emit_copy_slice_fp32(compiler, in_addr, out_addr, in_stride):
-    """Copy a (16, head_dim) column slice of a wider matrix into its own
-    tightly-packed buffer -- de-interleaving, not transposing.
+def _emit_copy_slice_fp32(compiler, in_addr, out_addr, in_stride, width=None):
+    """Copy a (16, width) column slice of a wider matrix into its own
+    tightly-packed buffer -- de-interleaving, not transposing. `width`
+    defaults to compiler.tile_dim; pass head_dim explicitly for a head
+    wider than one tile (the GEMM below already tiles M/N/K generically,
+    so this needed no other change to support that -- the earlier version
+    hardcoded width to M, which is what actually limited this to
+    head_dim==16, not anything about the identity-matrix trick itself).
 
     Why this exists: _emit_gqa_attention_fp32 expects K and V as n_kv_heads
     SEPARATE CONTIGUOUS blocks (see its docstring). K gets that layout as a
@@ -1196,10 +1212,45 @@ def _emit_copy_slice_fp32(compiler, in_addr, out_addr, in_stride):
     goal is a faithful copy, not a replication.
     """
     M = compiler.tile_dim
+    width = M if width is None else width
     ident_addr = compiler.alloc_staging(M * M * 4)
     ident = np.eye(M, dtype=np.float32)
     compiler._const_regions[ident_addr] = ident.tobytes()
-    _emit_matmul_fp32(compiler, M, M, M, ident_addr, in_addr, out_addr, b_stride=in_stride)
+    _emit_matmul_fp32(compiler, M, width, M, ident_addr, in_addr, out_addr, b_stride=in_stride)
+
+
+def _emit_transpose_wide_fp32(compiler, head_dim, in_addr, out_addr, in_stride=None):
+    """Transpose a (16, head_dim) matrix into a fresh, tightly-packed
+    (head_dim, 16) buffer, for head_dim a multiple of compiler.tile_dim
+    (not just exactly one tile, unlike _emit_transpose_fp32 alone).
+
+    _emit_transpose_fp32 only transposes ONE square tile in a single call
+    (a real hardware limit -- TRANSPOSE is in-place and square-tile-only,
+    see its own docstring). A wider transpose is built by calling it once
+    per column-tile of the input, each writing into its own ROW-BLOCK of
+    the output: for A (M, head_dim) split into column-tiles A_0..A_{n-1}
+    (each M x M), A^T's row-block t (rows [t*M:(t+1)*M]) is exactly A_t^T
+    -- confirmed directly: for r in that block, A^T[t*M+r, c] = A[c, t*M+r]
+    = A_t[c, r] = A_t^T[r, c]. Since the destination here is a FRESH,
+    tightly-packed (head_dim, M) buffer, each row-block already sits at
+    exactly byte offset t*M*M*w with no out_stride needed (row-major
+    storage puts row-block t there automatically) -- out_stride only
+    matters when the destination is itself a slice of something WIDER
+    (see test_kv_cache.py's K-cache construction, which calls
+    _emit_transpose_fp32 directly for exactly that reason).
+    """
+    M = compiler.tile_dim
+    if head_dim % M != 0:
+        raise NotImplementedError(
+            f"_emit_transpose_wide_fp32 needs head_dim as a multiple of "
+            f"compiler.tile_dim ({M}); got {head_dim}"
+        )
+    w = DType.BYTES[DType.FP32]
+    n_tiles = head_dim // M
+    for t in range(n_tiles):
+        _emit_transpose_fp32(compiler, in_addr=in_addr + t * M * w,
+                             out_addr=out_addr + t * M * M * w,
+                             in_stride=in_stride)
 
 
 def _emit_mul_fp32(compiler, a_addr, b_addr, out_addr, width, a_stride=None):
@@ -1244,21 +1295,34 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     compile-time constant here is consistent with the existing design, not
     a shortcut specific to this function.
 
-    head_dim must equal compiler.tile_dim (16), unlike compile_rope, which
-    requires head_dim to be a multiple of 2*tile_dim (32+) so that a
-    column's rotate_half partner is a WHOLE OTHER TILE, reachable with a
-    second LOAD_TILE at a shifted address. At head_dim=16 the partner is
-    WITHIN the same one tile (columns 0-7 pair with 8-15), which needs an
-    actual column permutation, not just a different load address. Done via
-    the same "constant matrix through GEMM" trick as
+    head_dim must be a multiple of compiler.tile_dim (16) -- NOT exactly
+    16 only, despite what an earlier version of this docstring said.
+    rotate_half's partner column is `(k + head_dim/2) mod head_dim`
+    regardless of head_dim's size, and the permutation-matrix-through-GEMM
+    trick below turns out to already be fully general: GEMM already tiles
+    M/N/K generically (proven throughout this codebase -- see e.g. the
+    attention core's seq_k/head_dim generalization), so a genuinely
+    (head_dim, head_dim) permutation matrix works whether the rotate_half
+    partner sits WITHIN one tile (head_dim==16: columns 0-7 pair with
+    8-15, an intra-tile shuffle) or is a WHOLE OTHER TILE (head_dim>=32:
+    e.g. at head_dim=128, tile 0's columns pair with tile 4's) -- the
+    permutation matrix expresses both identically; only the SIZE of P
+    changes. The `head_dim != M` restriction this docstring used to state
+    reflected a real bug at the time (P was hardcoded to (M, M) rather
+    than (head_dim, head_dim), corrupting or index-erroring past 16), not
+    a genuine limit of the approach -- fixed by sizing P correctly instead
+    of restricting the input.
+
+    Uses the same "constant matrix through GEMM" trick as
     _emit_broadcast_row0_fp32/_emit_copy_slice_fp32: rotate_half(in) =
-    in @ P, where P is a compile-time constant (16,16) matrix swapping the
-    two 8-wide halves (P[k, (k+8) mod 16] = 1, else 0) -- confirmed
-    directly against numpy that a PLAIN swap (no negation in P itself)
-    combined with rope_tables' sign-folded sin table reproduces the
-    standard RoPE rotation exactly (the negation rope_tables already bakes
-    into the first half of its sin table is exactly what a plain swap
-    needs to be correct, since a signed swap would double the negation).
+    in @ P, where P is a compile-time constant (head_dim, head_dim) matrix
+    swapping the two head_dim/2-wide halves (P[k, (k+head_dim/2) mod
+    head_dim] = 1, else 0) -- confirmed directly against numpy that a
+    PLAIN swap (no negation in P itself) combined with rope_tables'
+    sign-folded sin table reproduces the standard RoPE rotation exactly
+    (the negation rope_tables already bakes into the first half of its
+    sin table is exactly what a plain swap needs to be correct, since a
+    signed swap would double the negation).
 
     in_stride lets `in` be a column slice of a wider (M, n_heads*head_dim)
     Q/K projection buffer, so RoPE can be applied per-head directly on the
@@ -1267,10 +1331,10 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     pipeline once RoPE is wired into it.
     """
     M = compiler.tile_dim
-    if head_dim != M:
+    if head_dim % M != 0:
         raise NotImplementedError(
-            f"_emit_rope_fp32 needs head_dim == compiler.tile_dim ({M}); "
-            f"got {head_dim}"
+            f"_emit_rope_fp32 needs head_dim as a multiple of "
+            f"compiler.tile_dim ({M}); got {head_dim}"
         )
     if head_dim % 2 != 0:
         raise ValueError(f"_emit_rope_fp32 needs an even head_dim; got {head_dim}")
@@ -1284,10 +1348,10 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     compiler._const_regions[sin_addr] = sin_bcast.tobytes()
 
     half = head_dim // 2
-    perm = np.zeros((M, M), dtype=np.float32)
+    perm = np.zeros((head_dim, head_dim), dtype=np.float32)
     for k in range(head_dim):
         perm[k, (k + half) % head_dim] = 1.0
-    perm_addr = compiler.alloc_staging(M * M * 4)
+    perm_addr = compiler.alloc_staging(head_dim * head_dim * 4)
     compiler._const_regions[perm_addr] = perm.tobytes()
 
     rot_stage = compiler.alloc_staging(M * head_dim * 4)
@@ -1313,15 +1377,18 @@ def _emit_rope_batched_fp32(compiler, head_dim, positions, in_addr, out_addr,
     single row broadcast to all 16 -- the only actual difference from
     _emit_rope_fp32: cos_bcast/sin_bcast are built by INDEXING one table
     row per tile row instead of tiling one row 16 times. The permutation
-    matrix (rotate_half's intra-tile swap) and the GEMM/mul/add steps that
-    apply it are otherwise IDENTICAL and needed no changes -- they're
-    row-parallel, and don't care whether every row's cos/sin agree or not.
+    matrix (rotate_half's swap, intra-tile at head_dim==16 or whole-tile
+    at head_dim>=32 -- see _emit_rope_fp32's docstring, this needs the
+    identical (head_dim, head_dim) sizing) and the GEMM/mul/add steps that
+    apply it are otherwise IDENTICAL and needed no further changes --
+    they're row-parallel, and don't care whether every row's cos/sin agree
+    or not.
     """
     M = compiler.tile_dim
-    if head_dim != M:
+    if head_dim % M != 0:
         raise NotImplementedError(
-            f"_emit_rope_batched_fp32 needs head_dim == compiler.tile_dim "
-            f"({M}); got {head_dim}"
+            f"_emit_rope_batched_fp32 needs head_dim as a multiple of "
+            f"compiler.tile_dim ({M}); got {head_dim}"
         )
     if head_dim % 2 != 0:
         raise ValueError(f"_emit_rope_batched_fp32 needs an even head_dim; got {head_dim}")
@@ -1339,10 +1406,10 @@ def _emit_rope_batched_fp32(compiler, head_dim, positions, in_addr, out_addr,
     compiler._const_regions[sin_addr] = sin_bcast.tobytes()
 
     half = head_dim // 2
-    perm = np.zeros((M, M), dtype=np.float32)
+    perm = np.zeros((head_dim, head_dim), dtype=np.float32)
     for k in range(head_dim):
         perm[k, (k + half) % head_dim] = 1.0
-    perm_addr = compiler.alloc_staging(M * M * 4)
+    perm_addr = compiler.alloc_staging(head_dim * head_dim * 4)
     compiler._const_regions[perm_addr] = perm.tobytes()
 
     rot_stage = compiler.alloc_staging(M * head_dim * 4)
@@ -1412,13 +1479,13 @@ def _emit_attention_block_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
     (unlike RMSNorm/attention's REDUCE steps, which very much do). Default
     None skips RoPE entirely (e.g. for models/tests that don't use it).
 
-    Constrained to head_dim == compiler.tile_dim (16): K needs transposing
-    per head to match _emit_attention_core_fp32's matmul(q,k) semantics
-    (see that function's docstring -- no transpose inside the core itself),
-    and _emit_transpose_fp32 only handles one square tile -- transposing a
-    head_dim > 16 slice needs the same tile-addressing generalization
-    attention's OTHER buffers already got, not done for transpose yet.
-    (_emit_rope_fp32 has the identical constraint, for the same reason.)
+    head_dim must be a multiple of compiler.tile_dim (16), not exactly 16
+    only: K's per-head transpose uses _emit_transpose_wide_fp32 (loops
+    _emit_transpose_fp32 -- itself still square-single-tile-only, a real
+    hardware limit -- once per column-tile), and RoPE's permutation matrix
+    generalizes the same way (see _emit_rope_fp32's docstring) -- both
+    were previously restricted to exactly one tile because of bugs in
+    THOSE helpers, not a genuine limit of this block's own structure.
 
     x is (M, hidden) with M == compiler.tile_dim rows. Real multi-row
     batches inherit _emit_attention_core_fp32's own limit: genuinely
@@ -1431,9 +1498,9 @@ def _emit_attention_block_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
     context (the actual point of a KV-cache) is a separate piece --
     see _emit_kv_cache_attention_fp32.
     """
-    if head_dim != compiler.tile_dim:
+    if head_dim % compiler.tile_dim != 0:
         raise NotImplementedError(
-            f"_emit_attention_block_fp32 needs head_dim == "
+            f"_emit_attention_block_fp32 needs head_dim as a multiple of "
             f"compiler.tile_dim ({compiler.tile_dim}); got {head_dim}"
         )
     M = compiler.tile_dim
@@ -1491,8 +1558,8 @@ def _emit_attention_block_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
     # transposed result has all 16 COLUMNS identical -- exactly the "16
     # key positions, all the same distinct key" this degenerate case needs.
     for kv_h in range(n_kv_heads):
-        _emit_transpose_fp32(
-            compiler,
+        _emit_transpose_wide_fp32(
+            compiler, head_dim,
             in_addr=k_bcast + kv_h * head_dim * w,
             out_addr=k_t_stage + kv_h * head_dim * M * w,
             in_stride=kv_dim,
@@ -1512,7 +1579,7 @@ def _emit_attention_block_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
             compiler,
             in_addr=v_bcast + kv_h * head_dim * w,
             out_addr=v_blocks + kv_h * M * head_dim * w,
-            in_stride=kv_dim,
+            in_stride=kv_dim, width=head_dim,
         )
 
     _emit_gqa_attention_fp32(
@@ -1561,14 +1628,14 @@ def _emit_attention_block_batched_fp32(compiler, hidden, n_heads, n_kv_heads, he
     position 0), or None (default) to skip RoPE. See
     _emit_rope_batched_fp32 for the actual per-row cos/sin mechanics.
 
-    Same head_dim == compiler.tile_dim constraint as the replicated
-    version, for the same reason (K's per-head transpose only handles one
-    square tile).
+    Same head_dim-as-a-multiple-of-compiler.tile_dim requirement as the
+    replicated version -- see that function's docstring; K's transpose
+    goes through _emit_transpose_wide_fp32 here too.
     """
-    if head_dim != compiler.tile_dim:
+    if head_dim % compiler.tile_dim != 0:
         raise NotImplementedError(
-            f"_emit_attention_block_batched_fp32 needs head_dim == "
-            f"compiler.tile_dim ({compiler.tile_dim}); got {head_dim}"
+            f"_emit_attention_block_batched_fp32 needs head_dim as a "
+            f"multiple of compiler.tile_dim ({compiler.tile_dim}); got {head_dim}"
         )
     M = compiler.tile_dim
     q_dim = n_heads * head_dim
@@ -1599,8 +1666,8 @@ def _emit_attention_block_batched_fp32(compiler, hidden, n_heads, n_kv_heads, he
                                     theta=rope_theta, in_stride=kv_dim)
 
     for kv_h in range(n_kv_heads):
-        _emit_transpose_fp32(
-            compiler,
+        _emit_transpose_wide_fp32(
+            compiler, head_dim,
             in_addr=k_proj_stage + kv_h * head_dim * w,
             out_addr=k_t_stage + kv_h * head_dim * M * w,
             in_stride=kv_dim,
@@ -1610,7 +1677,7 @@ def _emit_attention_block_batched_fp32(compiler, hidden, n_heads, n_kv_heads, he
             compiler,
             in_addr=v_stage + kv_h * head_dim * w,
             out_addr=v_blocks + kv_h * M * head_dim * w,
-            in_stride=kv_dim,
+            in_stride=kv_dim, width=head_dim,
         )
 
     _emit_gqa_attention_batched_fp32(
@@ -1641,9 +1708,10 @@ def _emit_transformer_layer_fp32(compiler, hidden, inter, n_heads, n_kv_heads,
     means no RoPE, preserving every existing caller's behavior. No
     1/sqrt(head_dim) scaling (consistent with _emit_attention_core_fp32
     having no scale step -- see its docstring). Inherits
-    _emit_attention_block_fp32's constraints: head_dim == compiler.tile_dim,
-    and x is one real row replicated across the 16-row tile (self-attention
-    over its own replicated K/V, not a genuine multi-token context).
+    _emit_attention_block_fp32's constraints: head_dim a multiple of
+    compiler.tile_dim, and x is one real row replicated across the 16-row
+    tile (self-attention over its own replicated K/V, not a genuine
+    multi-token context).
 
     This intentionally does NOT reproduce a known bug in the hand-written
     pipeline: e2e_test.py's Fp32FullLayerCase documents that

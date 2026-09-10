@@ -125,6 +125,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_swiglu_resident     # SwiGLU intermediates kept resident in SRAM
         test_attention_batched   # genuinely different rows, real per-row softmax
         test_kv_cache            # growing multi-tile KV-cache, append + tail mask
+        test_attention_wide_headdim  # head_dim > tile_dim, incl. Qwen3's real hd=128
     )
     foreach(RTV_TVM_TEST ${RTV_TVM_TESTS})
         add_test(NAME ${RTV_TVM_TEST}
