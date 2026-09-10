@@ -989,7 +989,7 @@ def _emit_gqa_attention_batched_fp32(compiler, n_heads, n_kv_heads, seq_k, head_
         )
 
 
-def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width):
+def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None):
     """Replicate row 0 of a (16, width) "row0 real, rest zero" buffer into
     all 16 rows -- bridges the layer-level convention (row0 real, rest
     zero, the one _emit_rmsnorm_row_fp32/emit_composite's "rmsnorm" kind
@@ -1009,13 +1009,19 @@ def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width):
     for every m -- exactly the replication wanted, using only the existing
     GEMM primitive and a constant injected via compiler._const_regions
     (same mechanism the row0 padding-mask inside the attention core uses).
+
+    in_stride lets `in` be a column slice of a wider matrix (the same
+    mechanism attention's Q/out and RoPE already use) -- needed to
+    broadcast just one head's slice of a wide (M, n_heads*head_dim)
+    projection directly, e.g. before appending it into a per-head
+    KV-cache tile, without first de-interleaving it into its own buffer.
     """
     M = compiler.tile_dim
     bcast_addr = compiler.alloc_staging(M * M * 4)
     bcast = np.zeros((M, M), dtype=np.float32)
     bcast[:, 0] = 1.0
     compiler._const_regions[bcast_addr] = bcast.tobytes()
-    _emit_matmul_fp32(compiler, M, width, M, bcast_addr, in_addr, out_addr)
+    _emit_matmul_fp32(compiler, M, width, M, bcast_addr, in_addr, out_addr, b_stride=in_stride)
 
 
 def _emit_mask_to_row0_fp32(compiler, in_addr, out_addr, width):
@@ -1219,10 +1225,11 @@ def _emit_copy_slice_fp32(compiler, in_addr, out_addr, in_stride, width=None):
     _emit_matmul_fp32(compiler, M, width, M, ident_addr, in_addr, out_addr, b_stride=in_stride)
 
 
-def _emit_transpose_wide_fp32(compiler, head_dim, in_addr, out_addr, in_stride=None):
-    """Transpose a (16, head_dim) matrix into a fresh, tightly-packed
-    (head_dim, 16) buffer, for head_dim a multiple of compiler.tile_dim
-    (not just exactly one tile, unlike _emit_transpose_fp32 alone).
+def _emit_transpose_wide_fp32(compiler, head_dim, in_addr, out_addr, in_stride=None,
+                              out_stride=None):
+    """Transpose a (16, head_dim) matrix into a (head_dim, 16) destination,
+    for head_dim a multiple of compiler.tile_dim (not just exactly one
+    tile, unlike _emit_transpose_fp32 alone).
 
     _emit_transpose_fp32 only transposes ONE square tile in a single call
     (a real hardware limit -- TRANSPOSE is in-place and square-tile-only,
@@ -1231,13 +1238,44 @@ def _emit_transpose_wide_fp32(compiler, head_dim, in_addr, out_addr, in_stride=N
     the output: for A (M, head_dim) split into column-tiles A_0..A_{n-1}
     (each M x M), A^T's row-block t (rows [t*M:(t+1)*M]) is exactly A_t^T
     -- confirmed directly: for r in that block, A^T[t*M+r, c] = A[c, t*M+r]
-    = A_t[c, r] = A_t^T[r, c]. Since the destination here is a FRESH,
-    tightly-packed (head_dim, M) buffer, each row-block already sits at
-    exactly byte offset t*M*M*w with no out_stride needed (row-major
-    storage puts row-block t there automatically) -- out_stride only
-    matters when the destination is itself a slice of something WIDER
-    (see test_kv_cache.py's K-cache construction, which calls
-    _emit_transpose_fp32 directly for exactly that reason).
+    = A_t[c, r] = A_t^T[r, c].
+
+    in_stride (row pitch in ELEMENTS) is the mirror for the INPUT: lets
+    `in` be a column slice of a wider matrix (e.g. one head's slice of a
+    (M, n_heads*head_dim) K-projection). THIS IS NOT OPTIONAL the way it
+    reads -- a real bug, found the hard way: None used to mean "assume
+    row pitch compiler.tile_dim", which is only correct when
+    head_dim==tile_dim. For head_dim > tile_dim, `in` is a genuinely
+    (M, head_dim)-shaped buffer in its OWN right (e.g. a KV-cache tile,
+    not a slice of anything wider) with a TRUE row pitch of head_dim, not
+    tile_dim -- defaulting to tile_dim silently read column-tile 1 (and
+    beyond) starting head_dim-tile_dim elements too early, landing inside
+    column-tile 0's own row extent instead. Invisible in every caller
+    before this one because they all fed a row0-real-rest-zero buffer
+    (rows 1-15 already zero regardless of which address they're
+    misread from), and every EXPLICIT in_stride passed so far happened to
+    equal head_dim anyway (n_kv_heads==1 callers). Confirmed directly:
+    transposing a tile with two GENUINELY DIFFERENT real rows reproduced
+    row 0's column correctly and row 1's column WRONG, matching exactly
+    what an off-by-row-pitch read predicts. Fixed by defaulting to
+    head_dim (this buffer's own natural tight-packing width) instead of
+    tile_dim, and letting a caller override for the genuine
+    slice-of-something-wider case, same contract as every other
+    in_stride in this module.
+
+    out_stride (row pitch in ELEMENTS): lets the destination be a column
+    SLICE of a wider (head_dim, seq_k) buffer instead of its own
+    tightly-packed (head_dim, M) region -- e.g. one K-cache TILE's
+    transpose landing in columns [tile_idx*M:(tile_idx+1)*M] of the full
+    (head_dim, seq_k) K^T a KV-cache attention step needs, seq_k spanning
+    every active cache tile. None (default) keeps the tightly-packed
+    single-destination behavior every existing caller uses -- row-block t
+    then sits at exactly byte offset t*M*M*w, row-major placement doing
+    the work for free. With out_stride set, row-block t's bytes instead
+    start at t*M*out_stride*w (still relative to whatever column offset
+    the caller baked into out_addr itself), matching how
+    _emit_transpose_fp32's own out_stride locates one square tile inside
+    a wider row.
     """
     M = compiler.tile_dim
     if head_dim % M != 0:
@@ -1247,10 +1285,12 @@ def _emit_transpose_wide_fp32(compiler, head_dim, in_addr, out_addr, in_stride=N
         )
     w = DType.BYTES[DType.FP32]
     n_tiles = head_dim // M
+    in_pitch = in_stride if in_stride is not None else head_dim
+    out_stride_pitch = out_stride if out_stride is not None else M
     for t in range(n_tiles):
         _emit_transpose_fp32(compiler, in_addr=in_addr + t * M * w,
-                             out_addr=out_addr + t * M * M * w,
-                             in_stride=in_stride)
+                             out_addr=out_addr + t * M * out_stride_pitch * w,
+                             in_stride=in_pitch, out_stride=out_stride)
 
 
 def _emit_mul_fp32(compiler, a_addr, b_addr, out_addr, width, a_stride=None):
@@ -1688,6 +1728,145 @@ def _emit_attention_block_batched_fp32(compiler, hidden, n_heads, n_kv_heads, he
     _emit_matmul_fp32(compiler, M, hidden, q_dim, ctx_stage, wo_addr, out_addr)
 
 
+def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
+                                       x_addr, wq_addr, wk_addr, wv_addr, wo_addr,
+                                       out_addr, pos, k_cache_tiles, v_cache_tiles,
+                                       rope_theta=1e6):
+    """The actual decode-step attention operation: project Q/K/V for the
+    CURRENT real token, apply RoPE at its absolute position, append the
+    new K/V into a genuine growing multi-tile KV-cache, then attend over
+    every real token cached so far (tail-masking the current tile's
+    unfilled rows) -- assembling _emit_attention_block_fp32's real
+    projections, _emit_rope_fp32's per-position rotation,
+    _emit_kv_cache_append_fp32/_emit_kv_cache_tail_mask_fp32's cache
+    mechanics, and _emit_transpose_wide_fp32/_emit_attention_core_fp32's
+    head_dim>tile_dim support into one real per-layer operation, none of
+    which needed further changes to compose this way.
+
+    k_cache_tiles/v_cache_tiles: length-n_kv_heads lists, each itself a
+    list of max_tiles DRAM addresses for that KV head's cache tiles
+    (pre-allocated zero-initialized in the DRAM image -- see
+    build_kvcache_model_dram_image). Every kv_h's OWN v_cache_tiles must
+    be mutually CONTIGUOUS (tile i immediately followed by tile i+1) --
+    _emit_attention_core_fp32 takes one v_addr and treats it as a single
+    tightly-packed (seq_k, head_dim) block, the same requirement
+    test_kv_cache.py's v_cache_base already established. K's tiles need
+    not be contiguous (each is transposed individually, one at a time).
+
+    pos: the CURRENT decode step's absolute token position (a Python int
+    -- see _emit_rope_fp32's docstring on why position is compile-time
+    here). Determines both the RoPE angle and which cache tile/row this
+    step's new token lands in (`divmod(pos, compiler.tile_dim)`) and how
+    many cache tiles are active/how much of the latest one is real
+    (`seq_k`, `valid_len` -- see _emit_kv_cache_tail_mask_fp32).
+
+    x is (M, hidden) with row 0 the real current token, rows 1-15 zero
+    (the layer-level convention -- see _emit_rmsnorm_row_fp32's
+    docstring). head_dim must be a multiple of compiler.tile_dim (16),
+    same as _emit_attention_block_fp32.
+    """
+    if head_dim % compiler.tile_dim != 0:
+        raise NotImplementedError(
+            f"_emit_attention_block_kvcache_fp32 needs head_dim as a "
+            f"multiple of compiler.tile_dim ({compiler.tile_dim}); got {head_dim}"
+        )
+    M = compiler.tile_dim
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+    w = DType.BYTES[DType.FP32]
+
+    tile_idx, row = divmod(pos, M)
+    n_active_tiles = tile_idx + 1
+    seq_k = n_active_tiles * M
+    valid_len = pos + 1
+    if tile_idx >= len(k_cache_tiles[0]):
+        raise ValueError(
+            f"pos={pos} needs cache tile {tile_idx}, but only "
+            f"{len(k_cache_tiles[0])} tiles were allocated per KV head"
+        )
+
+    q_stage = compiler.alloc_staging(M * q_dim * w)
+    k_proj_stage = compiler.alloc_staging(M * kv_dim * w)
+    v_proj_stage = compiler.alloc_staging(M * kv_dim * w)
+    q_bcast = compiler.alloc_staging(M * q_dim * w)
+    ctx_stage = compiler.alloc_staging(M * q_dim * w)
+    attn_wide = compiler.alloc_staging(M * hidden * w)
+
+    _emit_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
+    _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
+    _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_proj_stage)
+
+    # RoPE on Q (every query head) and the NEW K (every KV head) at this
+    # step's absolute position, while still row0-real-rest-zero -- RoPE
+    # doesn't care about that convention either side of it (pure
+    # elementwise+permute), so this is the same ordering
+    # _emit_attention_block_fp32 already uses.
+    for qh in range(n_heads):
+        off = qh * head_dim * w
+        _emit_rope_fp32(compiler, head_dim, pos, q_stage + off, q_stage + off,
+                        theta=rope_theta, in_stride=q_dim)
+    for kv_h in range(n_kv_heads):
+        off = kv_h * head_dim * w
+        _emit_rope_fp32(compiler, head_dim, pos, k_proj_stage + off, k_proj_stage + off,
+                        theta=rope_theta, in_stride=kv_dim)
+
+    # Q needs to be all-16-replicated for the attention core's own
+    # softmax convention (see _emit_attention_block_fp32's docstring).
+    _emit_broadcast_row0_fp32(compiler, q_stage, q_bcast, q_dim)
+
+    mask_addr = _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len)
+
+    k_t_wide_per_kv = []
+    for kv_h in range(n_kv_heads):
+        off = kv_h * head_dim * w
+        # Broadcast this head's NEW (already-rotated) K/V to all 16 rows
+        # -- _emit_kv_cache_append_fp32's contract needs the inserted row
+        # replicated, the same way GEMM needs any full operand tile.
+        k_new_bcast = compiler.alloc_staging(M * head_dim * w)
+        _emit_broadcast_row0_fp32(compiler, k_proj_stage + off, k_new_bcast, head_dim,
+                                  in_stride=kv_dim)
+        _emit_kv_cache_append_fp32(compiler, k_cache_tiles[kv_h][tile_idx],
+                                   k_new_bcast, row, head_dim)
+
+        v_new_bcast = compiler.alloc_staging(M * head_dim * w)
+        _emit_broadcast_row0_fp32(compiler, v_proj_stage + off, v_new_bcast, head_dim,
+                                  in_stride=kv_dim)
+        _emit_kv_cache_append_fp32(compiler, v_cache_tiles[kv_h][tile_idx],
+                                   v_new_bcast, row, head_dim)
+
+        # Transpose every ACTIVE cache tile into one contiguous
+        # (head_dim, seq_k) K^T -- matmul(q, k)'s literal semantics need
+        # K pre-transposed (see _emit_attention_core_fp32's docstring),
+        # and this needs to happen AFTER this step's append so the just-
+        # inserted row is included.
+        k_t_wide = compiler.alloc_staging(head_dim * seq_k * w)
+        for ti in range(n_active_tiles):
+            _emit_transpose_wide_fp32(compiler, head_dim,
+                                      in_addr=k_cache_tiles[kv_h][ti],
+                                      out_addr=k_t_wide + ti * M * w,
+                                      out_stride=seq_k)
+        k_t_wide_per_kv.append(k_t_wide)
+
+    rep = n_heads // n_kv_heads
+    for qh in range(n_heads):
+        kv_h = qh // rep
+        _emit_attention_core_fp32(
+            compiler, seq_k, head_dim,
+            q_addr=q_bcast + qh * head_dim * w,
+            k_addr=k_t_wide_per_kv[kv_h],
+            v_addr=v_cache_tiles[kv_h][0],   # base of the CONTIGUOUS V block
+            out_addr=ctx_stage + qh * head_dim * w,
+            mask_addr=mask_addr, q_stride=q_dim, out_stride=q_dim,
+        )
+
+    # ctx_stage comes out "all 16 rows identical" (the attention core's
+    # own convention); mask back down to "row 0 real, rest zero" before
+    # handing this block's result to the caller, same as
+    # _emit_attention_block_fp32.
+    _emit_matmul_fp32(compiler, M, hidden, q_dim, ctx_stage, wo_addr, attn_wide)
+    _emit_mask_to_row0_fp32(compiler, attn_wide, out_addr, hidden)
+
+
 def _emit_transformer_layer_fp32(compiler, hidden, inter, n_heads, n_kv_heads,
                                  head_dim, x_addr, gamma1_addr, gamma2_addr,
                                  wq_addr, wk_addr, wv_addr, wo_addr,
@@ -1886,6 +2065,166 @@ def _emit_model_batched_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
         )
         cur_in = cur_out
     return cur_in
+
+
+def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_heads,
+                                         head_dim, x_addr, gamma1_addr, gamma2_addr,
+                                         wq_addr, wk_addr, wv_addr, wo_addr,
+                                         wgate_addr, wup_addr, wdown_addr, out_addr,
+                                         pos, k_cache_tiles, v_cache_tiles, rope_theta=1e6):
+    """_emit_transformer_layer_fp32, but attending against a genuine
+    growing KV-cache (_emit_attention_block_kvcache_fp32) instead of
+    self-attending over one real token replicated 16x. This is the
+    actual per-layer, per-decode-step operation a real generation loop
+    needs -- RMSNorm/SwiGLU are REUSED VERBATIM (no cross-row reduction
+    /already-correct for a single real row either way).
+
+    k_cache_tiles/v_cache_tiles: THIS LAYER's own cache (see
+    _emit_attention_block_kvcache_fp32's docstring) -- every layer has
+    an independent KV-cache, unlike weights which are also per-layer but
+    unrelated to sequence position.
+    """
+    M = compiler.tile_dim
+    w = DType.BYTES[DType.FP32]
+
+    norm1 = compiler.alloc_staging(M * hidden * w)
+    attn_out = compiler.alloc_staging(M * hidden * w)
+    resid1 = compiler.alloc_staging(M * hidden * w)
+    norm2 = compiler.alloc_staging(M * hidden * w)
+    mlp_out = compiler.alloc_staging(M * hidden * w)
+
+    _emit_rmsnorm_row_fp32(compiler, hidden, x_addr=x_addr, gamma_addr=gamma1_addr,
+                           out_addr=norm1,
+                           scratch_addr=compiler.alloc_staging(4),
+                           stage_addr=compiler.alloc_staging(M * _padded(hidden) * 4))
+
+    _emit_attention_block_kvcache_fp32(
+        compiler, hidden, n_heads, n_kv_heads, head_dim,
+        x_addr=norm1, wq_addr=wq_addr, wk_addr=wk_addr, wv_addr=wv_addr, wo_addr=wo_addr,
+        out_addr=attn_out, pos=pos, k_cache_tiles=k_cache_tiles, v_cache_tiles=v_cache_tiles,
+        rope_theta=rope_theta,
+    )
+
+    _emit_residual_add_fp32(compiler, x_addr, attn_out, resid1, hidden)
+
+    _emit_rmsnorm_row_fp32(compiler, hidden, x_addr=resid1, gamma_addr=gamma2_addr,
+                           out_addr=norm2,
+                           scratch_addr=compiler.alloc_staging(4),
+                           stage_addr=compiler.alloc_staging(M * _padded(hidden) * 4))
+
+    _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr=norm2,
+                          w_gate_addr=wgate_addr, w_up_addr=wup_addr,
+                          w_down_addr=wdown_addr, out_addr=mlp_out)
+
+    _emit_residual_add_fp32(compiler, resid1, mlp_out, out_addr, hidden)
+
+
+def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_heads,
+                             head_dim, x_addr, layer_weights, scratch_a, scratch_b,
+                             pos, rope_theta=1e6):
+    """_emit_model_fp32, chaining _emit_transformer_layer_kvcache_fp32
+    instead -- same ping-pong buffering, same layer_weights contract
+    PLUS two more keys per layer: "k_cache"/"v_cache" (that layer's own
+    KV-cache tile-address lists -- see _emit_attention_block_kvcache_fp32's
+    docstring, and build_kvcache_model_dram_image for how these get
+    allocated). `pos` is the CURRENT decode step's absolute position,
+    forwarded unchanged to every layer, same reasoning as
+    _emit_model_fp32's `pos` (RoPE and the cache both depend on which
+    token this is, not which layer is processing it) -- this is the
+    actual whole-model per-decode-step operation a real generation loop
+    calls once per token, with a fresh instruction stream each time (the
+    ISA has no control flow -- see codegen.py's own docstring)."""
+    cur_in = x_addr
+    bufs = [scratch_b, scratch_a]
+    for i in range(n_layers):
+        cur_out = bufs[i % 2]
+        lw = layer_weights[i]
+        _emit_transformer_layer_kvcache_fp32(
+            compiler, hidden, inter, n_heads, n_kv_heads, head_dim,
+            x_addr=cur_in, gamma1_addr=lw["gamma1"], gamma2_addr=lw["gamma2"],
+            wq_addr=lw["wq"], wk_addr=lw["wk"], wv_addr=lw["wv"], wo_addr=lw["wo"],
+            wgate_addr=lw["wgate"], wup_addr=lw["wup"], wdown_addr=lw["wdown"],
+            out_addr=cur_out, pos=pos, k_cache_tiles=lw["k_cache"],
+            v_cache_tiles=lw["v_cache"], rope_theta=rope_theta,
+        )
+        cur_in = cur_out
+    return cur_in
+
+
+def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_dim,
+                                   max_seq_len, layer_weights_np):
+    """Like build_model_dram_image, but ALSO pre-allocates a per-layer,
+    per-KV-head, zero-initialized KV-cache sized for max_seq_len tokens
+    -- the layout _emit_model_kvcache_fp32 needs for a real multi-step
+    decode loop, where cache state must persist in the DRAM image ACROSS
+    separate rtv_sim invocations (one per decode step; the ISA has no
+    control flow, so there is no single "generate N tokens" program).
+
+    max_seq_len is rounded UP to a whole number of compiler.tile_dim-row
+    tiles (LOAD_TILE/STORE_TILE only move whole tiles -- see
+    _emit_kv_cache_append_fp32's docstring). Each KV head's OWN v_cache
+    tiles are allocated as ONE contiguous block (required -- see
+    _emit_attention_block_kvcache_fp32's docstring); k_cache tiles are
+    allocated the same way for simplicity, though only v_cache strictly
+    needs it.
+
+    Does NOT place an initial x row the way build_model_dram_image does
+    -- a decode loop's x changes every step (each step embeds whatever
+    token was just generated/given), so the caller places that fresh
+    each step at the returned x_addr. Returns (dram, x_addr,
+    layer_weight_addrs, scratch_a, scratch_b, max_tiles) --
+    layer_weight_addrs[i] has the usual 9 weight keys PLUS "k_cache"/
+    "v_cache" (each a list of n_kv_heads lists of max_tiles addresses),
+    ready for _emit_model_kvcache_fp32's layer_weights parameter.
+    """
+    M = compiler.tile_dim
+    max_tiles = -(-max_seq_len // M)   # ceil
+    w = DType.BYTES[DType.FP32]
+    cursor = [0x1000]
+    placed = []
+
+    def place(arr):
+        addr = cursor[0]
+        cursor[0] += arr.nbytes + 0x1000
+        placed.append((addr, arr))
+        return addr
+
+    def place_zeros(nbytes):
+        addr = cursor[0]
+        cursor[0] += nbytes + 0x1000
+        return addr   # zero-filled by the bytearray() below; nothing to stage
+
+    x_addr = place(np.zeros((M, hidden), dtype=np.float32))
+
+    layer_weight_addrs = []
+    for lw in layer_weights_np:
+        entry = {}
+        for name in ("gamma1", "gamma2"):
+            bcast = np.tile(np.asarray(lw[name], dtype=np.float32), (M, 1))
+            entry[name] = place(bcast)
+        for name in ("wq", "wk", "wv", "wo", "wgate", "wup", "wdown"):
+            entry[name] = place(np.asarray(lw[name], dtype=np.float32))
+
+        k_cache, v_cache = [], []
+        for _ in range(n_kv_heads):
+            k_base = place_zeros(max_tiles * M * head_dim * w)
+            k_cache.append([k_base + ti * M * head_dim * w for ti in range(max_tiles)])
+            v_base = place_zeros(max_tiles * M * head_dim * w)
+            v_cache.append([v_base + ti * M * head_dim * w for ti in range(max_tiles)])
+        entry["k_cache"] = k_cache
+        entry["v_cache"] = v_cache
+        layer_weight_addrs.append(entry)
+
+    scratch_a = place(np.zeros((M, hidden), dtype=np.float32))
+    scratch_b = place(np.zeros((M, hidden), dtype=np.float32))
+
+    compiler._dram_cursor = cursor[0] + 0x10000
+
+    dram = bytearray(cursor[0] + 0x20000)
+    for addr, arr in placed:
+        dram[addr:addr + arr.nbytes] = arr.tobytes()
+
+    return dram, x_addr, layer_weight_addrs, scratch_a, scratch_b, max_tiles
 
 
 def build_model_dram_image(compiler, hidden, n_layers, x_row, layer_weights_np):

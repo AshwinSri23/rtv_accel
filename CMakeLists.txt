@@ -126,6 +126,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_attention_batched   # genuinely different rows, real per-row softmax
         test_kv_cache            # growing multi-tile KV-cache, append + tail mask
         test_attention_wide_headdim  # head_dim > tile_dim, incl. Qwen3's real hd=128
+        test_decode_loop         # multi-step decode loop, state persists across rtv_sim runs
     )
     foreach(RTV_TVM_TEST ${RTV_TVM_TESTS})
         add_test(NAME ${RTV_TVM_TEST}
