@@ -5,7 +5,7 @@ This document outlines the design and implementation of a custom Neural Processi
 
 > **Scope note.** This project also includes a Linux kernel driver layer (`/dev/rtv_accel`, DMA API, `mmap` zero-copy, `ioctl` control), deferred rather than dropped: three of five planned parts are implemented and verified (character device registration, an `ioctl`-based control-plane handshake with real kernel wait-queue blocking, all tested inside a `virtme-ng` VM), but work on it is paused so the ISA/simulator/compiler core can be brought to full correctness first — the driver doesn't affect that correctness in either direction. See `driver/` for the current implementation.
 
-> **Platform note.** "NPU" and "silicon" throughout this document describe what the ISA/simulator MODEL, not hardware this project has ever run on. Every build, test, and benchmark to date has run on x86-64 (the AVX2-vectorized PE array path, `src/pe_array.cpp`) — there is no physical RTV-Accel silicon, and the ARM/NEON path referenced in §2 compiles but has never actually executed, on real AArch64 hardware or otherwise (this repo has no cross-compiler or emulator for it either). Where the text below says "target Raspberry Pi 5 platform" or similar, read it as the intended eventual deployment target this project is designed toward, not a claim about where anything has actually run — see TODO.md's Phase 4.1 for that gap tracked as open work.
+> **Platform note.** "NPU" and "silicon" throughout this document describe what the ISA/simulator MODEL, not hardware this project has ever run on. Every build, test, and benchmark to date has run on x86-64 (the AVX2-vectorized PE array path, `src/pe_array.cpp`) — there is no physical RTV-Accel silicon, and the ARM/NEON path referenced in §2 compiles but has never actually executed, on real AArch64 hardware or otherwise (this repo has no cross-compiler or emulator for it either). Where the text below says "target Raspberry Pi 5 platform" or similar, read it as the intended eventual deployment target this project is designed toward, not a claim about where anything has actually run. Validating the NEON path on real ARM hardware is not currently tracked as planned work — this project's own development happens on x86-64.
 
 ---
 
@@ -130,7 +130,7 @@ The simulator is implemented as a cycle-approximate behavioral model in C++, opt
 
 * **Memory Controller:** Manages tiered memory simulation, modeling the latency gap between DRAM and local SRAM. Implements **SRAM Partitioning** to support concurrent execution.
 * **Instruction Dispatcher:** Parses instructions and routes them to dual asynchronous execution queues (Load/Store Engine vs. Compute Engine).
-* **PE Array:** A functional model of a $16 \times 16$ systolic array engine, vectorized on whichever SIMD ISA the build machine actually has: **Arm Neon** on AArch64, **AVX2** on x86-64 (`check_cxx_source_runs` selects it only when the build machine can actually execute it, not just accept the compiler flag — see `CMakeLists.txt`). Every development, build, and test run of this project to date has been on an x86-64 machine (this one included: an Intel Core Ultra 7 258V, 8 threads, AVX2 present), via the AVX2 path — that is the ONLY path with any real execution history behind it. The NEON path compiles (cross-compilation isn't even attempted from this machine — no `aarch64-linux-gnu-gcc` or QEMU user-mode emulation is installed here) but has never actually been *run*, on real ARM hardware or otherwise; "the target Raspberry Pi 5 platform" describes an intended eventual deployment target, not the platform this simulator has ever executed on. Closing that gap is TODO.md's Phase 4.1 (Physical ARM NEON Validation), open and unstarted as of this writing.
+* **PE Array:** A functional model of a $16 \times 16$ systolic array engine, vectorized on whichever SIMD ISA the build machine actually has: **Arm Neon** on AArch64, **AVX2** on x86-64 (`check_cxx_source_runs` selects it only when the build machine can actually execute it, not just accept the compiler flag — see `CMakeLists.txt`). Every development, build, and test run of this project to date has been on an x86-64 machine (this one included: an Intel Core Ultra 7 258V, 8 threads, AVX2 present), via the AVX2 path — that is the ONLY path with any real execution history behind it. The NEON path compiles (cross-compilation isn't even attempted from this machine — no `aarch64-linux-gnu-gcc` or QEMU user-mode emulation is installed here) but has never actually been *run*, on real ARM hardware or otherwise; "the target Raspberry Pi 5 platform" describes an intended eventual deployment target, not the platform this simulator has ever executed on. Validating it on real ARM hardware isn't tracked as active work in this repository — this project develops and tests on x86-64.
 
 ---
 
@@ -333,10 +333,11 @@ same treatment as TODO.md's own Phase 2.
 
 ### **Deferred**
 
-Driver parts 4-5 (DMA/`mmap`, daemon — TODO.md Phase 3, deliberately last)
-and physical ARM NEON validation (TODO.md Phase 4 — needs real AArch64
-hardware; every build and test run to date has been x86-64/AVX2, see the
-Platform note at the top of this document).
+Driver parts 4-5 (DMA/`mmap`, daemon — TODO.md Phase 3, deliberately last).
+Physical ARM NEON validation is not tracked as planned work at all — this
+project develops and tests on x86-64 (see the Platform note at the top of
+this document); the NEON path stays in the simulator as a real hardware
+capability, just not one anything here currently verifies.
 
 The recompile-per-token cost itself (the ISA has no control flow, so each
 decode step is a freshly compiled instruction stream — see "What TVM does

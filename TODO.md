@@ -4,7 +4,7 @@ This document outlines the pending implementation tasks and milestones required 
 
 **2026-09-08 precision pivot:** the NPU now targets native FP32 precision — INT8 quantization is out of scope. Most INT8-centric language below (in this doc, in the now-deleted `npu_compiler.py`'s comments, and in the spec doc itself) predates this decision. Concretely: Phase 2 is moot (it's entirely INT8 calibration work), and the original reason `tvm_backend.py` kept `npu_compiler.py` as the instruction-emitting backend — preserving hard-won INT8 scale semantics — no longer applied, since FP32 has none of that (confirmed directly against `pe_array.cpp`: FP32 GEMM/ELEMWISE_MUL/RMS_SCALE are the literal float operation, no fixed-point convention anywhere). This is what made 1.5 (retiring `npu_compiler.py` outright) tractable.
 
-**2026-09-10 — Phase 1 complete.** Every item below is checked off: the TVM path (`tvm_backend.py` + `rtv_tvm/`) is now the sole compiler, `npu_compiler.py` is deleted, and the surviving shared device/runtime state lives in `toolchain/compiler_state.py`. 73 TVM-path tests across 12 files (plus the pre-existing 28-case `test_tvm_path.py`, folded into that count) all pass, verified through a real `cmake` + `ctest` run, not just manual invocation. What Phase 1 does NOT cover, by design: genuinely batched multi-row processing and the KV-cache are built and verified at the attention-core level but not wired into a full per-layer/per-model decode loop with real projections (mechanical assembly of existing pieces, not a remaining open question); `head_dim > compiler.tile_dim` (e.g. 32) is unsupported throughout the attention path (K's per-head transpose and RoPE's intra-tile permutation both need generalizing to multi-tile first); and Phases 2-4 below are separate, untouched efforts (Phase 2 is dropped/moot, Phases 3-4 are kernel-driver and hardware-validation work this effort never touched).
+**2026-09-10 — Phase 1 complete.** Every item below is checked off: the TVM path (`tvm_backend.py` + `rtv_tvm/`) is now the sole compiler, `npu_compiler.py` is deleted, and the surviving shared device/runtime state lives in `toolchain/compiler_state.py`. 73 TVM-path tests across 12 files (plus the pre-existing 28-case `test_tvm_path.py`, folded into that count) all pass, verified through a real `cmake` + `ctest` run, not just manual invocation. What Phase 1 does NOT cover, by design: genuinely batched multi-row processing and the KV-cache are built and verified at the attention-core level but not wired into a full per-layer/per-model decode loop with real projections (mechanical assembly of existing pieces, not a remaining open question); `head_dim > compiler.tile_dim` (e.g. 32) is unsupported throughout the attention path (K's per-head transpose and RoPE's intra-tile permutation both need generalizing to multi-tile first); and Phases 2-3 below are separate, untouched efforts (Phase 2 is dropped/moot, Phase 3 is kernel-driver work this effort never touched — deliberately saved for last). Phase 4 (hardware/platform verification) was removed entirely: 4.1 needed physical ARM hardware this project doesn't target (development is x86-64 only), and 4.2 depended on coordinating with `rtv_core`, a separate project out of scope for this repo's own roadmap.
 
 ---
 
@@ -84,10 +84,3 @@ This document outlines the pending implementation tasks and milestones required 
   - [ ] Implement `mmap` file operations for zero-copy memory sharing between userspace DRAM buffers and hardware memory controller.
 - [ ] **3.2. Phase 5: Userspace Runtime Service**
   - [ ] Develop userspace runtime daemon/service for multi-process job queue submission and interrupt handling.
-
----
-
-## Phase 4: Hardware & Platform Verification
-
-- [ ] **4.1. Physical ARM NEON Validation**
-  - [ ] Test and verify ARM NEON SIMD path on physical AArch64 hardware (Raspberry Pi 5 / Cortex-A76).
