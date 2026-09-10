@@ -1,0 +1,24 @@
+{
+    "pe_array_dim":        16,
+    "sram_size_bytes":     65536,
+    "sram_partitions":     2,
+    "bus_width_bits":      128,
+    "dram_latency_cycles": 120,
+    "sram_latency_cycles": 1,
+    "tile_size_bytes":     256,
+    "model": {
+        "name":              "Qwen3-0.6B",
+        "architecture":      "Qwen3ForCausalLM",
+        "hf_repo":           "Qwen/Qwen3-0.6B",
+        "hidden_size":       1024,
+        "intermediate_size": 3072,
+        "num_layers":        28,
+        "num_heads":         16,
+        "num_kv_heads":      8,
+        "head_dim":          128,
+        "vocab_size":        151936,
+        "rope_theta":        1000000,
+        "rms_norm_eps":      1e-6,
+        "max_position_embeddings": 40960
+    }
+}
