@@ -128,6 +128,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_attention_wide_headdim  # head_dim > tile_dim, incl. Qwen3's real hd=128
         test_decode_loop         # multi-step decode loop, state persists across rtv_sim runs
         test_checkpoint_loader   # real Qwen3-0.6B weights; skips cleanly if not downloaded locally
+        test_checkpoint_decode_loop  # real Qwen3-0.6B weights through a genuine multi-step decode loop
     )
     foreach(RTV_TVM_TEST ${RTV_TVM_TESTS})
         add_test(NAME ${RTV_TVM_TEST}
