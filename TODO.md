@@ -91,5 +91,3 @@ This document outlines the pending implementation tasks and milestones required 
 
 - [ ] **4.1. Physical ARM NEON Validation**
   - [ ] Test and verify ARM NEON SIMD path on physical AArch64 hardware (Raspberry Pi 5 / Cortex-A76).
-- [ ] **4.2. Control Flow Inefficiency (Future Hardware Extension)**
-  - [ ] Coordinate with sibling `rtv_core` scalar control core project to introduce basic control flow and remove per-token recompilation for auto-regressive decode.
