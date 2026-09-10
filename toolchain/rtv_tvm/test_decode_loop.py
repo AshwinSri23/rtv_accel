@@ -23,7 +23,11 @@ back in as step t+1's --dram-image.
 Verified against a genuine incremental numpy reference (real distinct
 per-step tokens, real growing attention context, real RoPE at each
 token's true position, N layers) -- not a single-shot batch pretending to
-be a loop.
+be a loop. One case (decode_2layer_gqa_qk_norm) also exercises Qwen3's
+per-head q_norm/k_norm RMSNorm (applied after projection, before RoPE --
+see _emit_attention_block_kvcache_fp32's docstring) with random weights,
+independent of test_checkpoint_loader.py's real-checkpoint coverage of
+the same feature (which skips cleanly when no checkpoint is downloaded).
 
 Run with the TVM venv:  .venv-tvm/bin/python toolchain/rtv_tvm/test_decode_loop.py
 """
@@ -87,7 +91,7 @@ def _run_sim(instr_stream, dram_path_in, dram_path_out, extra_dumps=()):
 
 
 def run_decode_loop_case(hidden, inter, n_heads, n_kv_heads, head_dim,
-                         n_layers, n_steps, seed=17):
+                         n_layers, n_steps, seed=17, use_qk_norm=False):
     rng = np.random.default_rng(seed)
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
     w = DType.BYTES[DType.FP32]
@@ -97,13 +101,17 @@ def run_decode_loop_case(hidden, inter, n_heads, n_kv_heads, head_dim,
 
     layers_np = []
     for _ in range(n_layers):
-        layers_np.append(dict(
+        lw = dict(
             gamma1=rng.uniform(0.5, 1.5, size=(hidden,)).astype(np.float32),
             gamma2=rng.uniform(0.5, 1.5, size=(hidden,)).astype(np.float32),
             wq=w_((hidden, q_dim)), wk=w_((hidden, kv_dim)), wv=w_((hidden, kv_dim)),
             wo=w_((q_dim, hidden)), wgate=w_((hidden, inter)), wup=w_((hidden, inter)),
             wdown=w_((inter, hidden)),
-        ))
+        )
+        if use_qk_norm:
+            lw["q_norm"] = rng.uniform(0.5, 1.5, size=(head_dim,)).astype(np.float32)
+            lw["k_norm"] = rng.uniform(0.5, 1.5, size=(head_dim,)).astype(np.float32)
+        layers_np.append(lw)
 
     token_rows = [rng.normal(size=(hidden,)).astype(np.float32) * 0.3 for _ in range(n_steps)]
 
@@ -120,6 +128,10 @@ def run_decode_loop_case(hidden, inter, n_heads, n_kv_heads, head_dim,
             q = (norm1 @ lw["wq"]).reshape(n_heads, head_dim)
             k_new = (norm1 @ lw["wk"]).reshape(n_kv_heads, head_dim)
             v_new = (norm1 @ lw["wv"]).reshape(n_kv_heads, head_dim)
+            if use_qk_norm:
+                q = np.stack([_rmsnorm_ref(q[h], lw["q_norm"]) for h in range(n_heads)])
+                k_new = np.stack([_rmsnorm_ref(k_new[h], lw["k_norm"])
+                                  for h in range(n_kv_heads)])
             q = np.stack([_rope_ref(q[h], t, head_dim) for h in range(n_heads)])
             k_new = np.stack([_rope_ref(k_new[h], t, head_dim) for h in range(n_kv_heads)])
             for h in range(n_kv_heads):
@@ -220,6 +232,9 @@ def main():
          lambda: run_decode_loop_case(32, 48, 1, 1, 16, n_layers=1, n_steps=20)),
         ("decode_2layer_headdim32",
          lambda: run_decode_loop_case(48, 64, 2, 1, 32, n_layers=2, n_steps=8)),
+        ("decode_2layer_gqa_qk_norm",
+         lambda: run_decode_loop_case(32, 48, 4, 2, 16, n_layers=2, n_steps=10,
+                                      use_qk_norm=True)),
     ]
     n_pass = 0
     for name, fn in cases:

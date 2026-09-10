@@ -225,7 +225,7 @@ def offloaded_composites(mod):
     return out
 
 
-def _rmsnorm_prim_fp32(M, N):
+def _rmsnorm_prim_fp32(M, N, x_stride=None, out_stride=None):
     """One RMSNorm-with-gamma tile, as three chained FP32 PrimFuncs.
 
     Returns (sumsq_func, rms_scale_func, mul_func). Buffer variable names
@@ -233,10 +233,22 @@ def _rmsnorm_prim_fp32(M, N):
     buffer from the LOCAL VARIABLE it's assigned to in match_buffer, not the
     handle parameter's name (confirmed against how test_tvm_path.py's own
     build_* functions are consumed).
+
+    x_stride/out_stride (row pitch in ELEMENTS, same convention as
+    _matmul_prim_fp32's a_stride/b_stride/c_stride) let the INPUT and FINAL
+    OUTPUT be a column slice of a wider buffer -- e.g. one head's
+    head_dim-wide q_norm slice out of a (M, n_heads*head_dim) Q projection
+    buffer, normalized in place without first de-interleaving that head into
+    its own tight buffer. Only the two ends of the three-pass chain need
+    this: `scratch_addr` (the scalar accumulator) and `stage_addr` (the
+    post-scale, pre-gamma intermediate) are this function's OWN dedicated
+    temporaries, always tightly packed at (M, N) regardless of what x_addr/
+    out_addr are sliced from.
     """
     @T.prim_func(s_tir=True)
     def sq(a: T.handle, s: T.handle) -> None:
-        A = T.match_buffer(a, (M, N), "float32")
+        A = T.match_buffer(a, (M, N), "float32",
+                           strides=([x_stride, 1] if x_stride is not None else None))
         S = T.match_buffer(s, (1,), "float32")
         for i, j in T.grid(M, N):
             with T.sblock("sumsq"):
@@ -248,7 +260,8 @@ def _rmsnorm_prim_fp32(M, N):
     @T.prim_func(s_tir=True)
     def rms(s: T.handle, a: T.handle, c: T.handle) -> None:
         S = T.match_buffer(s, (1,), "float32")
-        A = T.match_buffer(a, (M, N), "float32")
+        A = T.match_buffer(a, (M, N), "float32",
+                           strides=([x_stride, 1] if x_stride is not None else None))
         C = T.match_buffer(c, (M, N), "float32")
         for i, j in T.grid(M, N):
             with T.sblock("rms"):
@@ -259,7 +272,8 @@ def _rmsnorm_prim_fp32(M, N):
     def mul(a: T.handle, b: T.handle, c: T.handle) -> None:
         A = T.match_buffer(a, (M, N), "float32")
         B = T.match_buffer(b, (M, N), "float32")
-        C = T.match_buffer(c, (M, N), "float32")
+        C = T.match_buffer(c, (M, N), "float32",
+                           strides=([out_stride, 1] if out_stride is not None else None))
         for i, j in T.grid(M, N):
             with T.sblock("mul"):
                 vi, vj = T.axis.remap("SS", [i, j])
@@ -269,7 +283,7 @@ def _rmsnorm_prim_fp32(M, N):
 
 
 def _emit_rmsnorm_row_fp32(compiler, hidden, x_addr, gamma_addr, out_addr,
-                           scratch_addr, stage_addr):
+                           scratch_addr, stage_addr, x_stride=None, out_stride=None):
     """One row of RMSNorm-with-gamma, entirely via TVM schedule+codegen --
     npu_compiler.py's compile_* methods are not called.
 
@@ -291,9 +305,17 @@ def _emit_rmsnorm_row_fp32(compiler, hidden, x_addr, gamma_addr, out_addr,
     directly, see git history / prior session notes). Replicating gamma
     once in the DRAM image the caller builds sidesteps that failure mode
     entirely rather than reproducing it.
+
+    `x_stride`/`out_stride` (row pitch in elements): pass these when x_addr/
+    out_addr are a column slice of a wider buffer rather than their own
+    tight (16, hidden) allocation -- e.g. Qwen3's per-head q_norm/k_norm,
+    applied in place to one head's head_dim-wide slice of the wide Q/K
+    projection buffer (hidden here is head_dim, and x_stride/out_stride is
+    the full q_dim/kv_dim row pitch). None (the default) means tightly
+    packed, matching every pre-existing caller.
     """
     M = compiler.tile_dim
-    sq, rms, mul = _rmsnorm_prim_fp32(M, hidden)
+    sq, rms, mul = _rmsnorm_prim_fp32(M, hidden, x_stride, out_stride)
 
     codegen.emit(compiler,
                  schedule.schedule_reduce(sq, "sumsq", intrin.register_sumsq_fp32()),
@@ -1731,7 +1753,7 @@ def _emit_attention_block_batched_fp32(compiler, hidden, n_heads, n_kv_heads, he
 def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
                                        x_addr, wq_addr, wk_addr, wv_addr, wo_addr,
                                        out_addr, pos, k_cache_tiles, v_cache_tiles,
-                                       rope_theta=1e6):
+                                       rope_theta=1e6, q_norm_addr=None, k_norm_addr=None):
     """The actual decode-step attention operation: project Q/K/V for the
     CURRENT real token, apply RoPE at its absolute position, append the
     new K/V into a genuine growing multi-tile KV-cache, then attend over
@@ -1764,6 +1786,18 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     (the layer-level convention -- see _emit_rmsnorm_row_fp32's
     docstring). head_dim must be a multiple of compiler.tile_dim (16),
     same as _emit_attention_block_fp32.
+
+    q_norm_addr/k_norm_addr: real Qwen3 applies a per-head RMSNorm to Q
+    and K -- ONE shared (head_dim,) gain per projection, reused by every
+    head -- right after projection/reshape and before RoPE (confirmed
+    against Qwen3Attention.forward: `q_norm(q_proj(x).view(...))` then
+    RoPE). Each must point at a genuine (16, head_dim) broadcast buffer
+    (gamma physically repeated across all 16 rows, same contract as
+    gamma1_addr/gamma2_addr elsewhere), the SAME buffer reused for every
+    head since the gain is shared, not per-head. None (default) skips
+    this step entirely, preserving every caller that predates this
+    architectural detail (e.g. every random-weight test in this
+    directory, which has no q_norm/k_norm to load).
     """
     if head_dim % compiler.tile_dim != 0:
         raise NotImplementedError(
@@ -1795,6 +1829,32 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     _emit_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
     _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
     _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_proj_stage)
+
+    # Qwen3's per-head q_norm/k_norm: one shared (head_dim,) RMSNorm gain,
+    # applied independently to each head's own head_dim-wide slice, IN
+    # PLACE on the wide projection buffer (x_stride/out_stride = q_dim or
+    # kv_dim) -- right after projection, before RoPE, matching real
+    # Qwen3's op ordering. norm_scratch/norm_stage are this step's own
+    # tight temporaries, reused serially across every head (nothing here
+    # needs them to persist between calls).
+    if q_norm_addr is not None:
+        norm_scratch = compiler.alloc_staging(w)
+        norm_stage = compiler.alloc_staging(M * _padded(head_dim) * w)
+        for qh in range(n_heads):
+            off = qh * head_dim * w
+            _emit_rmsnorm_row_fp32(compiler, head_dim, x_addr=q_stage + off,
+                                   gamma_addr=q_norm_addr, out_addr=q_stage + off,
+                                   scratch_addr=norm_scratch, stage_addr=norm_stage,
+                                   x_stride=q_dim, out_stride=q_dim)
+    if k_norm_addr is not None:
+        norm_scratch = compiler.alloc_staging(w)
+        norm_stage = compiler.alloc_staging(M * _padded(head_dim) * w)
+        for kv_h in range(n_kv_heads):
+            off = kv_h * head_dim * w
+            _emit_rmsnorm_row_fp32(compiler, head_dim, x_addr=k_proj_stage + off,
+                                   gamma_addr=k_norm_addr, out_addr=k_proj_stage + off,
+                                   scratch_addr=norm_scratch, stage_addr=norm_stage,
+                                   x_stride=kv_dim, out_stride=kv_dim)
 
     # RoPE on Q (every query head) and the NEW K (every KV head) at this
     # step's absolute position, while still row0-real-rest-zero -- RoPE
@@ -2071,7 +2131,8 @@ def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_
                                          head_dim, x_addr, gamma1_addr, gamma2_addr,
                                          wq_addr, wk_addr, wv_addr, wo_addr,
                                          wgate_addr, wup_addr, wdown_addr, out_addr,
-                                         pos, k_cache_tiles, v_cache_tiles, rope_theta=1e6):
+                                         pos, k_cache_tiles, v_cache_tiles, rope_theta=1e6,
+                                         q_norm_addr=None, k_norm_addr=None):
     """_emit_transformer_layer_fp32, but attending against a genuine
     growing KV-cache (_emit_attention_block_kvcache_fp32) instead of
     self-attending over one real token replicated 16x. This is the
@@ -2083,6 +2144,10 @@ def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_
     _emit_attention_block_kvcache_fp32's docstring) -- every layer has
     an independent KV-cache, unlike weights which are also per-layer but
     unrelated to sequence position.
+
+    q_norm_addr/k_norm_addr: forwarded unchanged to
+    _emit_attention_block_kvcache_fp32 (see its docstring) -- None skips
+    Qwen3's q_norm/k_norm step, for callers whose weights don't have it.
     """
     M = compiler.tile_dim
     w = DType.BYTES[DType.FP32]
@@ -2102,7 +2167,7 @@ def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_
         compiler, hidden, n_heads, n_kv_heads, head_dim,
         x_addr=norm1, wq_addr=wq_addr, wk_addr=wk_addr, wv_addr=wv_addr, wo_addr=wo_addr,
         out_addr=attn_out, pos=pos, k_cache_tiles=k_cache_tiles, v_cache_tiles=v_cache_tiles,
-        rope_theta=rope_theta,
+        rope_theta=rope_theta, q_norm_addr=q_norm_addr, k_norm_addr=k_norm_addr,
     )
 
     _emit_residual_add_fp32(compiler, x_addr, attn_out, resid1, hidden)
@@ -2133,7 +2198,13 @@ def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
     token this is, not which layer is processing it) -- this is the
     actual whole-model per-decode-step operation a real generation loop
     calls once per token, with a fresh instruction stream each time (the
-    ISA has no control flow -- see codegen.py's own docstring)."""
+    ISA has no control flow -- see codegen.py's own docstring).
+
+    Each layer's dict may ALSO carry "q_norm"/"k_norm" (Qwen3's per-head
+    RMSNorm gain, see _emit_attention_block_kvcache_fp32's docstring);
+    missing/None on a given layer just skips that step for it, so
+    weights without this key (every random-weight test predating it)
+    keep working unchanged."""
     cur_in = x_addr
     bufs = [scratch_b, scratch_a]
     for i in range(n_layers):
@@ -2146,6 +2217,7 @@ def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
             wgate_addr=lw["wgate"], wup_addr=lw["wup"], wdown_addr=lw["wdown"],
             out_addr=cur_out, pos=pos, k_cache_tiles=lw["k_cache"],
             v_cache_tiles=lw["v_cache"], rope_theta=rope_theta,
+            q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
         )
         cur_in = cur_out
     return cur_in
@@ -2176,6 +2248,13 @@ def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_
     layer_weight_addrs[i] has the usual 9 weight keys PLUS "k_cache"/
     "v_cache" (each a list of n_kv_heads lists of max_tiles addresses),
     ready for _emit_model_kvcache_fp32's layer_weights parameter.
+
+    If a layer's dict in layer_weights_np has "q_norm"/"k_norm" (Qwen3's
+    per-head RMSNorm gain, each (head_dim,) -- see checkpoint_loader.py),
+    each is broadcast to a genuine (M, head_dim) buffer (same convention
+    as gamma1/gamma2) and placed once per layer; entry["q_norm"]/
+    ["k_norm"] is then that address, or None if the layer's dict has no
+    such key (every random-weight test predating this).
     """
     M = compiler.tile_dim
     max_tiles = -(-max_seq_len // M)   # ceil
@@ -2204,6 +2283,12 @@ def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_
             entry[name] = place(bcast)
         for name in ("wq", "wk", "wv", "wo", "wgate", "wup", "wdown"):
             entry[name] = place(np.asarray(lw[name], dtype=np.float32))
+        for name in ("q_norm", "k_norm"):
+            if name in lw and lw[name] is not None:
+                bcast = np.tile(np.asarray(lw[name], dtype=np.float32), (M, 1))
+                entry[name] = place(bcast)
+            else:
+                entry[name] = None
 
         k_cache, v_cache = [], []
         for _ in range(n_kv_heads):
