@@ -387,6 +387,22 @@ int main(int argc, char* argv[])
         }
         out.write(reinterpret_cast<const char*>(buf.data()),
                   static_cast<std::streamsize>(buf.size()));
+        // write() doesn't throw on failure -- it just sets the stream's
+        // failbit, which nothing here checked before. A full disk/tmpfs
+        // (this project's own callers round-trip DRAM images through
+        // /tmp, which can be a size-capped RAM-backed tmpfs) then produced
+        // a silently truncated or empty file with exit code 0 -- a caller
+        // reading it back saw "0 bytes", not a clear error, which is
+        // exactly as confusing as it sounds (confirmed hitting this
+        // directly running toolchain/generate.py at Qwen3-0.6B's real
+        // 28-layer scale: /tmp filled up mid-run and this line is the
+        // only place that would have caught it before the caller did).
+        if (!out) {
+            std::fprintf(stderr,
+                "error: write to --dump file %s failed (disk/tmpfs full?)\n",
+                d.path.c_str());
+            return 1;
+        }
         std::printf("dumped   : 0x%08X +%zu -> %s\n", d.addr, d.len, d.path.c_str());
     }
 
