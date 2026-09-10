@@ -162,8 +162,8 @@ registers, scalar loads and stores, branches. RTV-Accel has no register file,
 no control flow, and 128-bit instructions performing whole 16x16 GEMMs with
 DMA dependencies tracked by `dep_id`. There is no sensible lowering from LLVM
 IR to `COMPUTE_GEMM`, and LLVM's register allocator and scheduler would have
-nothing to allocate or schedule. (LLVM *is* the right target for a scalar ISA
-— see the sibling RTV-Core project.)
+nothing to allocate or schedule — LLVM is the right tool for a scalar
+register-machine ISA, which this is not.
 
 **TVM over MLIR.** TVM provides the fastest, cleanest path to end-to-end correctness for RTV-Accel:
 
@@ -333,12 +333,16 @@ same treatment as TODO.md's own Phase 2.
 
 ### **Deferred**
 
-Driver parts 4-5 (DMA/`mmap`, daemon — TODO.md Phase 3, deliberately last),
-physical ARM NEON validation (TODO.md Phase 4.1 — needs real AArch64
+Driver parts 4-5 (DMA/`mmap`, daemon — TODO.md Phase 3, deliberately last)
+and physical ARM NEON validation (TODO.md Phase 4 — needs real AArch64
 hardware; every build and test run to date has been x86-64/AVX2, see the
-Platform note at the top of this document), and a scalar control core to
-remove the recompile-per-token (TODO.md Phase 4.2) — the last of which is
-the single largest structural inefficiency and is tracked in the sibling
-RTV-Core project.
+Platform note at the top of this document).
+
+The recompile-per-token cost itself (the ISA has no control flow, so each
+decode step is a freshly compiled instruction stream — see "What TVM does
+not fix," above) is the single largest structural inefficiency in this
+design. Removing it needs a scalar control core capable of real branches
+and loops — out of scope for rtv_accel itself, which is a fixed-function
+tensor ISA by design, not a roadmap item tracked in this repository.
 
 ```
