@@ -16,16 +16,12 @@ compatible only where in==out, wrong everywhere else, no error raised).
 Every 2-D projection weight below is transposed on load specifically to
 avoid repeating that.
 
-What this does NOT do, and why that's a real, tracked gap rather than an
-oversight: Qwen3 applies a per-head RMSNorm to Q and K (`q_norm.weight`/
-`k_norm.weight`, each a (head_dim,) gain shared across every head) BEFORE
-RoPE -- confirmed present in the real checkpoint (every layer has both).
-tvm_backend._emit_attention_block_kvcache_fp32 has no such step. This
-loader still extracts and returns those weights (as `q_norm`/`k_norm` in
-each layer's dict) so nothing is silently dropped, but nothing in the
-compiler consumes them yet -- running a real checkpoint through the
-current pipeline is not yet a faithful reproduction of Qwen3's actual
-forward pass for exactly this reason. See TODO.md.
+Also extracted: `q_norm.weight`/`k_norm.weight` (each a (head_dim,) gain,
+shared across every head), Qwen3's per-head RMSNorm applied to Q and K
+after projection, before RoPE. tvm_backend._emit_attention_block_kvcache_fp32
+now implements that step (q_norm_addr/k_norm_addr) --
+build_kvcache_model_dram_image reads these two keys straight off each
+layer's dict here and broadcasts/places them the same way as gamma1/gamma2.
 
 Also host-side, not compiled to the NPU at all, consistent with the
 established design (embedding gather and argmax sampling are already

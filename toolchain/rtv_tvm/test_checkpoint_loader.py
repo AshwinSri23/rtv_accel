@@ -14,17 +14,18 @@ actual model file, run them through _emit_model_kvcache_fp32 and rtv_sim,
 and check against a numpy reference built from the IDENTICAL loaded
 tensors (not re-derived, not re-randomized).
 
-This is NOT a claim that the result matches real Qwen3-0.6B's actual
-published behavior -- it deliberately is not, for a real, documented
-reason: Qwen3 applies a per-head RMSNorm to Q and K (`q_norm`/`k_norm`)
-before RoPE, which tvm_backend._emit_attention_block_kvcache_fp32 does not
-implement yet (see checkpoint_loader.py's module docstring). Both the
-device path and this test's own numpy reference skip that step
-IDENTICALLY, so what this proves is "the loader's real weight values,
-run through the real compiler pipeline at real dimensions, agree with an
-independent computation using those same values" -- loader + compiler
-correctness, not architectural fidelity to Qwen3's true forward pass.
-That gap is tracked in TODO.md, not hidden here.
+tvm_backend._emit_attention_block_kvcache_fp32 now implements Qwen3's
+per-head q_norm/k_norm RMSNorm (applied after projection, before RoPE --
+see its docstring), and this test's own numpy reference applies it too,
+using the SAME loaded q_norm/k_norm gains -- so what this proves is now
+closer to genuine architectural fidelity: real checkpoint values, real
+q_norm/k_norm, run through the real compiler pipeline at real
+dimensions, agreeing with an independent computation using those same
+values. (The one still-missing piece for a bit-for-bit match against
+Qwen3-0.6B's own published outputs is attending over a genuine multi-
+token context -- this reference still uses "one real cached key, this
+step's own" per the comment below, same as every other test in this
+directory; see TODO.md.)
 
 Real dimensions are slow: expect this file to take noticeably longer than
 anything else in this directory (~10-40s per case, dominated by TVM
@@ -114,8 +115,10 @@ def run_real_checkpoint_case(model_dir, n_layers, token_id, pos=0, seed=0):
 
     x_row = embed_tokens[token_id].astype(np.float32)
 
-    # Numpy reference over the SAME loaded real tensors -- no q_norm/k_norm,
-    # matching what the device path below also skips (see module docstring).
+    # Numpy reference over the SAME loaded real tensors, INCLUDING
+    # q_norm/k_norm (a per-head RMSNorm, applied after projection, before
+    # RoPE -- see module docstring), matching what the device path below
+    # now also implements.
     cur = x_row.astype(np.float64)
     rep = n_heads // n_kv_heads
     for lw in layers:
@@ -123,6 +126,8 @@ def run_real_checkpoint_case(model_dir, n_layers, token_id, pos=0, seed=0):
         q = (norm1 @ lw["wq"]).reshape(n_heads, head_dim)
         k = (norm1 @ lw["wk"]).reshape(n_kv_heads, head_dim)
         v = (norm1 @ lw["wv"]).reshape(n_kv_heads, head_dim)
+        q = np.stack([_rmsnorm_ref(q[h], lw["q_norm"], eps) for h in range(n_heads)])
+        k = np.stack([_rmsnorm_ref(k[h], lw["k_norm"], eps) for h in range(n_kv_heads)])
         q = np.stack([_rope_ref(q[h], pos, head_dim, rope_theta) for h in range(n_heads)])
         k = np.stack([_rope_ref(k[h], pos, head_dim, rope_theta) for h in range(n_kv_heads)])
         ctx = np.zeros((n_heads, head_dim), dtype=np.float64)
