@@ -96,6 +96,22 @@ class NPUCompiler:
         # extensive use of this for exactly that.
         self._const_regions: dict = {}
 
+        # Memoization for those same constants -- see tvm_backend.py's
+        # _get_or_build_const. Many of them (RoPE's rotate_half permutation
+        # matrix, the row0<->broadcast masks, the KV-cache tail mask) are
+        # bit-identical across every head and every layer within ONE decode
+        # step (they depend only on head_dim/seq_k/pos/theta -- decode-step-
+        # global values, never on which head or layer is asking), so
+        # rebuilding a fresh copy per call was pure waste: at Qwen3-0.6B's
+        # real dimensions, one 64KB RoPE permutation matrix alone was being
+        # rebuilt 672 times (16 Q heads + 8 K heads, x28 layers) per decode
+        # step for content that never changes within that step. Keyed by
+        # whatever the caller considers this constant's identity (e.g.
+        # ("rope_perm", head_dim)); a fresh NPUCompiler per decode step
+        # means this cache naturally resets exactly when it should -- new
+        # position, new step, new cache -- without any explicit reset call.
+        self._const_cache: dict = {}
+
         self.instruction_stream: bytearray = bytearray()
 
     # ── Staging allocator ────────────────────────────────────────────────

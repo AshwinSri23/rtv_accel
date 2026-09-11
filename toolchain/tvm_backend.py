@@ -225,6 +225,43 @@ def offloaded_composites(mod):
     return out
 
 
+def _get_or_build_const(compiler, key, nbytes, build_fn):
+    """Return the DRAM address of a compile-time constant identified by
+    `key`, building it (via `build_fn()`, called with no arguments and
+    expected to return a numpy array of exactly `nbytes` bytes) only the
+    first time this exact key is seen -- every later call this decode
+    step gets back the SAME address instead of allocating and staging a
+    fresh, byte-identical copy.
+
+    This matters because several "constant matrix via GEMM" helpers
+    throughout this module (RoPE's rotate_half permutation matrix, the
+    row0<->broadcast masks, the KV-cache tail mask and append masks)
+    build content that depends only on decode-step-global values
+    (head_dim, seq_k, pos, theta, ...) -- NEVER on which head or which
+    layer is calling. Every prior caller rebuilt a fresh copy every
+    single call anyway, which at Qwen3-0.6B's real dimensions meant one
+    64KB RoPE permutation matrix alone being rebuilt 672 times (16 Q + 8
+    K heads, x28 layers) per decode step for content that's identical
+    all 672 times.
+
+    `key` should be a tuple starting with a string tag unique to the
+    calling helper (e.g. ("rope_perm", head_dim)) -- so two different
+    helpers can never collide even if their other key fields happen to
+    match. Caches on `compiler._const_cache`, which lives on the
+    NPUCompiler instance -- a fresh compiler per decode step (this
+    codebase's existing convention, see _emit_model_kvcache_fp32's
+    docstring) means the cache resets exactly when it should, with no
+    explicit reset call needed.
+    """
+    addr = compiler._const_cache.get(key)
+    if addr is not None:
+        return addr
+    addr = compiler.alloc_staging(nbytes)
+    compiler._const_regions[addr] = build_fn().tobytes()
+    compiler._const_cache[key] = addr
+    return addr
+
+
 def _rmsnorm_prim_fp32(M, N, x_stride=None, out_stride=None):
     """One RMSNorm-with-gamma tile, as three chained FP32 PrimFuncs.
 
@@ -662,7 +699,6 @@ def _emit_attention_core_fp32(compiler, seq_k, head_dim, q_addr, k_addr, v_addr,
     masked_stage = compiler.alloc_staging(M * seq_k * 4) if mask_addr else scores_stage
     probs_stage = compiler.alloc_staging(M * seq_k * 4)
     sum_input_stage = compiler.alloc_staging(M * seq_k * 4)
-    row0_mask_addr = compiler.alloc_staging(M * seq_k * 4)
     rowmax_scratch = compiler.alloc_staging(4)
     rowsum_scratch = compiler.alloc_staging(4)
 
@@ -678,9 +714,13 @@ def _emit_attention_core_fp32(compiler, seq_k, head_dim, q_addr, k_addr, v_addr,
     # the same mechanism compile_lut's table and RoPE's cos/sin already use;
     # the caller must copy it into the DRAM image (see this dispatch's
     # tests for the pattern).
-    row0_mask = np.zeros((M, seq_k), dtype=np.float32)
-    row0_mask[0, :] = 1.0
-    compiler._const_regions[row0_mask_addr] = row0_mask.tobytes()
+    def _build_row0_mask():
+        row0_mask = np.zeros((M, seq_k), dtype=np.float32)
+        row0_mask[0, :] = 1.0
+        return row0_mask
+
+    row0_mask_addr = _get_or_build_const(compiler, ("attn_row0_mask", seq_k),
+                                         M * seq_k * 4, _build_row0_mask)
 
     _emit_matmul_fp32(compiler, M, seq_k, head_dim, q_addr, k_addr, scores_stage,
                       a_stride=q_stride, b_stride=k_stride)
@@ -1039,10 +1079,13 @@ def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None
     KV-cache tile, without first de-interleaving it into its own buffer.
     """
     M = compiler.tile_dim
-    bcast_addr = compiler.alloc_staging(M * M * 4)
-    bcast = np.zeros((M, M), dtype=np.float32)
-    bcast[:, 0] = 1.0
-    compiler._const_regions[bcast_addr] = bcast.tobytes()
+
+    def _build():
+        bcast = np.zeros((M, M), dtype=np.float32)
+        bcast[:, 0] = 1.0
+        return bcast
+
+    bcast_addr = _get_or_build_const(compiler, ("bcast_row0", M), M * M * 4, _build)
     _emit_matmul_fp32(compiler, M, width, M, bcast_addr, in_addr, out_addr, b_stride=in_stride)
 
 
@@ -1054,10 +1097,13 @@ def _emit_mask_to_row0_fp32(compiler, in_addr, out_addr, width):
     calls require. Same compile-time-constant-mask technique the attention
     core's own row0_mask already uses for its internal sum step."""
     M = compiler.tile_dim
-    mask_addr = compiler.alloc_staging(M * width * 4)
-    mask = np.zeros((M, width), dtype=np.float32)
-    mask[0, :] = 1.0
-    compiler._const_regions[mask_addr] = mask.tobytes()
+
+    def _build():
+        mask = np.zeros((M, width), dtype=np.float32)
+        mask[0, :] = 1.0
+        return mask
+
+    mask_addr = _get_or_build_const(compiler, ("mask_to_row0", width), M * width * 4, _build)
 
     @T.prim_func(s_tir=True)
     def mul(a: T.handle, b: T.handle, c: T.handle) -> None:
@@ -1113,14 +1159,19 @@ def _emit_kv_cache_append_fp32(compiler, cache_tile_addr, new_row_bcast_addr, ro
     if not (0 <= row < M):
         raise ValueError(f"row must be in [0, {M}); got {row}")
 
-    mask_keep = np.eye(M, dtype=np.float32)
-    mask_keep[row, row] = 0.0
-    mask_insert = np.zeros((M, M), dtype=np.float32)
-    mask_insert[row, row] = 1.0
-    keep_addr = compiler.alloc_staging(M * M * 4)
-    insert_addr = compiler.alloc_staging(M * M * 4)
-    compiler._const_regions[keep_addr] = mask_keep.tobytes()
-    compiler._const_regions[insert_addr] = mask_insert.tobytes()
+    def _build_keep():
+        mask_keep = np.eye(M, dtype=np.float32)
+        mask_keep[row, row] = 0.0
+        return mask_keep
+
+    def _build_insert():
+        mask_insert = np.zeros((M, M), dtype=np.float32)
+        mask_insert[row, row] = 1.0
+        return mask_insert
+
+    keep_addr = _get_or_build_const(compiler, ("kv_cache_keep", row), M * M * 4, _build_keep)
+    insert_addr = _get_or_build_const(compiler, ("kv_cache_insert", row), M * M * 4,
+                                      _build_insert)
 
     kept = compiler.alloc_staging(M * width * 4)
     inserted = compiler.alloc_staging(M * width * 4)
@@ -1156,11 +1207,13 @@ def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len):
     if not (0 < valid_len <= seq_k):
         raise ValueError(f"valid_len must be in (0, {seq_k}]; got {valid_len}")
 
-    mask = np.zeros((M, seq_k), dtype=np.float32)
-    mask[:, valid_len:] = -1e30
-    mask_addr = compiler.alloc_staging(M * seq_k * 4)
-    compiler._const_regions[mask_addr] = mask.tobytes()
-    return mask_addr
+    def _build():
+        mask = np.zeros((M, seq_k), dtype=np.float32)
+        mask[:, valid_len:] = -1e30
+        return mask
+
+    return _get_or_build_const(compiler, ("kv_tail_mask", seq_k, valid_len),
+                               M * seq_k * 4, _build)
 
 
 def _emit_transpose_fp32(compiler, in_addr, out_addr, in_stride=None, out_stride=None):
@@ -1241,9 +1294,8 @@ def _emit_copy_slice_fp32(compiler, in_addr, out_addr, in_stride, width=None):
     """
     M = compiler.tile_dim
     width = M if width is None else width
-    ident_addr = compiler.alloc_staging(M * M * 4)
-    ident = np.eye(M, dtype=np.float32)
-    compiler._const_regions[ident_addr] = ident.tobytes()
+    ident_addr = _get_or_build_const(compiler, ("copy_ident", M), M * M * 4,
+                                     lambda: np.eye(M, dtype=np.float32))
     _emit_matmul_fp32(compiler, M, width, M, ident_addr, in_addr, out_addr, b_stride=in_stride)
 
 
@@ -1401,20 +1453,35 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     if head_dim % 2 != 0:
         raise ValueError(f"_emit_rope_fp32 needs an even head_dim; got {head_dim}")
 
-    cos_tab, sin_tab = NPUCompiler.rope_tables(pos + 1, head_dim, base=theta, dtype=DType.FP32)
-    cos_bcast = np.tile(cos_tab[pos], (M, 1)).astype(np.float32)
-    sin_bcast = np.tile(sin_tab[pos], (M, 1)).astype(np.float32)
-    cos_addr = compiler.alloc_staging(M * head_dim * 4)
-    sin_addr = compiler.alloc_staging(M * head_dim * 4)
-    compiler._const_regions[cos_addr] = cos_bcast.tobytes()
-    compiler._const_regions[sin_addr] = sin_bcast.tobytes()
+    # cos/sin depend only on (head_dim, pos, theta) -- decode-step-global,
+    # identical for every head and every layer at this step -- and the
+    # rotate_half permutation matrix depends on head_dim ALONE (it doesn't
+    # even vary with pos/theta): both are memoized via _get_or_build_const
+    # rather than rebuilt per call, since at Qwen3-0.6B's real dimensions
+    # this function is called 24 times per layer (16 Q heads + 8 K heads)
+    # x28 layers = 672 times per decode step, all with the SAME head_dim/
+    # pos/theta -- see _get_or_build_const's own docstring.
+    def _build_cossin():
+        cos_tab, sin_tab = NPUCompiler.rope_tables(pos + 1, head_dim, base=theta,
+                                                    dtype=DType.FP32)
+        cos_bcast = np.tile(cos_tab[pos], (M, 1)).astype(np.float32)
+        sin_bcast = np.tile(sin_tab[pos], (M, 1)).astype(np.float32)
+        return np.concatenate([cos_bcast, sin_bcast], axis=0)
 
-    half = head_dim // 2
-    perm = np.zeros((head_dim, head_dim), dtype=np.float32)
-    for k in range(head_dim):
-        perm[k, (k + half) % head_dim] = 1.0
-    perm_addr = compiler.alloc_staging(head_dim * head_dim * 4)
-    compiler._const_regions[perm_addr] = perm.tobytes()
+    cossin_addr = _get_or_build_const(compiler, ("rope_cossin", head_dim, pos, theta),
+                                      2 * M * head_dim * 4, _build_cossin)
+    cos_addr = cossin_addr
+    sin_addr = cossin_addr + M * head_dim * 4
+
+    def _build_perm():
+        half = head_dim // 2
+        perm = np.zeros((head_dim, head_dim), dtype=np.float32)
+        for k in range(head_dim):
+            perm[k, (k + half) % head_dim] = 1.0
+        return perm
+
+    perm_addr = _get_or_build_const(compiler, ("rope_perm", head_dim),
+                                    head_dim * head_dim * 4, _build_perm)
 
     rot_stage = compiler.alloc_staging(M * head_dim * 4)
     term1 = compiler.alloc_staging(M * head_dim * 4)
@@ -1458,21 +1525,33 @@ def _emit_rope_batched_fp32(compiler, head_dim, positions, in_addr, out_addr,
         raise ValueError(f"_emit_rope_batched_fp32 needs exactly {M} positions "
                          f"(one per tile row); got {len(positions)}")
 
-    cos_tab, sin_tab = NPUCompiler.rope_tables(max(positions) + 1, head_dim,
-                                               base=theta, dtype=DType.FP32)
-    cos_bcast = np.stack([cos_tab[p] for p in positions]).astype(np.float32)
-    sin_bcast = np.stack([sin_tab[p] for p in positions]).astype(np.float32)
-    cos_addr = compiler.alloc_staging(M * head_dim * 4)
-    sin_addr = compiler.alloc_staging(M * head_dim * 4)
-    compiler._const_regions[cos_addr] = cos_bcast.tobytes()
-    compiler._const_regions[sin_addr] = sin_bcast.tobytes()
+    # Same memoization reasoning as _emit_rope_fp32: `positions` (as a
+    # tuple, hashable) plus head_dim/theta fully determines cos/sin, and
+    # the permutation matrix depends on head_dim alone -- if this batch of
+    # positions or this head_dim recurs across heads/layers within one
+    # decode step, later calls reuse the first build instead of redoing it.
+    def _build_cossin():
+        cos_tab, sin_tab = NPUCompiler.rope_tables(max(positions) + 1, head_dim,
+                                                   base=theta, dtype=DType.FP32)
+        cos_bcast = np.stack([cos_tab[p] for p in positions]).astype(np.float32)
+        sin_bcast = np.stack([sin_tab[p] for p in positions]).astype(np.float32)
+        return np.concatenate([cos_bcast, sin_bcast], axis=0)
 
-    half = head_dim // 2
-    perm = np.zeros((head_dim, head_dim), dtype=np.float32)
-    for k in range(head_dim):
-        perm[k, (k + half) % head_dim] = 1.0
-    perm_addr = compiler.alloc_staging(head_dim * head_dim * 4)
-    compiler._const_regions[perm_addr] = perm.tobytes()
+    cossin_addr = _get_or_build_const(
+        compiler, ("rope_batched_cossin", head_dim, tuple(positions), theta),
+        2 * M * head_dim * 4, _build_cossin)
+    cos_addr = cossin_addr
+    sin_addr = cossin_addr + M * head_dim * 4
+
+    def _build_perm():
+        half = head_dim // 2
+        perm = np.zeros((head_dim, head_dim), dtype=np.float32)
+        for k in range(head_dim):
+            perm[k, (k + half) % head_dim] = 1.0
+        return perm
+
+    perm_addr = _get_or_build_const(compiler, ("rope_perm", head_dim),
+                                    head_dim * head_dim * 4, _build_perm)
 
     rot_stage = compiler.alloc_staging(M * head_dim * 4)
     term1 = compiler.alloc_staging(M * head_dim * 4)
