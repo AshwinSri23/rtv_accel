@@ -54,7 +54,7 @@ from tvm.script import tirx as T                    # noqa: E402
 from compiler_state import NPUCompiler, DType, SRAMMap, _padded, _align   # noqa: E402
 
 from rtv_tvm import patterns, schedule, codegen, intrin
-from rtv_isa import DType, Opcode, ActivationMode, encode
+from rtv_isa import DType, Opcode, ActivationMode, encode, decode
 
 CODEGEN = patterns.CODEGEN
 
@@ -252,13 +252,24 @@ def _get_or_build_const(compiler, key, nbytes, build_fn):
     codebase's existing convention, see _emit_model_kvcache_fp32's
     docstring) means the cache resets exactly when it should, with no
     explicit reset call needed.
+
+    Stores (addr, nbytes), not just addr: a caller may hand back a
+    DERIVED address into this region (e.g. _emit_rope_fp32 packs cos
+    and sin into one cached block and computes
+    `sin_addr = cossin_addr + M*head_dim*4`) -- schedule relocation
+    (_emit_model_kvcache_fp32_relocated) needs the full byte RANGE to
+    recognize that derived address as still part of a shared constant,
+    not a per-layer staging address to shift. Confirmed hitting this
+    directly: an earlier version storing only `addr` here caused
+    relocation to silently mis-shift RoPE's sin table, since exact-
+    address matching missed `cossin_addr + offset` entirely.
     """
-    addr = compiler._const_cache.get(key)
-    if addr is not None:
-        return addr
+    cached = compiler._const_cache.get(key)
+    if cached is not None:
+        return cached[0]
     addr = compiler.alloc_staging(nbytes)
     compiler._const_regions[addr] = build_fn().tobytes()
-    compiler._const_cache[key] = addr
+    compiler._const_cache[key] = (addr, nbytes)
     return addr
 
 
@@ -2299,6 +2310,253 @@ def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
             q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
         )
         cur_in = cur_out
+    return cur_in
+
+
+def _layer_role_addrs(lw, x_addr, out_addr, hidden, inter, n_heads, n_kv_heads,
+                      head_dim):
+    """Every named DRAM region belonging to one layer's own weights,
+    KV-cache tiles, and boundary (input/output) buffers, as
+    {role: (addr, nbytes)} -- role is a string stable across every
+    layer sharing the same config (e.g. "wq", "k_cache_2_0"), used by
+    _emit_model_kvcache_fp32_relocated to translate one compiled
+    layer's addresses onto a different, structurally identical layer's
+    own addresses without recompiling.
+
+    nbytes matters, not just addr: any of these buffers wider than one
+    16-wide tile (hidden/q_dim/kv_dim/inter > compiler.tile_dim, which
+    is nearly always true for a real model) gets read or written via
+    MULTIPLE LOAD_TILE/STORE_TILE instructions at different offsets
+    within the same logical buffer -- only the FIRST one lands exactly
+    on the role's base address; the rest land at base+64, base+128,
+    etc. (one column-tile's width further each time). An earlier
+    version of this function returned addresses only, so only each
+    buffer's very first tile got correctly relocated -- every other
+    tile silently fell through to the staging-shift branch instead
+    (caught directly: a real recompile and a relocated compile
+    diverged starting at the second tile of the first oversized buffer
+    used, x_addr's own second column-tile in a small hidden=32 test
+    case). The fix is to record each role's full byte RANGE and, when
+    an address falls inside one, preserve its OFFSET within that range
+    rather than only matching the base address exactly (see
+    _relocate_instructions).
+
+    q_norm/k_norm are included only when present (same `.get()`-is-a-
+    no-op convention _emit_model_kvcache_fp32 already uses) --
+    relocating between a layer that has them and one that doesn't
+    isn't meaningful anyway, since the two layers wouldn't actually be
+    structurally identical."""
+    M, w = 16, DType.BYTES[DType.FP32]
+    q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
+    roles = {
+        "x_addr": (x_addr, M * hidden * w),
+        "out_addr": (out_addr, M * hidden * w),
+        "gamma1": (lw["gamma1"], M * hidden * w),
+        "gamma2": (lw["gamma2"], M * hidden * w),
+        "wq": (lw["wq"], hidden * q_dim * w),
+        "wk": (lw["wk"], hidden * kv_dim * w),
+        "wv": (lw["wv"], hidden * kv_dim * w),
+        "wo": (lw["wo"], q_dim * hidden * w),
+        "wgate": (lw["wgate"], hidden * inter * w),
+        "wup": (lw["wup"], hidden * inter * w),
+        "wdown": (lw["wdown"], inter * hidden * w),
+    }
+    for name in ("q_norm", "k_norm"):
+        addr = lw.get(name)
+        if addr is not None:
+            roles[name] = (addr, M * head_dim * w)
+    for kv_h, tiles in enumerate(lw["k_cache"]):
+        for ti, addr in enumerate(tiles):
+            roles[f"k_cache_{kv_h}_{ti}"] = (addr, M * head_dim * w)
+    for kv_h, tiles in enumerate(lw["v_cache"]):
+        for ti, addr in enumerate(tiles):
+            roles[f"v_cache_{kv_h}_{ti}"] = (addr, M * head_dim * w)
+    return roles
+
+
+def _addr_is_shared(addr, shared_ranges):
+    """True if `addr` falls within any [start, start+nbytes) range of a
+    memoized decode-step-shared constant -- a RANGE check, not exact-
+    address match, because a cached region's address may be a DERIVED
+    offset into it (e.g. RoPE's sin table lives at cossin_addr +
+    M*head_dim*4, not at cossin_addr itself -- see _get_or_build_const's
+    docstring)."""
+    return any(start <= addr < start + nbytes for start, nbytes in shared_ranges)
+
+
+def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delta,
+                           shared_ranges):
+    """Rewrite one already-compiled layer's instruction bytes for a
+    DIFFERENT, structurally identical layer, without touching TVM's
+    schedule/codegen at all -- the actual "relocation" in schedule
+    relocation. `instr_bytes` was compiled for some SOURCE layer whose
+    named regions are `source_roles` ({role: (addr, nbytes)}, from
+    _layer_role_addrs); `target_roles` is the TARGET layer's own
+    {role: (addr, nbytes)}.
+
+    Only LOAD_TILE/STORE_TILE's dram_addr field is EVER a real address
+    -- confirmed directly against every encode(opcode=...) call site in
+    codegen.py before writing this: every other opcode either hardcodes
+    dram_addr=0 (REDUCE) or repurposes it as an immediate (SCALAR_ALU's
+    scale_num for RMS_SCALE) -- blindly translating those would corrupt
+    them. Every other instruction is copied through completely
+    untouched, byte for byte, not decoded and re-encoded, so there's no
+    risk of a round-trip mismatch on a field this function never
+    intended to touch.
+
+    For each LOAD_TILE/STORE_TILE's dram_addr, in order:
+      1. It's a memoized, decode-step-shared constant (RoPE's
+         permutation/cos-sin tables, the various masks -- see
+         _get_or_build_const) -- falls within `shared_ranges` -- leave
+         UNCHANGED. These are built once per decode step and
+         deliberately shared by every layer; shifting them per layer
+         would be wrong, not just redundant.
+      2. It falls within one of the SOURCE layer's own named regions
+         (a role in `source_roles`) -- substitute the TARGET layer's
+         region for that same role, preserving the address's OFFSET
+         within the region (not just matching the region's base --
+         see _layer_role_addrs's docstring on why: a buffer wider than
+         one tile is read/written via several instructions at
+         different offsets into it, only one of which sits exactly at
+         the base address).
+      3. Anything else is a genuine per-layer-fresh staging buffer
+         (q_stage, rot_stage, scores_stage, ...) -- shift by
+         `staging_delta`, the fixed byte offset between the source
+         layer's staging region and the target layer's (constant
+         because every layer at a given config consumes exactly the
+         same amount of staging).
+    """
+    source_ranges = [(addr, addr + nbytes, role)
+                     for role, (addr, nbytes) in source_roles.items()]
+
+    out = bytearray(instr_bytes)
+    for off in range(0, len(instr_bytes), 16):
+        word = int.from_bytes(instr_bytes[off:off + 16], "big")
+        fields = decode(word)
+        if fields["opcode"] not in (Opcode.LOAD_TILE, Opcode.STORE_TILE):
+            continue
+        addr = fields["dram_addr"]
+        if _addr_is_shared(addr, shared_ranges):
+            continue
+        new_addr = None
+        for start, end, role in source_ranges:
+            if start <= addr < end:
+                target_addr, _ = target_roles[role]
+                new_addr = target_addr + (addr - start)
+                break
+        if new_addr is None:
+            new_addr = addr + staging_delta
+        if new_addr == addr:
+            continue
+        fields["dram_addr"] = new_addr
+        new_word = encode(**fields)
+        out[off:off + 16] = new_word.to_bytes(16, "big")
+    return bytes(out)
+
+
+def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_heads,
+                                       n_kv_heads, head_dim, x_addr, layer_weights,
+                                       scratch_a, scratch_b, pos, rope_theta=1e6):
+    """_emit_model_kvcache_fp32, but compiling only the first TWO layers
+    for real through TVM's schedule+codegen and RELOCATING that result
+    for every layer after that instead of recompiling. Every layer at a
+    given hidden/inter/n_heads/n_kv_heads/head_dim config is
+    structurally IDENTICAL -- same schedule, same instruction shape --
+    differing only in WHICH DRAM addresses it reads and writes (its
+    own weights, its own KV-cache tiles, its ping-ponged input/output
+    buffer). TVM's schedule+codegen dominates compile wall-clock time
+    (measured directly against this project's own real Qwen3-0.6B
+    checkpoint: ~7.6s to compile one layer vs ~0.17s for rtv_sim to
+    actually EXECUTE it) and _emit_model_kvcache_fp32 was paying that
+    cost n_layers times per decode step for what amounts to the exact
+    same schedule every time.
+
+    TWO real layers, not one: this interacts with _get_or_build_const's
+    memoization in a way that isn't obvious up front, and got caught
+    only by this function's own byte-identical regression test, not by
+    reasoning about it in advance. Layer 0 is compiled with a COLD
+    cache -- it's the one that actually BUILDS every decode-step-shared
+    constant (RoPE's tables, the various masks), which means layer 0's
+    OWN staging footprint includes that one-time cost and is LARGER
+    than any other layer's. Layer 1, compiled second, hits an already-
+    WARM cache for all of that -- its staging footprint is exactly
+    "per-layer-unique work only", which is what every layer from 2
+    onward will ALSO consume. So layer 1, not layer 0, is the correct
+    relocation template; relocating from layer 0 silently produced
+    instructions with the wrong staging addresses starting at the
+    first constant lookup layer 0 had to build fresh and no other
+    layer does (caught directly: an earlier version of this function
+    relocated from layer 0 and diverged from a full recompile exactly
+    at that point).
+
+    Produces INSTRUCTION-STREAM-IDENTICAL-UP-TO-RELOCATION output to
+    _emit_model_kvcache_fp32 for the same inputs -- verified directly
+    in rtv_tvm/test_schedule_relocation.py by running both paths and
+    comparing byte-for-byte (not just "same final numeric result",
+    which byte-identical instructions obviously also guarantee).
+
+    Same contract as _emit_model_kvcache_fp32 otherwise (layer_weights,
+    q_norm/k_norm handling, ping-pong buffering, return value). For
+    n_layers < 2 this degenerates to exactly what _emit_model_kvcache_
+    fp32 would do (nothing to relocate from).
+    """
+    bufs = [scratch_b, scratch_a]
+
+    def _io_addrs(i):
+        cur_in = x_addr if i == 0 else bufs[(i - 1) % 2]
+        cur_out = bufs[i % 2]
+        return cur_in, cur_out
+
+    def _emit_real_layer(i):
+        lw = layer_weights[i]
+        xi, outi = _io_addrs(i)
+        _emit_transformer_layer_kvcache_fp32(
+            compiler, hidden, inter, n_heads, n_kv_heads, head_dim,
+            x_addr=xi, gamma1_addr=lw["gamma1"], gamma2_addr=lw["gamma2"],
+            wq_addr=lw["wq"], wk_addr=lw["wk"], wv_addr=lw["wv"], wo_addr=lw["wo"],
+            wgate_addr=lw["wgate"], wup_addr=lw["wup"], wdown_addr=lw["wdown"],
+            out_addr=outi, pos=pos, k_cache_tiles=lw["k_cache"],
+            v_cache_tiles=lw["v_cache"], rope_theta=rope_theta,
+            q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
+        )
+        return xi, outi
+
+    compiler.init_staging()
+
+    # Layer 0: real compile, cold cache.
+    x0, out0 = _emit_real_layer(0)
+    if n_layers == 1:
+        return out0
+
+    # Layer 1: ALSO a real compile, now with a warm cache -- this is the
+    # actual relocation template (see docstring for why layer 0 can't be).
+    staging_before = compiler._staging_cursor
+    instr_start = len(compiler.instruction_stream)
+    x1, out1 = _emit_real_layer(1)
+    instr_end = len(compiler.instruction_stream)
+    S = compiler._staging_cursor - staging_before
+    template = bytes(compiler.instruction_stream[instr_start:instr_end])
+
+    roles_1 = _layer_role_addrs(layer_weights[1], x1, out1, hidden, inter,
+                               n_heads, n_kv_heads, head_dim)
+    shared_ranges = list(compiler._const_cache.values())
+
+    cur_in = out1
+    for i in range(2, n_layers):
+        lwi = layer_weights[i]
+        xi, outi = _io_addrs(i)
+        roles_i = _layer_role_addrs(lwi, xi, outi, hidden, inter,
+                                    n_heads, n_kv_heads, head_dim)
+        relocated = _relocate_instructions(template, roles_1, roles_i,
+                                           staging_delta=(i - 1) * S,
+                                           shared_ranges=shared_ranges)
+        compiler.instruction_stream += relocated
+        # No real alloc_staging calls happened for this layer -- advance
+        # the bookkeeping manually so dram_bytes_needed still sizes the
+        # image to hold this layer's (relocated) staging writes.
+        compiler._staging_cursor += S
+        compiler._staging_peak = max(compiler._staging_peak, compiler._staging_cursor)
+        cur_in = outi
     return cur_in
 
 
