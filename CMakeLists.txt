@@ -131,6 +131,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_checkpoint_decode_loop  # real Qwen3-0.6B weights through a genuine multi-step decode loop
         test_const_memoization   # repeated constant matrices (RoPE, masks) collapse to one cached copy
         test_schedule_relocation # compile layers 0-1 for real, relocate the rest -- byte-identical + real sim check
+        test_prefill_batching    # a real batch of causal prompt tokens processed in one call, seeding the KV-cache
     )
     foreach(RTV_TVM_TEST ${RTV_TVM_TESTS})
         add_test(NAME ${RTV_TVM_TEST}
