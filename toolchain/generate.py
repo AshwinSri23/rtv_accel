@@ -5,10 +5,17 @@ NPU: a real Qwen3 checkpoint (toolchain/checkpoint_loader.py), tokenized
 with a real BPE tokenizer (the `tokenizers` library reading the
 checkpoint's own tokenizer.json directly -- no torch, same reasoning
 hf_loader.py already documents for avoiding it: ~2 GB of dependency to
-read a file), driven through tvm_backend.py's _emit_model_kvcache_fp32
-one real decode step at a time, each step a fresh rtv_sim invocation
-(the ISA has no control flow -- see codegen.py's own docstring: "each
-decode step is a fresh ... instruction program").
+read a file). The prompt's first min(len(prompt), 16) tokens are
+processed in ONE real, causally-masked batch
+(_emit_model_kvcache_batched_fp32) instead of one decode step each; every
+token after that -- the rest of a longer prompt, and every generated
+token -- runs through _emit_model_kvcache_fp32_relocated, one real
+decode step at a time, each step a fresh rtv_sim invocation (the ISA has
+no control flow -- see codegen.py's own docstring: "each decode step is
+a fresh ... instruction program"), with only the first two layers
+actually recompiled and every later layer's instructions relocated
+instead. Both are described in full in TODO.md's entries for their
+respective functions; this file just wires them together.
 
 This supersedes the INT8-era generate.py (retired 2026-09-09): that file
 drove NPUCompiler.compile_model()/compile_lm_head(), both removed with
@@ -40,12 +47,14 @@ attention, RoPE, q_norm/k_norm, the KV-cache -- runs on the simulated
 NPU, unmodified from what rtv_tvm/test_checkpoint_decode_loop.py already
 verifies.
 
-Real dimensions are slow to schedule/codegen, roughly linearly in
---n-layers (on this machine, ~9s/step at 1 layer; Qwen3-0.6B's real 28
-layers is correspondingly ~28x that per step -- consistent with
-codegen.py's own "each decode step is a fresh ~12M-instruction program"
-note for a full-size model). Use --n-layers to truncate for a fast
-smoke test of the DRIVER LOOP itself; truncated output is not meaningful
+Real dimensions are still slow to schedule/codegen even with relocation
+(the first two layers of every decode step are still a real ~7.6s-ish
+TVM compile each at Qwen3-0.6B's full size; only layers 2+ are a cheap
+address patch -- see TODO.md's entry for _emit_model_kvcache_fp32_
+relocated for the measured, honest number: ~7x faster per step than
+before relocation existed, not the "compile once" figure a naive
+estimate would suggest). Use --n-layers to truncate for a fast smoke
+test of the DRIVER LOOP itself; truncated output is not meaningful
 text (most of the model is simply missing), only a correctness/plumbing
 check -- see rtv_tvm/test_checkpoint_decode_loop.py for the real
 correctness proof at 1-2 layers against a numpy reference. Omit
@@ -148,6 +157,29 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
         )
     base_dram_cursor = comp0._dram_cursor
 
+    def _sample(hidden_row_f32):
+        """Host-side tail: the model's own trailing RMSNorm, then lm_head
+        (HF's native (vocab, hidden) layout -- unlike every layer weight,
+        lm_head is NOT transposed by checkpoint_loader.py, since it never
+        goes through the device GEMM), then argmax -- see module
+        docstring for why both stay off the NPU."""
+        hidden_row = hidden_row_f32.astype(np.float64)
+        normed = (hidden_row / np.sqrt((hidden_row ** 2).mean() + eps)
+                 * final_norm.astype(np.float64))
+        logits = normed @ lm_head.T.astype(np.float64)
+        return int(np.argmax(logits))
+
+    # Real prefill batching: the first min(P, M) prompt tokens are
+    # genuinely distinct real rows, causally self-attended in ONE call
+    # (tvm_backend._emit_model_kvcache_batched_fp32) instead of one
+    # separate decode step each -- see TODO.md's entry for this function
+    # for the full design (real per-row RMSNorm/q_norm/k_norm, a real
+    # causal mask, writing straight into the KV-cache). A prompt longer
+    # than M tokens still starts with one such batch for its first M
+    # tokens; the remaining prompt tokens fall through to the ordinary
+    # one-at-a-time loop below, unchanged.
+    n_batch = min(P, M)
+
     all_ids = list(prompt_ids)
     next_input_id = None
     with tempfile.TemporaryDirectory(prefix="rtv_generate_state_") as wd:
@@ -164,7 +196,56 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
         cur_path = os.path.join(wd, "state.img")
         open(cur_path, "wb").write(bytes(dram))
 
-        for pos in range(total_steps):
+        comp = NPUCompiler(hal)
+        comp.dtype = DType.FP32
+        comp.instruction_stream = bytearray()
+        comp._dram_cursor = base_dram_cursor
+        x_batch = np.zeros((M, hidden), dtype=np.float32)
+        for r in range(n_batch):
+            x_batch[r, :] = embed_tokens[prompt_ids[r]].astype(np.float32)
+        comp._const_regions[x_addr] = x_batch.tobytes()
+
+        final_addr = tvm_backend._emit_model_kvcache_batched_fp32(
+            comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
+            x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
+            scratch_b=scratch_b, n_real=n_batch, rope_theta=rope_theta,
+        )
+        step_dram = bytearray(open(cur_path, "rb").read())
+        needed = max(comp.dram_bytes_needed, len(step_dram))
+        if needed > len(step_dram):
+            step_dram += bytearray(needed - len(step_dram) + 0x10000)
+        for addr, data in comp._const_regions.items():
+            step_dram[addr:addr + len(data)] = data
+        open(cur_path, "wb").write(bytes(step_dram))
+
+        (out_raw,) = _run_sim(
+            sim, hal, comp.instruction_stream, cur_path, cur_path,
+            extra_dumps=[(final_addr, M * hidden * 4, "out")],
+        )
+        batch_out = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)
+
+        if n_batch == P and total_steps >= n_batch:
+            # The whole prompt fit in the one batch -- its own last real
+            # row's output is exactly what a decode step at pos=P-1 would
+            # have produced, so sample the first new token from it now
+            # instead of running that position again one-at-a-time.
+            next_input_id = _sample(batch_out[n_batch - 1])
+            all_ids.append(next_input_id)
+            if verbose:
+                piece = tok.decode([next_input_id])
+                print(f"  step {n_batch - 1}: token {next_input_id}  {piece!r}",
+                     file=sys.stderr)
+
+        # Continue one token at a time -- remaining prompt tokens (if the
+        # prompt was longer than one batch) and every generated token --
+        # via the schedule-RELOCATED path: layers 0-1 compile for real
+        # once, every later layer is a cheap address patch instead of a
+        # fresh TVM schedule/codegen pass (~7x faster per step at
+        # Qwen3-0.6B's real 28-layer scale -- see TODO.md's entry for
+        # _emit_model_kvcache_fp32_relocated). Produces the identical
+        # instruction stream _emit_model_kvcache_fp32 would, just faster
+        # to compile.
+        for pos in range(n_batch, total_steps):
             token_id = prompt_ids[pos] if pos < P else next_input_id
 
             comp = NPUCompiler(hal)
@@ -176,7 +257,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             x_row[0, :] = embed_tokens[token_id].astype(np.float32)
             comp._const_regions[x_addr] = x_row.tobytes()
 
-            final_addr = tvm_backend._emit_model_kvcache_fp32(
+            final_addr = tvm_backend._emit_model_kvcache_fp32_relocated(
                 comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
                 x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
                 scratch_b=scratch_b, pos=pos, rope_theta=rope_theta,
@@ -196,18 +277,8 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             )
 
             if pos >= P - 1:
-                hidden_row = np.frombuffer(out_raw, dtype=np.float32).reshape(
-                    M, hidden)[0].astype(np.float64)
-                # Host-side tail: the model's own trailing RMSNorm, then
-                # lm_head (HF's native (vocab, hidden) layout -- unlike
-                # every layer weight, lm_head is NOT transposed by
-                # checkpoint_loader.py, since it never goes through the
-                # device GEMM), then argmax -- see module docstring for
-                # why both stay off the NPU.
-                normed = (hidden_row / np.sqrt((hidden_row ** 2).mean() + eps)
-                         * final_norm.astype(np.float64))
-                logits = normed @ lm_head.T.astype(np.float64)
-                next_input_id = int(np.argmax(logits))
+                hidden_row = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)[0]
+                next_input_id = _sample(hidden_row)
                 all_ids.append(next_input_id)
                 if verbose:
                     piece = tok.decode([next_input_id])
