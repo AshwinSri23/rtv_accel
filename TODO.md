@@ -131,10 +131,28 @@ Both fixed, `rtv_sim` rebuilt, full 19/19 `ctest` re-verified (no regressions), 
 
 ---
 
-## Phase 3: Linux Kernel Driver Completion
+## Phase 3: Linux Kernel Driver — parts 1-3 done, parts 4-5 removed (2026-09-13)
 
-- [ ] **3.1. Phase 4: DMA & Zero-Copy Interface (`driver/rtv_accel.c`)**
-  - [ ] Implement Linux DMA mapping APIs (`dma_alloc_coherent` / scatter-gather lists).
-  - [ ] Implement `mmap` file operations for zero-copy memory sharing between userspace DRAM buffers and hardware memory controller.
-- [ ] **3.2. Phase 5: Userspace Runtime Service**
-  - [ ] Develop userspace runtime daemon/service for multi-process job queue submission and interrupt handling.
+`driver/rtv_accel.c` already implements and verifies (inside a `virtme-ng`
+VM — see memory/project notes on why never the host) three of five
+originally-planned parts: character device registration
+(`/dev/rtv_accel`), and an `ioctl`-based control-plane handshake
+(`RTV_IOC_START`/`WAIT_FOR_JOB`/`JOB_DONE`/`WAIT_DONE`) backed by real
+kernel wait-queues (`rtv_job_wq`/`rtv_done_wq`) — genuine, working,
+tested kernel code, not a stub. That work stays; nothing here removes it
+or its documentation in the spec doc's scope note.
+
+What's removed is the remaining checklist (parts 4-5: DMA/`mmap`
+zero-copy, a userspace runtime daemon) that used to sit here as an open
+TODO item. Reasoning: this project's actual chip was never fabricated —
+`rtv_sim` is a userspace program reading/writing plain files, so there is
+no physical device for DMA/`mmap` to give zero-copy access to, and no
+concurrent-request use case (see the "should we build an inference
+engine" discussion this session reached the same conclusion from) that
+would need a job-queue daemon. Building parts 4-5 would be a real,
+transferable kernel-engineering exercise, but it would not change this
+project's own correctness or capability — the compiler and simulator
+already fully answer the question this project set out to answer without
+it. Same treatment Phase 4 (ARM NEON validation) already got: removed
+from the roadmap as out of scope, not left as a stale "to do" nobody
+intends to pick up.

@@ -1,0 +1,57 @@
+name: CI
+
+# Runs the exact same cmake + ctest suite a developer runs locally --
+# nothing CI-specific about the test files themselves. The TVM-path
+# tests need a real Python venv at .venv-tvm (CMakeLists.txt checks for
+# that exact path and skips them entirely if it's absent), so this
+# workflow's only real job is producing that venv before configuring;
+# everything after that is what `cmake -B build && cmake --build build
+# && cd build && ctest` already does on its own.
+#
+# The checkpoint-dependent tests (test_checkpoint_loader.py,
+# test_checkpoint_decode_loop.py) need a real ~1.5 GB Qwen3-0.6B
+# download and skip cleanly (exit 0, not a failure) when it's absent --
+# deliberately not fetched here, same reasoning TESTING.md gives for why
+# no fresh checkout should be required to have it.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A genuine isolated venv at the exact path CMakeLists.txt looks
+      # for (.venv-tvm/bin/python) -- three packages is the full actual
+      # dependency set for the TVM-path tests + generate.py, confirmed
+      # directly by grepping every import in the active toolchain and
+      # re-running the suite against a from-scratch venv with only
+      # these three installed (nothing else in a real local dev
+      # environment's much larger package list turned out to be load-
+      # bearing). apache-tvm==0.26.0 is a real PyPI package, not an
+      # unreproducible local wheel.
+      - name: Set up .venv-tvm
+        run: |
+          python3 -m venv .venv-tvm
+          .venv-tvm/bin/pip install --quiet --upgrade pip
+          .venv-tvm/bin/pip install --quiet numpy apache-tvm==0.26.0 tokenizers
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
