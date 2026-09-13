@@ -1,18 +1,36 @@
 name: CI
 
 # Runs the exact same cmake + ctest suite a developer runs locally --
-# nothing CI-specific about the test files themselves. The TVM-path
-# tests need a real Python venv at .venv-tvm (CMakeLists.txt checks for
-# that exact path and skips them entirely if it's absent), so this
-# workflow's only real job is producing that venv before configuring;
-# everything after that is what `cmake -B build && cmake --build build
-# && cd build && ctest` already does on its own.
+# nothing CI-specific about the test files themselves -- but as one
+# GitHub Actions job PER TEST instead of one job running all of them
+# sequentially, via a dynamically-discovered matrix:
 #
-# The checkpoint-dependent tests (test_checkpoint_loader.py,
-# test_checkpoint_decode_loop.py) need a real ~1.5 GB Qwen3-0.6B
-# download and skip cleanly (exit 0, not a failure) when it's absent --
-# deliberately not fetched here, same reasoning TESTING.md gives for why
-# no fresh checkout should be required to have it.
+#   discover: configures once, asks ctest itself (`ctest -N`) which
+#             tests exist, and hands that list to...
+#   test:     ...a matrix job, one parallel run per test name.
+#
+# The list is discovered, not hand-maintained, deliberately: this
+# project's test suite has grown by ~5 files in a single session before
+# now, and a hardcoded matrix would silently stop covering a new test
+# the moment someone forgot to update this file -- `ctest -N` can't
+# drift from what `ctest` actually runs, because it IS what ctest
+# actually runs.
+#
+# Each matrix job repeats the (cheap) configure+build+venv-setup rather
+# than sharing a build artifact between jobs -- simpler and more
+# robust than artifact upload/download, and since matrix jobs run
+# CONCURRENTLY, redoing a ~30s setup in parallel costs wall-clock time
+# roughly once, not once per test (it does cost more total billed
+# compute-minutes; for a project this size that's a reasonable trade
+# for a much simpler workflow file).
+#
+# The TVM-path tests need a real Python venv at .venv-tvm
+# (CMakeLists.txt checks for that exact path and skips them entirely if
+# it's absent). The checkpoint-dependent tests (test_checkpoint_loader,
+# test_checkpoint_decode_loop) need a real ~1.5 GB Qwen3-0.6B download
+# and skip cleanly (exit 0, not a failure) when it's absent -- not
+# fetched here, same reasoning TESTING.md gives for why no fresh
+# checkout should be required to have it.
 
 on:
   push:
@@ -22,8 +40,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  discover:
     runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.list.outputs.tests }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,15 +51,42 @@ jobs:
         with:
           python-version: "3.12"
 
-      # A genuine isolated venv at the exact path CMakeLists.txt looks
-      # for (.venv-tvm/bin/python) -- three packages is the full actual
-      # dependency set for the TVM-path tests + generate.py, confirmed
-      # directly by grepping every import in the active toolchain and
-      # re-running the suite against a from-scratch venv with only
-      # these three installed (nothing else in a real local dev
-      # environment's much larger package list turned out to be load-
-      # bearing). apache-tvm==0.26.0 is a real PyPI package, not an
-      # unreproducible local wheel.
+      # Configuring is enough to register every test with ctest --
+      # nothing needs to be BUILT yet just to list them.
+      - name: Set up .venv-tvm
+        run: |
+          python3 -m venv .venv-tvm
+          .venv-tvm/bin/pip install --quiet --upgrade pip
+          .venv-tvm/bin/pip install --quiet numpy apache-tvm==0.26.0 tokenizers
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: List registered tests
+        id: list
+        working-directory: build
+        run: |
+          tests=$(ctest -N | awk '$1=="Test" && $2 ~ /^#[0-9]+:$/ {print $NF}' \
+                 | jq -R -s -c 'split("\n")[:-1]')
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJson(needs.discover.outputs.tests) }}
+    name: ${{ matrix.test }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same three packages as `discover` -- see that job's comment for
+      # why this is the full real dependency set, not an abbreviation.
       - name: Set up .venv-tvm
         run: |
           python3 -m venv .venv-tvm
@@ -52,6 +99,6 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
-      - name: Test
+      - name: Run ${{ matrix.test }}
         working-directory: build
-        run: ctest --output-on-failure
+        run: ctest -R "^${{ matrix.test }}$" --output-on-failure
