@@ -62,6 +62,8 @@ static uint32_t json_read_uint(const std::string& path, const std::string& key,
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+static constexpr std::size_t SRAM_BYTES_LIMIT = 64 * 1024;   // simulated SRAM size
+
 int main(int argc, char* argv[])
 {
     if (argc < 2) {
@@ -197,7 +199,16 @@ int main(int argc, char* argv[])
             throw std::runtime_error("dtype BF16W is only valid on COMPUTE_GEMM");
     };
     // LOAD/STORE address: 32 low bits from dram_addr, bits 35:32 from dram_hi.
-    auto dram_addr36 = [](const Decoder::DecodedInstruction& d) {
+    auto dram_addr36 = [&](const Decoder::DecodedInstruction& d) -> uint64_t {
+        if (d.activation == Decoder::ActivationMode::INDIRECT_ADDR) {
+            // ISA v1.7: dram_addr + a uint32 read from SRAM. The pointer's SRAM address is
+            // the whole dim_k wire word (dim_k | c_slot<<8 | dram_hi<<12), so dram_hi is
+            // spent on the pointer and indirect transfers address below 4 GB.
+            const uint16_t ptr = static_cast<uint16_t>(d.dim_k | (d.c_slot << 8) | (d.dram_hi << 12));
+            uint32_t off;
+            std::memcpy(&off, mem.sram_ptr(ptr), sizeof(off));
+            return static_cast<uint64_t>(d.dram_addr) + off;
+        }
         return (static_cast<uint64_t>(d.dram_hi) << 32) | d.dram_addr;
     };
 
@@ -347,6 +358,29 @@ int main(int argc, char* argv[])
         reject_bf16w(d);
         const uint16_t tile_sram = d.stride ? static_cast<uint16_t>(d.stride)
                                             : SRAM_INPUT_BASE;
+        if (d.activation == Decoder::ActivationMode::REDUCE_ARGMAX) {
+            // ISA v1.7: index of the FIRST maximum over a dim_m x dim_n FP32 tile (row-major),
+            // times an immediate byte multiplier (dram_addr, 1 if 0), as a uint32 at sram_addr.
+            // This is the missing half of data-dependent addressing: REDUCE_MAX yields the value
+            // but not where it was; INDIRECT_ADDR then uses this word as a DRAM offset.
+            if (d.dtype != Decoder::DType::FP32)
+                throw std::runtime_error("REDUCE_ARGMAX is FP32-only");
+            const std::size_t n = static_cast<std::size_t>(d.dim_m) * d.dim_n;
+            if (n == 0 || static_cast<std::size_t>(tile_sram) + n * 4 > SRAM_BYTES_LIMIT)
+                throw std::runtime_error("REDUCE_ARGMAX: tile out of SRAM range");
+            std::vector<float> t(n);
+            std::memcpy(t.data(), mem.sram_ptr(tile_sram), n * 4);
+            std::size_t best = 0;
+            for (std::size_t i = 1; i < n; ++i)
+                if (t[i] > t[best]) best = i;
+            const uint32_t out = static_cast<uint32_t>(best) * (d.dram_addr ? d.dram_addr : 1u);
+            std::memcpy(mem.sram_ptr(d.sram_addr), &out, sizeof(out));
+            const uint64_t cost = static_cast<uint64_t>(d.dim_m) * d.dim_n;
+            sim_clock += cost;
+            serial_cycles += cost;
+            ++cnt[6];
+            return;
+        }
         // d.accumulate lets a reduction span more tiles than one: RMSNorm's
         // scale is a sum over a whole row, which is wider than a single tile.
         pe.reduce(mem, tile_sram, d.sram_addr, d.dim_m, d.dim_n,

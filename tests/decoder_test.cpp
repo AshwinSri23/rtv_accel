@@ -290,6 +290,27 @@ static void test_v16_dram_hi_round_trip() {
     CHECK(threw);
 }
 
+// ISA v1.7: REDUCE_ARGMAX and INDIRECT_ADDR decode/encode, and an indirect LOAD's 16-bit
+// SRAM pointer survives in the dim_k wire word (dim_k | c_slot<<8 | dram_hi<<12).
+static void test_v17_indirect_and_argmax() {
+    Decoder::DecodedInstruction r{};
+    r.opcode = Decoder::Opcode::REDUCE;
+    r.activation = Decoder::ActivationMode::REDUCE_ARGMAX;
+    r.dram_addr = 0x12340;      // immediate byte multiplier
+    r.sram_addr = 0x7F00; r.dim_m = 1; r.dim_n = 4; r.stride = 0x8000;
+    r.dtype = Decoder::DType::FP32;
+    CHECK(instr_eq(r, Decoder::decode(Decoder::encode(r))));
+    Decoder::DecodedInstruction l{};
+    l.opcode = Decoder::Opcode::LOAD_TILE;
+    l.activation = Decoder::ActivationMode::INDIRECT_ADDR;
+    l.dram_addr = 0x100000; l.sram_addr = 0x5000; l.dim_m = 16; l.dim_n = 64; l.stride = 64;
+    l.dim_k = 0x00; l.c_slot = 0xF; l.dram_hi = 0x7;        // pointer = 0x7F00
+    const auto out = Decoder::decode(Decoder::encode(l));
+    CHECK(instr_eq(l, out));
+    CHECK_EQ((int)out.activation, (int)Decoder::ActivationMode::INDIRECT_ADDR);
+    CHECK_EQ((unsigned)(out.dim_k | (out.c_slot << 8) | (out.dram_hi << 12)), 0x7F00u);
+}
+
 // v1.5 backward compat: a v1-encoded instruction (all new bits zero) decodes
 // with accumulate=false, scale_shift=0, c_slot=0.
 static void test_v15_backward_compat() {
@@ -328,6 +349,8 @@ int main() {
         {"V15BackwardCompat",            test_v15_backward_compat},
         // ISA v1.6
         {"V16DramHiRoundTrip",           test_v16_dram_hi_round_trip},
+        // ISA v1.7
+        {"V17IndirectAndArgmax",          test_v17_indirect_and_argmax},
     };
 
     for (const auto& t : tests) {

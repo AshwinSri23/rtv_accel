@@ -136,6 +136,8 @@ if(EXISTS ${RTV_TVM_PY})
         test_moe_ffn             # host-segmented MoE routing on a persistent session
         test_moe_block           # MoE FFN block: RMSNorm + router + shared expert + residual
         test_moe_model           # whole tiny Qwen3-MoE model vs Hugging Face (skips without the checkpoint)
+        test_byoc_graph          # graph-driven (BYOC) FFN half-layer: byte-identical to the hand-driven emitters
+        test_moe_ondevice        # ISA v1.7: top-1 MoE routing on the device, one fixed stream
         test_prefill_multitile   # prefill of prompts longer than one 16-row tile
         test_bf16_weights_model  # whole model with BF16 weights: numerics, relocation, footprint
         test_schedule_relocation # compile layers 0-1 for real, relocate the rest -- byte-identical + real sim check

@@ -49,6 +49,8 @@ Decoder::ActivationMode Decoder::parse_activation(uint8_t bits) {
         case 0x10: return ActivationMode::PERCHAN_QUANT;
         case 0x11: return ActivationMode::RESCALE;
         case 0x12: return ActivationMode::LUT;
+        case 0x13: return ActivationMode::REDUCE_ARGMAX;
+        case 0x14: return ActivationMode::INDIRECT_ADDR;
         default:
             throw std::invalid_argument(
                 std::string("Unknown activation mode: ") +
@@ -188,6 +190,8 @@ static const char* activation_name(Decoder::ActivationMode am) {
         case Decoder::ActivationMode::PERCHAN_QUANT: return "PERCHAN_QUANT";
         case Decoder::ActivationMode::RESCALE:       return "RESCALE";
         case Decoder::ActivationMode::LUT:           return "LUT";
+        case Decoder::ActivationMode::REDUCE_ARGMAX: return "REDUCE_ARGMAX";
+        case Decoder::ActivationMode::INDIRECT_ADDR: return "INDIRECT_ADDR";
         default:                                    return "UNKNOWN";
     }
 }

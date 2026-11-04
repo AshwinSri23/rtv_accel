@@ -437,13 +437,17 @@ def _matmul_prim_fp32(M, N, K, a_stride=None, b_stride=None, c_stride=None):
 
 
 def _emit_matmul_fp32(compiler, M, N, K, a_addr, b_addr, c_addr,
-                      a_stride=None, b_stride=None, c_stride=None):
+                      a_stride=None, b_stride=None, c_stride=None, indirect_b=None):
+    """indirect_b: SRAM address of a uint32 byte offset (ISA v1.7). When given, every
+    LOAD of the B operand becomes dram_addr + SRAM[indirect_b], so WHICH weight matrix is
+    read is decided at run time (see _emit_moe_top1_ondevice_fp32)."""
     codegen.emit(compiler,
                  schedule.schedule_matmul(
                      _matmul_prim_fp32(M, N, K, a_stride, b_stride, c_stride),
                      intrin_name=intrin.register_gemm_fp32()),
                  {"A": a_addr, "B": b_addr, "C": c_addr},
-                 dtype=DType.FP32, kind="gemm")
+                 dtype=DType.FP32, kind="gemm",
+                 indirect={"B": indirect_b} if indirect_b is not None else None)
 
 
 def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, out_addr):
@@ -481,6 +485,54 @@ def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, 
     _emit_copy_slice_fp32(compiler, acc, out_addr, hidden, width=hidden)
 
 
+# SRAM word holding the on-device-chosen expert's byte offset (a free spot below the DMA
+# scratch at 0x8000 and above the wide weight zone that ends at 0x7000).
+ROUTE_PTR_SRAM = 0x7F00
+
+
+def _emit_moe_top1_ondevice_fp32(compiler, hidden, inter, x_addr, normed_addr, router_addr,
+                                 n_experts, expert0, expert_stride, out_addr):
+    """Top-1 MoE routing decided ENTIRELY ON THE DEVICE, with no host round trip and one
+    fixed instruction stream whatever the input:
+
+        logits = normed @ W_router                  (GEMM)
+        e      = first argmax of logits[0, :n_experts]   (REDUCE_ARGMAX, ISA v1.7)
+        offset = e * expert_stride                   (the argmax's immediate multiplier)
+        out    = x + SwiGLU_e(normed)                (expert weights fetched with
+                                                      INDIRECT_ADDR loads: dram_addr + offset)
+
+    Experts must be laid out at a fixed stride: expert e's gate/up/down live at
+    expert0[...] + e*expert_stride. Top-1 routing weight is 1 (renormalised top-1). Top-k
+    for k>1 would additionally need to mask the chosen logit and repeat; not built.
+    `expert0` is the {"w_gate","w_up","w_down"} address dict of expert 0.
+    """
+    M = compiler.tile_dim
+    logits = compiler.alloc_staging(M * M * 4)
+    _emit_matmul_fp32(compiler, M, M, hidden, normed_addr, router_addr, logits)
+    row_sram = DMA_SCRATCH_BASE
+    out_words = [
+        # bring logits row 0 (n_experts floats; the padded router columns are NOT included,
+        # since a padded zero could otherwise beat a negative real logit) into SRAM ...
+        encode(opcode=Opcode.LOAD_TILE, dep_id=0, dram_addr=logits, sram_addr=row_sram,
+               dim_m=1, dim_n=n_experts * 4, stride=n_experts * 4, dtype=int(DType.FP32)),
+        encode(opcode=Opcode.WAIT_SYNC, dep_id=0),
+        # ... and reduce it to e * expert_stride at ROUTE_PTR_SRAM.
+        encode(opcode=Opcode.REDUCE, dram_addr=expert_stride, sram_addr=ROUTE_PTR_SRAM,
+               dim_m=1, dim_n=n_experts, stride=row_sram,
+               activation=int(ActivationMode.REDUCE_ARGMAX), dtype=int(DType.FP32)),
+    ]
+    for w in out_words:
+        compiler.instruction_stream.extend(to_bytes(w))
+    y = compiler.alloc_staging(M * hidden * 4)
+    compiler.indirect_weights_scalar = ROUTE_PTR_SRAM
+    try:
+        _emit_swiglu_ffn_fp32(compiler, hidden, inter, normed_addr, expert0["w_gate"],
+                              expert0["w_up"], expert0["w_down"], y)
+    finally:
+        compiler.indirect_weights_scalar = None
+    _emit_residual_add_fp32(compiler, x_addr, y, out_addr, hidden)
+
+
 def _emit_moe_block_fp32(compiler, hidden, inter, x_addr, normed_addr, experts,
                          route_weights, out_addr, shared_expert=None):
     """A pre-norm MoE FFN block for one token with routing already decided:
@@ -511,7 +563,12 @@ def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
     (half the DRAM and weight traffic, FP32 accumulate) when
     `compiler.bf16_weights` is set, in which case W must have been stored as BF16
     (build_kvcache_model_dram_image(..., bf16_weights=True))."""
-    if getattr(compiler, "bf16_weights", False):
+    ptr = getattr(compiler, "indirect_weights_scalar", None)
+    if ptr is not None:
+        if getattr(compiler, "bf16_weights", False):
+            raise NotImplementedError("indirect (on-device routed) weights are FP32-only")
+        _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
+    elif getattr(compiler, "bf16_weights", False):
         _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
     else:
         _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
@@ -3487,7 +3544,13 @@ def emit_composite(compiler, info, addrs):
       (addrs keyed the same way -- "x"/"w" here too -- but its shape
       tuples are positional, not a params dict).
 
-    * Everything else -- "linear_bias", "softmax", "silu", "add", "mul" --
+    * "add" / "mul" -- elementwise over one tile (residual connections), via
+      _emit_residual_add_fp32 / _emit_mul_fp32.
+
+    * "linear_bias" -- matmul then add of a full-tile b (covers the matmul + residual
+      fusion the patterns produce).
+
+    * Everything else -- "softmax", "silu" --
       has no dispatch written yet. (Unlike before the FP32-only pivot, this
       is no longer blocked on missing scale data -- FP32 needs none -- it's
       just not built yet.)
@@ -3577,6 +3640,30 @@ def emit_composite(compiler, info, addrs):
         k2, n = w_shape[-2], w_shape[-1]
         assert k == k2, f"matmul shape mismatch: x has K={k}, w has K={k2}"
         _emit_matmul_fp32(compiler, m, n, k, addrs["x"], addrs["w"], addrs["out"])
+        return
+
+    if kind == "linear_bias":
+        # out = x @ w + b, with b a full (rows, n) tile (this is also how a matmul fused
+        # with a residual connection arrives: R.add(x, h @ w)).
+        x_shape, w_shape = info["params"][0]["shape"], info["params"][1]["shape"]
+        m, k = x_shape[-2], x_shape[-1]
+        n = w_shape[-1]
+        tmp = compiler.alloc_staging(compiler.tile_dim * n * 4)
+        _emit_matmul_fp32(compiler, m, n, k, addrs["x"], addrs["w"], tmp)
+        _emit_residual_add_fp32(compiler, tmp, addrs["b"], addrs["out"], n)
+        return
+
+    if kind in ("add", "mul"):
+        # Elementwise residual add / multiply over a (rows<=tile, width) tile; the
+        # operands' (and result's) row pitch is the tight width, as everywhere here.
+        width = info["params"][0]["shape"][-1]
+        rows = 1
+        for d in info["params"][0]["shape"][:-1]:
+            rows *= d
+        if rows > compiler.tile_dim:
+            raise NotImplementedError(f"emit_composite: {kind} with {rows} rows > one tile")
+        fn = _emit_residual_add_fp32 if kind == "add" else _emit_mul_fp32
+        fn(compiler, addrs["x"], addrs["y"], addrs["out"], width)
         return
 
     raise NotImplementedError(

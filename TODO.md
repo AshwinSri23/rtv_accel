@@ -450,23 +450,29 @@ Three options, in preference order:
   not compared numerically, so small FP32 deviations that don't flip a token would not show.
 - [x] **`reset_staging` / per-layer liveness (5.4 step 2): measured, deferred** (2026-11-04). One real 28-layer decode step needs 70.7 MB of staging (2.52 MB/layer) on top of a 1,772.8 MB image: ~4% of the footprint. Reusing it per layer would save ~66 MB but touches relocation's address tables, which the byte-identical tests depend on. Not worth the risk for this model; revisit for arbitrary graphs with large activations.
 - [x] **HF comparison automated as a script** (`toolchain/hf_compare.py`, 2026-11-04): runs HF greedy and `generate.py` on a prompt and compares token ids (exit 0 identical / 1 differ / 77 skipped without torch). Deliberately not in `ctest` (PyTorch is not a project dependency, minutes per prompt). Verified identical for FP32 and `--chip-args=--bf16-weights`.
-- [ ] **Promote the BYOC graph path to production (5.4 step 4)** — not attempted. It needs a Relax Qwen3 graph from a frontend (TVM's PyTorch import, i.e. torch in the TVM venv), a lowering for every claimed op, a boundary decision for attention (patterns.py cannot match per-head loops), and the byte-identical-stream acceptance test against the hand-driven path. Multi-week; the prerequisite pieces now exist (persistent session, tile-based prefill, BF16, HF oracle).
-- [x] **Real-architecture MoE model validated against Hugging Face** (2026-11-04).
-  `toolchain/moe_model.py` runs a Qwen3-MoE checkpoint on the chip (host-segmented routing,
-  two device programs per layer, one persistent session); `test_moe_model.py` runs
-  `hf-internal-testing/tiny-random-Qwen3MoeForCausalLM` (2 layers, 4 experts, top-2,
-  norm_topk_prob, q/k-norm, GQA) and compares to a recorded HF reference: the 6 generated
-  tokens are identical and the top-5 logits at every step agree to **4.95e-5** (the model's
-  logits are nearly tied, so this is tight). **Two findings on the way:** (1) transformers
-  5.12 expects the router as `mlp.gate.weight` but this checkpoint stores
-  `mlp.router.weight`, so HF silently leaves the router RANDOMLY initialised ("MISSING" in its
-  load report); my first reference was therefore wrong and showed phantom 0.007 logit gaps;
-  the reference now copies the checkpoint's router in explicitly. (2) The chip's RMSNorm had no
-  epsilon; fixed (`compiler.rms_eps`: an extra tile whose sum of squares is N*eps is accumulated
-  into the reduction), enabled in `generate.py` and `moe_model.py`; effect is below 1e-3 on this
-  model and the 28-layer Qwen3 comparisons stay token-identical (both prompts re-run).
-- [ ] **On-device MoE routing** (argmax-with-index + indirect LOAD) — an ISA design alternative, not a pending task; host-segmented routing is the chosen path.
+- [x] **BYOC graph path: promoted for the FFN half-layer; attention half measured** (2026-11-04).
+  `toolchain/byoc_graph.py` (`emit_graph`, `coverage`) walks a partitioned Relax `main` and lowers each
+  claimed composite with `emit_composite` (which gained `add`, `mul` and `linear_bias`). Acceptance bar from
+  5.4 step 4 met for `out = x + SwiGLU(RMSNorm(x))`: the patterns claim EVERY op (rmsnorm, swiglu_ffn,
+  add), the emitted stream is **byte-identical** (169 instructions) to the hand-driven emitters, and it
+  matches numpy to 1.4e-7 (`test_byoc_graph.py`). **Measured scope of the rest:** a full decoder-layer
+  graph in standard Relax ops (projections, reshape/permute head split, batched attention, softmax,
+  residuals, FFN) partitions into 9 composites; the ONLY ops left unclaimed are the 8 reshape/permute_dims
+  (layout glue). Still NOT graph-driven: lowering those layout ops (reshape is a view; the head
+  permutes are strided DMA, which `_emit_dma_copy` already does), a batched/per-head attention composite
+  using the real-rows softmax, and RoPE/KV-cache (not discoverable from graph structure, as patterns.py
+  documents). So production decode still uses the hand-driven emitters; the graph path is proven correct
+  for a real fragment and its remaining gap is now enumerated rather than guessed.
+- [x] **On-device MoE routing built** (2026-11-04, ISA v1.7). `REDUCE_ARGMAX` (first-max index times an
+  immediate byte multiplier, as a uint32 in SRAM) and `INDIRECT_ADDR` (LOAD/STORE address = dram_addr +
+  an SRAM word) give data-dependent addressing without a branch or loop. `_emit_moe_top1_ondevice_fp32`
+  compiles router GEMM -> argmax -> expert SwiGLU (indirect weight loads) -> residual into ONE
+  183-instruction program; `test_moe_ondevice.py` runs those same bytes on 8 inputs, which select all 4
+  experts, each matching a numpy top-1 MoE to 4e-7. Limits: top-1 only (top-k would mask the chosen logit
+  and repeat, plus an on-device softmax for the weights), FP32 weights only (not combined with BF16),
+  indirect transfers address < 4 GB (dram_hi is the pointer), experts at a fixed stride. Host-segmented
+  routing stays the general path (any top-k, validated against a real Qwen3-MoE).
 - [x] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
   half unstaged, plus the work above).
 
-**Status (2026-11-04, later):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred (below); step 3 answered by `test_moe_ffn.py`; step 4 (promote the BYOC graph path to production) NOT started and not attempted; step 5 prototyped (host-segmented MoE, no real checkpoint). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.
+**Status (2026-11-04, end):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred; step 3 answered by `test_moe_ffn.py`; step 4 done for the FFN half-layer with the byte-identical bar, remaining gap enumerated; step 5 done: host-segmented MoE validated against a real Qwen3-MoE architecture, plus on-device top-1 routing (ISA v1.7). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.

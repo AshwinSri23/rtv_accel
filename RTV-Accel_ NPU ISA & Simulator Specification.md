@@ -67,6 +67,21 @@ encoding.
 column-range move, a half-swap, a row broadcast or a one-row KV-cache append be
 plain DMA instead of a GEMM against a constant matrix.
 
+### **Instruction Bit-Layout — v1.7 (data-dependent addressing, no control flow)**
+
+Two additions, both using previously unassigned `activation` values; neither adds a branch or a loop.
+
+| Mode | Applies to | Semantics |
+| :--- | :--- | :--- |
+| `REDUCE_ARGMAX` = 0x13 | `REDUCE`, FP32 | Over the `dim_m x dim_n` float tile at `stride`, writes `index_of_first_max * dram_addr` (`dram_addr` is an immediate byte multiplier, 1 if 0) as a `uint32` at `sram_addr`. Row-major index. |
+| `INDIRECT_ADDR` = 0x14 | `LOAD_TILE` / `STORE_TILE` | The DRAM address becomes `dram_addr` + the `uint32` stored in SRAM at the 16-bit address given by the `dim_k` wire word (`dim_k` \| `c_slot`<<8 \| `dram_hi`<<12). `dram_hi` is spent on the pointer, so indirect transfers address below 4 GB. |
+
+Together they let a program pick WHICH weights to fetch from a runtime value: on-device MoE routing
+(`tvm_backend._emit_moe_top1_ondevice_fp32`, `test_moe_ondevice.py`) is one fixed instruction stream for any
+input. The cost is that a DRAM address is no longer a pure literal for these loads (it is a literal plus
+one SRAM word), so static address analysis must treat `INDIRECT_ADDR` transfers as "base plus runtime
+offset". Host-segmented routing (`test_moe_ffn.py`, `moe_model.py`) needs neither instruction.
+
 **Dependency tags.** `dep_id` is a 4-bit tag recorded per `LOAD_TILE` and
 cleared by `WAIT_SYNC`. A compiler may rotate tags across loads that are in
 flight at once; the simulator tracks completion per tag. `codegen.py`'s K-loop
@@ -137,7 +152,7 @@ residue that was never the point of the test.
 
 **The codegen computes no addresses.** Every offset and stride is read off the TIR, which TVM derives from typed buffer definitions — the ~276 lines of byte-vs-element arithmetic the hand-written compiler carried, and the source of most of its bugs, has no place to live in this design.
 
-**All 11 hardware intrinsics have FP32 `TensorIntrin` coverage** (`gemm`/`mul`/`sumsq`/`rms_scale`/`silu`/`rowmax`/`rowsum`/`exp_sub`/`scalar_div`/`transpose`/`add`), alongside the original INT8 versions kept for hardware-capability coverage. Composed into RMSNorm, SwiGLU FFN, multi-head/GQA attention (including RoPE and a real, growing multi-tile KV-cache), and whole transformer layers chained with ping-ponged DRAM buffers — verified against `rtv_sim` and numpy across the TVM-path tests (30 `ctest` targets in total as of 2026-11-04, 3 of them C++), registered individually in `CMakeLists.txt`.
+**All 11 hardware intrinsics have FP32 `TensorIntrin` coverage** (`gemm`/`mul`/`sumsq`/`rms_scale`/`silu`/`rowmax`/`rowsum`/`exp_sub`/`scalar_div`/`transpose`/`add`), alongside the original INT8 versions kept for hardware-capability coverage. Composed into RMSNorm, SwiGLU FFN, multi-head/GQA attention (including RoPE and a real, growing multi-tile KV-cache), and whole transformer layers chained with ping-ponged DRAM buffers — verified against `rtv_sim` and numpy across the TVM-path tests (32 `ctest` targets in total as of 2026-11-04, 3 of them C++), registered individually in `CMakeLists.txt`.
 
 **It fully unrolls, and must.** The ISA has no control flow, so a TIR loop becomes repeated instructions. The same property forces a fresh program per decode step, which no compiler change fixes — see "What TVM does not fix" below.
 

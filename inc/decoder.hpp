@@ -78,6 +78,14 @@ public:
                              // for all 256 inputs -- SiLU's curvature lives near |x|<6.
                              // The table is built at compile time for the buffer's known
                              // scale, so the function is evaluated at the true value.
+        // ISA v1.7 -- data-dependent addressing WITHOUT control flow (on-device MoE routing).
+        REDUCE_ARGMAX = 0x13, // REDUCE mode (FP32): tile = dim_m x dim_n floats at `stride`; writes
+                              // uint32 (index of the FIRST maximum, row-major) * dram_addr (an
+                              // immediate byte multiplier, 1 if 0) to the 4 bytes at sram_addr.
+        INDIRECT_ADDR = 0x14, // LOAD_TILE/STORE_TILE `activation`: the DRAM address becomes
+                              // dram_addr + the uint32 stored in SRAM at the 16-bit address held in
+                              // the dim_k wire word (bits [15:0]: dim_k | c_slot<<8 | dram_hi<<12).
+                              // Indirect transfers therefore address < 4 GB (dram_hi is the pointer).
         PERCHAN_QUANT=0x10,  // EXEC_ALU: INT32 accumulator → INT8 with a PER-OUTPUT-CHANNEL
                              // scale. Per-tensor INT8 weights are not sufficient for a real
                              // LLM: measured on Qwen3-0.6B, one scale per tensor drives the

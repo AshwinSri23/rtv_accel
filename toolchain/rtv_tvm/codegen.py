@@ -131,6 +131,10 @@ class Codegen:
         # the full row width: both ops already work over a whole dim_m x dim_n
         # region.
         self.dim_n = TILE
+        # ISA v1.7: {operand key: SRAM address of a uint32 byte offset}. LOADs of that
+        # operand become INDIRECT_ADDR: dram_addr + SRAM[ptr] (data-dependent addressing,
+        # e.g. an MoE expert chosen on-device by REDUCE_ARGMAX).
+        self.indirect = {}
         self.slot = _slot_map(kind, self.w)
         self.out_w = 4 if kind in ("gemm", "reduce") else DType.BYTES[dtype]
         # Keyed by activation, not a single counter: softmax runs a MAX
@@ -262,11 +266,16 @@ class Codegen:
         slot = slot_override if slot_override is not None else self.slot[key]
 
         if to_sram:
+            extra = {}
+            if key in self.indirect:
+                ptr = self.indirect[key]
+                extra = dict(activation=int(ActivationMode.INDIRECT_ADDR), dim_k=ptr & 0xFF,
+                             c_slot=(ptr >> 8) & 0xF, dram_hi=(ptr >> 12) & 0xF)
             word = encode(opcode=Opcode.LOAD_TILE, dep_id=(dep_override if dep_override is not None
                                   else DEP.get(key, 3)),
                           dram_addr=addr, sram_addr=slot, dim_m=self.dim_m,
                           dim_n=TILE * self.w, stride=pitch,
-                          dtype=int(self.dtype))
+                          dtype=int(self.dtype), **extra)
             self._emit_word(word)
         else:
             ew = self.out_w
@@ -556,12 +565,13 @@ class Codegen:
 
 
 def emit(compiler, sch, dram, dtype=DType.INT8, kind="gemm", scale_num=0,
-         lut_dram=None, temperature=0, reduce_accumulate=False):
+         lut_dram=None, temperature=0, reduce_accumulate=False, indirect=None):
     """Emit instructions for a scheduled PrimFunc into `compiler`."""
     cg = Codegen(compiler, dram, dtype, kind)
     cg.scale_num = scale_num
     cg.lut_dram = lut_dram
     cg.temperature = temperature
+    cg.indirect = dict(indirect or {})
     if reduce_accumulate:
         # The first REDUCE_SUMSQ ADDS onto the scalar already in SRAM instead of
         # overwriting it (used to fold RMSNorm's epsilon into the sum of squares).

@@ -99,6 +99,8 @@ class ActivationMode(IntEnum):
     PERCHAN_QUANT= 0x10  # EXEC_ALU: INT32 → INT8 with a per-output-channel mantissa/shift
     RESCALE      = 0x11  # EXEC_ALU: INT8 → INT8 scale conversion, mant/shift in dram_addr
     LUT          = 0x12  # EXEC_ALU: out[i] = table[tile[i]+128], 256-byte table at stride
+    REDUCE_ARGMAX = 0x13 # v1.7 REDUCE (FP32): uint32 first-max index * dram_addr(imm, 1 if 0) -> sram_addr
+    INDIRECT_ADDR = 0x14 # v1.7 LOAD/STORE activation: DRAM addr += uint32 at SRAM[dim_k wire word]
 
 
 # ── Encoding ──────────────────────────────────────────────────────────────────
