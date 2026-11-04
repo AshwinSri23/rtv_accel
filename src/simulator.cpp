@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "../inc/instruction_dispatcher.hpp"
 #include "../inc/memory_controller.hpp"
 #include "../inc/pe_array.hpp"
@@ -8,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -63,7 +66,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 2) {
         std::fprintf(stderr,
-            "Usage: %s <program.bin> [hal_config.json] [dram_mb] [options]\n"
+            "Usage: %s <program.bin|--serve> [hal_config.json] [dram_mb] [options]\n"
             "\n"
             "  program.bin     — binary instruction stream from npu_compiler.py\n"
             "  hal_config.json — hardware profile (default: toolchain/hal_config.json)\n"
@@ -79,6 +82,9 @@ int main(int argc, char* argv[])
     }
 
     const std::string bin_path    = argv[1];
+    // --serve: a persistent session. DRAM (and the loaded weights in it) stays
+    // resident while programs are submitted over stdin; see the serve loop below.
+    const bool        serve       = (bin_path == "--serve");
     std::string       config_path = "toolchain/hal_config.json";
     std::size_t       dram_mb     = 32;
     std::string       dram_image;
@@ -130,11 +136,18 @@ int main(int argc, char* argv[])
     // ── HAL config ────────────────────────────────────────────────────────────
     const uint32_t dram_latency =
         json_read_uint(config_path, "dram_latency_cycles", 120);
+    // Bytes the single shared DMA engine moves per cycle: an explicit
+    // "dram_bytes_per_cycle" if the config sets one, else the bus width the
+    // config already declares (bus_width_bits / 8; 128 bits = 16 B/cycle).
+    const uint32_t bus_bytes = std::max<uint32_t>(
+        1, json_read_uint(config_path, "bus_width_bits", 128) / 8);
+    const uint32_t dma_bpc = std::max<uint32_t>(
+        1, json_read_uint(config_path, "dram_bytes_per_cycle", bus_bytes));
 
     // ── Load instruction stream ───────────────────────────────────────────────
     InstructionDispatcher disp;
     try {
-        disp.load_binary(bin_path);
+        if (!serve) disp.load_binary(bin_path);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "load error: %s\n", e.what());
         return 1;
@@ -144,8 +157,8 @@ int main(int argc, char* argv[])
     std::printf("program  : %s\n",   bin_path.c_str());
     std::printf("config   : %s\n",   config_path.c_str());
     std::printf("instrs   : %zu\n",  n_instr);
-    std::printf("dram     : %zu MiB  (latency %u cycles)\n",
-                dram_mb, dram_latency);
+    std::printf("dram     : %zu MiB  (latency %u cycles, %u B/cycle shared DMA)\n",
+                dram_mb, dram_latency, dma_bpc);
 
     // ── Hardware models ───────────────────────────────────────────────────────
     MemoryController mem(dram_latency);
@@ -178,6 +191,15 @@ int main(int argc, char* argv[])
         std::printf("dram-img : %s (%zu bytes)\n", dram_image.c_str(), bytes.size());
     }
     PEArray pe;
+    // BF16W is a COMPUTE_GEMM-only dtype; fail loudly rather than misread data.
+    auto reject_bf16w = [](const Decoder::DecodedInstruction& d) {
+        if (d.dtype == Decoder::DType::BF16W)
+            throw std::runtime_error("dtype BF16W is only valid on COMPUTE_GEMM");
+    };
+    // LOAD/STORE address: 32 low bits from dram_addr, bits 35:32 from dram_hi.
+    auto dram_addr36 = [](const Decoder::DecodedInstruction& d) {
+        return (static_cast<uint64_t>(d.dram_hi) << 32) | d.dram_addr;
+    };
 
     // ── Cycle-accurate timing model ───────────────────────────────────────────
     //
@@ -194,6 +216,13 @@ int main(int argc, char* argv[])
 
     uint64_t sim_clock    = 0;
     uint64_t dep_done[16] = {};
+    // One DMA engine serves every LOAD and STORE: transfers queue behind each
+    // other (dma_free = cycle the engine can start the next one), and only the
+    // fixed DRAM latency overlaps between requests. Without this, any number
+    // of in-flight loads completed independently, which no real engine does
+    // and which made deep prefetch look free.
+    uint64_t dma_free = 0;
+    auto xfer_cycles = [&](uint64_t bytes) { return (bytes + dma_bpc - 1) / dma_bpc; };
     uint64_t serial_cycles = 0;
 
     // ── Opcode counters ───────────────────────────────────────────────────────
@@ -207,14 +236,15 @@ int main(int argc, char* argv[])
     // stride=0 in compiler output means contiguous tile; default to dim_n.
     disp.on(Decoder::Opcode::LOAD_TILE, [&](const Decoder::DecodedInstruction& d) {
         const uint16_t stride = d.stride ? d.stride : d.dim_n;
-        mem.load_tile(d.dram_addr, d.sram_addr, d.dim_m, d.dim_n, stride);
+        mem.load_tile(dram_addr36(d), d.sram_addr, d.dim_m, d.dim_n, stride);
 
-        const uint64_t lat = dram_latency
-                           + static_cast<uint64_t>(d.dim_m) * d.dim_n;
+        const uint64_t xfer  = xfer_cycles(static_cast<uint64_t>(d.dim_m) * d.dim_n);
+        const uint64_t start = std::max(sim_clock, dma_free);
+        dma_free = start + xfer;
         if (d.dep_id < 16)
-            dep_done[d.dep_id] = sim_clock + lat;
+            dep_done[d.dep_id] = start + xfer + dram_latency;
 
-        serial_cycles += lat;
+        serial_cycles += dram_latency + xfer;
         ++cnt[1];
     });
 
@@ -222,12 +252,13 @@ int main(int argc, char* argv[])
     // Treated as blocking: the CPU cannot proceed until the write completes.
     disp.on(Decoder::Opcode::STORE_TILE, [&](const Decoder::DecodedInstruction& d) {
         const uint16_t stride = d.stride ? d.stride : d.dim_n;
-        mem.store_tile(d.sram_addr, d.dram_addr, d.dim_m, d.dim_n, stride);
+        mem.store_tile(d.sram_addr, dram_addr36(d), d.dim_m, d.dim_n, stride);
 
-        const uint64_t lat = dram_latency
-                           + static_cast<uint64_t>(d.dim_m) * d.dim_n;
-        sim_clock    += lat;
-        serial_cycles += lat;
+        const uint64_t xfer  = xfer_cycles(static_cast<uint64_t>(d.dim_m) * d.dim_n);
+        const uint64_t start = std::max(sim_clock, dma_free);
+        dma_free  = start + xfer;
+        sim_clock = start + xfer + dram_latency;   // blocking; waits its turn
+        serial_cycles += dram_latency + xfer;
         ++cnt[2];
     });
 
@@ -278,6 +309,7 @@ int main(int argc, char* argv[])
     // EXEC_ALU: element-wise op on tile at sram_addr.
     // stride doubles as b_sram for binary modes (ELEMWISE_MUL, SCALAR_ADD).
     disp.on(Decoder::Opcode::EXEC_ALU, [&](const Decoder::DecodedInstruction& d) {
+        reject_bf16w(d);
         // dram_addr doubles as an immediate-operand field for EXEC_ALU modes
         // that need a constant rather than an SRAM address (RESCALE's
         // mantissa/shift), the same way SCALAR_ALU RMS_SCALE already uses it.
@@ -312,6 +344,7 @@ int main(int argc, char* argv[])
     // only when the tile happened to already be at 0x0000, silently wrong
     // otherwise (e.g. RMSNorm on a tile sitting in the output zone).
     disp.on(Decoder::Opcode::REDUCE, [&](const Decoder::DecodedInstruction& d) {
+        reject_bf16w(d);
         const uint16_t tile_sram = d.stride ? static_cast<uint16_t>(d.stride)
                                             : SRAM_INPUT_BASE;
         // d.accumulate lets a reduction span more tiles than one: RMSNorm's
@@ -331,6 +364,7 @@ int main(int argc, char* argv[])
     // RSQRT:      scalar  = 1/√scalar  (result stored as Q0.15)
     // Other modes delegate to pe_array for tile-based scalar operations.
     disp.on(Decoder::Opcode::SCALAR_ALU, [&](const Decoder::DecodedInstruction& d) {
+        reject_bf16w(d);
         // Delegate every mode to PEArray, which is the reference executor.
         //
         // This handler used to special-case SCALAR_ADD and RSQRT, transforming
@@ -359,6 +393,73 @@ int main(int argc, char* argv[])
         serial_cycles += 4;
         ++cnt[7];
     });
+
+    // ── Persistent session (--serve) ──────────────────────────────────────────
+    // One process holds DRAM across many programs, so weights are loaded once
+    // and each program is just submitted, like a command buffer to a device.
+    // Commands, one per line on stdin; every reply is one line on stdout:
+    //   RUN <prog.bin> [ADDR:LEN:FILE ...]  run a program, then dump regions
+    //   WRITE <addr> <file>                 copy a file into DRAM at addr
+    //   QUIT
+    // Replies: "OK instrs=N serial=S db=D" or "ERR <message>". Timing state is
+    // reset per RUN; DRAM and SRAM contents persist.
+    if (serve) {
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);
+        std::printf("READY\n");
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            std::istringstream in(line);
+            std::string cmd;
+            in >> cmd;
+            if (cmd.empty()) continue;
+            if (cmd == "QUIT") break;
+            try {
+                if (cmd == "WRITE") {
+                    std::string addr_s, file;
+                    in >> addr_s >> file;
+                    std::ifstream f(file, std::ios::binary);
+                    if (!f) throw std::runtime_error("cannot open " + file);
+                    const std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)),
+                                                  std::istreambuf_iterator<char>());
+                    mem.write_dram(static_cast<uint32_t>(std::stoull(addr_s, nullptr, 0)),
+                                   b.data(), b.size());
+                    std::printf("OK wrote=%zu\n", b.size());
+                } else if (cmd == "RUN") {
+                    std::string prog;
+                    in >> prog;
+                    std::vector<DumpSpec> ds;
+                    for (std::string spec; in >> spec;) {
+                        const auto c1 = spec.find(':'), c2 = spec.find(':', c1 + 1);
+                        if (c1 == std::string::npos || c2 == std::string::npos)
+                            throw std::runtime_error("bad dump spec " + spec);
+                        ds.push_back({static_cast<uint32_t>(std::stoull(spec.substr(0, c1), nullptr, 0)),
+                                      static_cast<std::size_t>(std::stoull(spec.substr(c1 + 1, c2 - c1 - 1), nullptr, 0)),
+                                      spec.substr(c2 + 1)});
+                    }
+                    sim_clock = 0; serial_cycles = 0; dma_free = 0;
+                    std::fill(std::begin(dep_done), std::end(dep_done), 0);
+                    std::fill(std::begin(cnt), std::end(cnt), 0);
+                    disp.load_binary(prog);
+                    disp.dispatch_all();
+                    for (const auto& d : ds) {
+                        std::vector<uint8_t> buf(d.len);
+                        mem.read_dram(d.addr, buf.data(), buf.size());
+                        std::ofstream out(d.path, std::ios::binary | std::ios::trunc);
+                        out.write(reinterpret_cast<const char*>(buf.data()),
+                                  static_cast<std::streamsize>(buf.size()));
+                        if (!out) throw std::runtime_error("write failed: " + d.path);
+                    }
+                    std::printf("OK instrs=%zu serial=%llu db=%llu\n", disp.instruction_count(),
+                                (unsigned long long)serial_cycles, (unsigned long long)sim_clock);
+                } else {
+                    throw std::runtime_error("unknown command " + cmd);
+                }
+            } catch (const std::exception& e) {
+                std::printf("ERR %s\n", e.what());
+            }
+        }
+        return 0;
+    }
 
     // ── Execute ───────────────────────────────────────────────────────────────
     std::printf("\nexecuting...\n");

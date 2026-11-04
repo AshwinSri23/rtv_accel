@@ -83,7 +83,13 @@ Decoder::DecodedInstruction Decoder::decode(const RawInstruction& raw) {
     d.dim_m       = static_cast<uint8_t>(wire_dim_m & 0xFF);
     d.scale_shift = static_cast<uint8_t>((wire_dim_m >> 8) & 0x1F);
     // bits 14:13 -- 0 decodes as INT8, so a v1/v1.5 word is unchanged.
-    d.dtype       = static_cast<DType>((wire_dim_m >> 13) & 0x3);
+    // v1.6: bit 15 extends the dtype field to 3 bits (4 = BF16W). 5-7 are invalid.
+    {
+        const uint8_t dt = static_cast<uint8_t>((wire_dim_m >> 13) & 0x7);
+        if (dt > static_cast<uint8_t>(DType::BF16W))
+            throw std::invalid_argument("decode: invalid dtype " + std::to_string(dt));
+        d.dtype = static_cast<DType>(dt);
+    }
 
     // lo word: dim_m_lo[63:56] | dim_n[55:40] | dim_k_wire[39:24] | stride[23:8] | activation_wire[7:0]
     d.dim_n = static_cast<uint16_t>((lo >> 40) & 0xFFFF);
@@ -92,6 +98,8 @@ Decoder::DecodedInstruction Decoder::decode(const RawInstruction& raw) {
     const uint16_t wire_dim_k = static_cast<uint16_t>((lo >> 24) & 0xFFFF);
     d.dim_k  = static_cast<uint8_t>(wire_dim_k & 0xFF);
     d.c_slot = static_cast<uint8_t>((wire_dim_k >> 8) & 0x0F);
+    // v1.6: bits [15:12] = DRAM address bits 35:32 (0 in every older encoding).
+    d.dram_hi = static_cast<uint8_t>((wire_dim_k >> 12) & 0x0F);
 
     d.stride = static_cast<uint16_t>((lo >> 8) & 0xFFFF);
 
@@ -113,10 +121,11 @@ Decoder::RawInstruction Decoder::encode(const DecodedInstruction& d) {
     // v1.5: pack sub-fields back into the wire words before building hi/lo.
     // wire_dim_m: bits [12:8] = scale_shift, bits [7:0] = tile rows
     const uint16_t wire_dim_m =
-        (static_cast<uint16_t>(static_cast<uint8_t>(d.dtype) & 0x3) << 13) |
+        (static_cast<uint16_t>(static_cast<uint8_t>(d.dtype) & 0x7) << 13) |
         (static_cast<uint16_t>(d.scale_shift & 0x1F) << 8) | d.dim_m;
     // wire_dim_k: bits [11:8] = c_slot, bits [7:0] = tile depth
     const uint16_t wire_dim_k =
+        (static_cast<uint16_t>(d.dram_hi & 0x0F) << 12) |
         (static_cast<uint16_t>(d.c_slot & 0x0F) << 8) | d.dim_k;
     // wire_activation: bit 7 = accumulate, bits [6:0] = mode enum
     const uint8_t wire_act =
@@ -203,6 +212,8 @@ std::string Decoder::to_string(const DecodedInstruction& d) {
     if (d.scale_shift)
         n += std::snprintf(buf + n, sizeof(buf) - static_cast<std::size_t>(n), " sshift=%u", d.scale_shift);
     if (d.c_slot)
-        std::snprintf(buf + n, sizeof(buf) - static_cast<std::size_t>(n), " cslot=%u", d.c_slot);
+        n += std::snprintf(buf + n, sizeof(buf) - static_cast<std::size_t>(n), " cslot=%u", d.c_slot);
+    if (d.dram_hi)
+        std::snprintf(buf + n, sizeof(buf) - static_cast<std::size_t>(n), " dramhi=%u", d.dram_hi);
     return std::string(buf);
 }

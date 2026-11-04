@@ -46,6 +46,34 @@ void PEArray::compute_gemm(MemoryController& mem,
                            uint8_t scale_shift,
                            Decoder::DType dtype)
 {
+    if (dtype == Decoder::DType::BF16W) {
+        // Mixed precision: FP32 activations (A) x BF16 weights (B) -> FP32.
+        // BF16 is the top 16 bits of an FP32, so widening is exact.
+        const uint32_t na = static_cast<uint32_t>(M) * K;
+        const uint32_t nb = static_cast<uint32_t>(K) * N;
+        const uint32_t nc = static_cast<uint32_t>(M) * N;
+        check_sram(a_sram, na * 4, "compute_gemm A (fp32)");
+        check_sram(b_sram, nb * 2, "compute_gemm B (bf16)");
+        check_sram(c_sram, nc * 4, "compute_gemm C (fp32)");
+        const float*    Af = reinterpret_cast<const float*>(mem.sram_ptr(a_sram));
+        const uint16_t* Bh = reinterpret_cast<const uint16_t*>(mem.sram_ptr(b_sram));
+        float*          Cf = reinterpret_cast<float*>(mem.sram_ptr(c_sram));
+        if (!accumulate)
+            std::memset(Cf, 0, static_cast<std::size_t>(nc) * sizeof(float));
+        for (uint16_t i = 0; i < M; ++i)
+            for (uint16_t k = 0; k < K; ++k) {
+                const float a = Af[i * K + k];
+                if (a == 0.0f) continue;
+                for (uint16_t j = 0; j < N; ++j) {
+                    const uint32_t bits = static_cast<uint32_t>(Bh[k * N + j]) << 16;
+                    float b;
+                    std::memcpy(&b, &bits, sizeof(b));
+                    Cf[i * N + j] += a * b;
+                }
+            }
+        return;
+    }
+
     if (dtype == Decoder::DType::FP32) {
         // No quantisation: A, B and C are all float, so there is no
         // accumulator width to choose, no requantisation step, and no scale

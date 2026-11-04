@@ -51,6 +51,36 @@ The tile dimension fields are safe to subdivide because they are bounded by the 
 
 **Disassembly.** A v1.5 word read by a v1 disassembler prints misleading dimensions — `dim_m = 0x0710` renders as `M=1808` — so the disassemblers in both `src/decoder.cpp` and `toolchain/rtv_isa.py` must print the sub-fields explicitly.
 
+### **Instruction Bit-Layout — v1.6**
+
+v1.6 is a second backward-compatible revision. Like v1.5, no field moves or
+changes width; it assigns meaning to bits that are zero in every earlier
+encoding.
+
+| Field | Earlier meaning | v1.6 addition |
+| :--- | :--- | :--- |
+| `dim_k` [39:24] bits 15:12 | reserved | **`dram_hi`**: DRAM address bits 35:32 for `LOAD_TILE`/`STORE_TILE`. Effective address is `dram_hi << 32 \| DRAM_Addr`: a 36-bit, 64 GB space. Other opcodes keep using `DRAM_Addr` as a 32-bit immediate and ignore `dram_hi`. |
+| `dim_m` [71:56] bit 15 | reserved | Third **dtype** bit (dtype is now bits 15:13). New value **`BF16W` = 4**: valid on `COMPUTE_GEMM` only. A is FP32, B is BF16 (2 bytes per element, widened exactly to FP32), C and the accumulator are FP32. Values 5-7 are invalid and the decoder rejects them. The simulator rejects `BF16W` on every other opcode. |
+
+`LOAD_TILE`/`STORE_TILE` are byte-granular: `dim_m` rows of `dim_n` bytes, with
+`stride` bytes between DRAM rows, at any byte offset. This is what lets a
+column-range move, a half-swap, a row broadcast or a one-row KV-cache append be
+plain DMA instead of a GEMM against a constant matrix.
+
+**Dependency tags.** `dep_id` is a 4-bit tag recorded per `LOAD_TILE` and
+cleared by `WAIT_SYNC`. A compiler may rotate tags across loads that are in
+flight at once; the simulator tracks completion per tag. `codegen.py`'s K-loop
+uses tags 8-15 this way (A: 8-11, B: 12-15) to prefetch up to three steps
+ahead. `STORE_TILE` is blocking.
+
+**Persistent session.** `rtv_sim --serve` keeps DRAM resident across programs: stdin commands `RUN <prog.bin> [ADDR:LEN:FILE ...]`, `WRITE <addr> <file>` and `QUIT`, one-line replies (`OK ...` / `ERR ...`), timing state reset per `RUN`.
+
+**Simulator timing model.** One shared DMA engine serves every `LOAD_TILE` and
+`STORE_TILE`: transfers queue behind each other at `dram_bytes_per_cycle` (from
+`hal_config.json`, else `bus_width_bits / 8`, i.e. 16 B/cycle), and only the
+fixed `dram_latency_cycles` overlaps between requests. Compute instructions
+advance the clock; loads do not.
+
 > [!NOTE]
 > **Case study: why standalone `.py` compiler scripts were abandoned, and why their INT8-era debugging history is gone from this document.** `toolchain/npu_compiler.py` (~3400 lines) was a hand-written Python compiler predating TVM: independent wire-packing, manual DRAM/SRAM address arithmetic, untyped buffers. Bringing up Qwen3-0.6B against it surfaced a long series of silent-corruption bugs across GEMM accumulation, SRAM slot addressing, staging buffer sizing, RoPE, attention, and INT8 requantization calibration — cascading, hard-to-find defects that motivated abandoning hand-written `.py` compiler scripts entirely in favor of Apache TVM (BYOC + TensorIR), where a typed tensor IR derives addresses and strides from buffer types instead of trusting hand-written arithmetic to agree across ~95 call sites.
 >
@@ -107,7 +137,7 @@ residue that was never the point of the test.
 
 **The codegen computes no addresses.** Every offset and stride is read off the TIR, which TVM derives from typed buffer definitions — the ~276 lines of byte-vs-element arithmetic the hand-written compiler carried, and the source of most of its bugs, has no place to live in this design.
 
-**All 11 hardware intrinsics have FP32 `TensorIntrin` coverage** (`gemm`/`mul`/`sumsq`/`rms_scale`/`silu`/`rowmax`/`rowsum`/`exp_sub`/`scalar_div`/`transpose`/`add`), alongside the original INT8 versions kept for hardware-capability coverage. Composed into RMSNorm, SwiGLU FFN, multi-head/GQA attention (including RoPE and a real, growing multi-tile KV-cache), and whole transformer layers chained with ping-ponged DRAM buffers — verified against `rtv_sim` and numpy across 73 tests in 12 files, registered individually in `CMakeLists.txt` and run through `ctest`.
+**All 11 hardware intrinsics have FP32 `TensorIntrin` coverage** (`gemm`/`mul`/`sumsq`/`rms_scale`/`silu`/`rowmax`/`rowsum`/`exp_sub`/`scalar_div`/`transpose`/`add`), alongside the original INT8 versions kept for hardware-capability coverage. Composed into RMSNorm, SwiGLU FFN, multi-head/GQA attention (including RoPE and a real, growing multi-tile KV-cache), and whole transformer layers chained with ping-ponged DRAM buffers — verified against `rtv_sim` and numpy across the TVM-path tests (25 `ctest` targets in total as of 2026-11-04, 3 of them C++), registered individually in `CMakeLists.txt`.
 
 **It fully unrolls, and must.** The ISA has no control flow, so a TIR loop becomes repeated instructions. The same property forces a fresh program per decode step, which no compiler change fixes — see "What TVM does not fix" below.
 
@@ -265,7 +295,7 @@ only, orchestration stays here) or the design moves to per-op kernels and
 ### **Superseded & Retired Components**
 
 * **Standalone Python Compiler (`toolchain/npu_compiler.py`, ~3400 lines):** **Deleted**, not merely superseded-and-kept. Its dtype-agnostic shared state (HAL config loading, the DRAM staging allocator, RoPE's host-side table math, and the raw instruction-emission primitives `test_tvm_path.py`'s INT8-intrinsic tests still drive directly) was extracted into `toolchain/compiler_state.py` first; everything else — every `compile_*` method, `ingest_model`, the four-pass INT8 orchestration this section used to describe — is gone, not relocated.
-* **INT8 quantization, end to end:** Out of scope, not deprioritized. The NPU runs models in native FP32; there is no calibration, scale planning, or requantization step anywhere in the current compiler. `toolchain/e2e_test.py` (22 INT8/FP32 test classes; the 4 FP32 ones are superseded by `rtv_tvm/e2e_migrated.py` with verified parity) and the INT8-era validation stack (`generate.py`, `device_probe.py`, `quant_sim.py`, `scale_sim.py`, `quant_eval.py`, `hf_loader.py`) are retired alongside it — `generate.py`/`device_probe.py` carry an explicit RETIRED notice in place; the rest are simply unused by anything still running.
+* **INT8 quantization, end to end:** Out of scope, not deprioritized. The NPU runs models in native FP32; there is no calibration, scale planning, or requantization step anywhere in the current compiler. `toolchain/e2e_test.py` (22 INT8/FP32 test classes; the 4 FP32 ones are superseded by `rtv_tvm/e2e_migrated.py` with verified parity) and the INT8-era validation stack (`device_probe.py`, `quant_sim.py`, `scale_sim.py`, `quant_eval.py`, `ref_model.py`, `layer_probe.py`, `swizzle.py`) are retired alongside it and have been deleted. `generate.py` and `hf_loader.py` were rewritten for FP32 and are in use.
 * **JIT Swizzle Engine (`toolchain/swizzle.py`):** Withdrawn. Tensor layout transformation and strided memory access are managed by TVM's typed buffer system.
 * **Hand-Written Polyhedral Tiling & List Scheduling:** Withdrawn. Tiling and double-buffering are expressed via TVM TensorIR schedule primitives (`split`, `reorder`, `tensorize`, and a hand-driven K-tile double-buffer in `codegen.py` where no TVM schedule primitive could express it — see `Codegen._gemm_k_loop`).
 * **Hardware Abstraction Layer (`toolchain/hal_config.json`):** Retained. Hardware dimensions (PE size, SRAM zone bounds) feed directly into TVM memory scopes and intrinsic declarations.
@@ -276,7 +306,7 @@ only, orchestration stays here) or the design moves to per-op kernels and
 
 Rather than executing abstract synthetic workloads, the software toolchain is architected to parse and execute cutting-edge AI architectures, run in their native FP32 precision (no quantization anywhere in this pipeline):
 * **Computer Vision:** End-to-end execution of a **ResNet-18** convolution pipeline.
-* **Edge Large Language Models:** FP32 deployment of **[Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)**'s architecture (Qwen3ForCausalLM, ~0.6B parameters, hidden\_size=1024, 28 layers, GQA 16→8 heads, head\_dim=128, SiLU/SwiGLU FFN, RMSNorm ε=1e-6, RoPE θ=1,000,000). The pipeline utilizes Apache TVM (with BYOC subgraph partitioning and TensorIR schedules) to orchestrate the model's attention and FFN blocks through the simulated NPU hardware without overflowing local SRAM buffers. RoPE rotation tables are pre-computed on the host CPU and loaded via LOAD\_TILE. Verified so far at up to 3-layer chained models with real Q/K/V/O projections, GQA, RoPE, and a growing KV-cache (`head_dim == 16`); the full 28-layer/head_dim=128 configuration is not yet run end to end (`head_dim > 16` needs the attention path's per-head transpose and RoPE's intra-tile permutation generalized to span multiple tiles first).
+* **Edge Large Language Models:** FP32 deployment of **[Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)**'s architecture (Qwen3ForCausalLM, ~0.6B parameters, hidden\_size=1024, 28 layers, GQA 16→8 heads, head\_dim=128, SiLU/SwiGLU FFN, RMSNorm ε=1e-6, RoPE θ=1,000,000). The pipeline utilizes Apache TVM (with BYOC subgraph partitioning and TensorIR schedules) to orchestrate the model's attention and FFN blocks through the simulated NPU hardware without overflowing local SRAM buffers. RoPE rotation tables are pre-computed on the host CPU and loaded via LOAD\_TILE. Verified at Qwen3's real dimensions (hidden=1024, 16 heads over 8 KV heads, head_dim=128) for 1-2 real layers through a multi-step KV-cache decode loop against a numpy reference; `toolchain/generate.py` runs the full 28 layers with schedule relocation and batched prefill. A comparison of a full 28-layer run against the Hugging Face reference model has not been done.
 
 ---
 
@@ -309,17 +339,7 @@ dtype-agnostic shared state extracted first into `toolchain/compiler_state.py`.
 Verified: 73 tests across 12 files in `toolchain/rtv_tvm/`, registered
 individually in `CMakeLists.txt` and passing under `ctest`.
 
-**What's still open, tracked as TODO.md Phase 1 gaps, not new roadmap items:**
-`head_dim > compiler.tile_dim` (e.g. 128, Qwen3's real value) is
-unsupported throughout the attention path — the per-head K transpose and
-RoPE's intra-tile permutation both need generalizing to span multiple
-tiles. The KV-cache append/tail-mask mechanism is verified at the
-attention-core level but not yet wired into a full per-layer/per-model
-decode loop with real projections and RoPE at the current position —
-assembly of pieces that already exist, not an open design question.
-TVM's auto-scheduling search space (exploring alternate loop orderings
-and tile configurations beyond the one hand-chosen schedule per op) is
-unexplored.
+**What's still open:** see TODO.md Phase 5 (generalizing beyond Qwen3, MoE) and its section 5.5. `head_dim > compiler.tile_dim`, the per-layer KV-cache decode loop with RoPE at the current position, and the multi-tile attention path are all done and tested. TVM's auto-scheduling search space is unexplored.
 
 ### **Dropped: INT8 completion**
 

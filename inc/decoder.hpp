@@ -105,6 +105,12 @@ public:
         // quantisation. Floats carry their own exponent, so the scale-
         // bookkeeping mistakes the INT8 path is prone to cannot occur here.
         FP32  = 3,
+        // ISA v1.6 (wire value 4, needs the third dtype bit at dim_m[15]):
+        // mixed-precision COMPUTE_GEMM only -- A is FP32, B is BF16 (2 bytes
+        // per element, widened exactly to FP32 on read), C and the
+        // accumulator are FP32. Halves weight DMA traffic and weight SRAM
+        // use. Any other opcode with this dtype is an error.
+        BF16W = 4,
     };
 
     // Bytes per element for a given width.
@@ -134,6 +140,7 @@ public:
     //                 tile an instruction operates on. Zero decodes as INT8, so
     //                 every previously-encoded program keeps its meaning.
     //   c_slot      — bits 11:8 of the dim_k wire word; destination C-buffer slot (0–15)
+    //   dram_hi     — v1.6, bits 15:12 of the dim_k wire word; DRAM address bits 35:32
     struct DecodedInstruction {
         Opcode         opcode;
         uint8_t        dep_id;      // 4-bit dependency tag for WAIT_SYNC barriers
@@ -149,6 +156,11 @@ public:
         bool           accumulate;  // do not zero C before GEMM; add into existing
         uint8_t        scale_shift; // INT32→INT8 shift amount (replaces fixed >>7)
         uint8_t        c_slot;      // C-buffer destination slot index
+        // ISA v1.6: dram_addr bits 35:32 (dim_k wire bits 15:12). Zero in every
+        // earlier encoding, so addresses stay 32-bit there. LOAD_TILE and
+        // STORE_TILE use dram_addr | dram_hi<<32 (a 36-bit, 64 GB space); other
+        // opcodes use dram_addr as a 32-bit immediate and ignore this field.
+        uint8_t        dram_hi;
         // Element width of the operand tile. INT8 is the default and the only
         // width the ISA originally had; the residual stream needs INT16
         // because it accumulates across 28 layers and carries Qwen3's massive

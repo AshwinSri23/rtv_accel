@@ -104,7 +104,8 @@ def run_rope_single_entry_case():
     """head_dim=32, 4 Q heads + 2 KV heads, 3 layers -> _emit_rope_fp32
     is called (4+2)*3 = 18 times this step, all with the SAME
     (head_dim, pos, theta) -- must collapse to exactly one
-    "rope_cossin" entry and one "rope_perm" entry, not 18 of each."""
+    "rope_cossin" entry, not 18. There is no "rope_perm" entry any more: the
+    rotate_half swap is now two strided DMA copies, not a permutation GEMM."""
     hidden, inter, n_heads, n_kv_heads, head_dim = 32, 48, 4, 2, 16
     comp = _build_and_emit(3, hidden, inter, n_heads, n_kv_heads, head_dim)
 
@@ -112,8 +113,8 @@ def run_rope_single_entry_case():
     rope_perm = [k for k in comp._const_cache if k[0] == "rope_perm"]
     if len(rope_cossin) != 1:
         return False, f"expected 1 rope_cossin cache entry, got {len(rope_cossin)}", 0
-    if len(rope_perm) != 1:
-        return False, f"expected 1 rope_perm cache entry, got {len(rope_perm)}", 0
+    if len(rope_perm) != 0:
+        return False, f"expected 0 rope_perm cache entries (DMA swap), got {len(rope_perm)}", 0
     return True, "", len(comp._const_cache)
 
 

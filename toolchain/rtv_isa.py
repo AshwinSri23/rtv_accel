@@ -73,8 +73,9 @@ class DType(IntEnum):
     INT16 = 1
     INT32 = 2
     FP32  = 3   # no quantisation: the baseline that separates lowering bugs from quantisation loss
+    BF16W = 4   # v1.6, COMPUTE_GEMM only: FP32 A x BF16 B -> FP32 (B is 2 bytes/elem)
 
-DType.BYTES = {0: 1, 1: 2, 2: 4, 3: 4, DType.INT8: 1, DType.INT16: 2, DType.INT32: 4, DType.FP32: 4}
+DType.BYTES = {0: 1, 1: 2, 2: 4, 3: 4, 4: 2, DType.INT8: 1, DType.INT16: 2, DType.INT32: 4, DType.FP32: 4, DType.BF16W: 2}
 
 
 
@@ -116,6 +117,7 @@ def encode(
     scale_shift: int = 0,
     c_slot:      int = 0,
     dtype:       int = 0,
+    dram_hi:     int = 0,
 ) -> int:
     """
     Pack all fields into a single 128-bit Python int.
@@ -130,6 +132,15 @@ def encode(
     packed here from the accumulate/scale_shift/c_slot parameters, not from
     dim_m/dim_k directly. accumulate packs into activation's bit 7.
     """
+    # ISA v1.6: a LOAD_TILE/STORE_TILE address above 32 bits is split into the
+    # 32-bit dram_addr field plus dram_hi (bits 35:32, dim_k wire bits 15:12).
+    if dram_addr > 0xFFFF_FFFF:
+        if opcode not in (Opcode.LOAD_TILE, Opcode.STORE_TILE):
+            raise ValueError(f"dram_addr {dram_addr:#x} exceeds 32 bits (only LOAD_TILE/STORE_TILE take 36-bit addresses)")
+        if dram_addr >> 36:
+            raise ValueError(f"dram_addr {dram_addr:#x} exceeds 36 bits")
+        dram_hi, dram_addr = dram_addr >> 32, dram_addr & 0xFFFF_FFFF
+    if dram_hi     & ~0xF:  raise ValueError(f"dram_hi {dram_hi} exceeds 4 bits")
     if opcode      & ~0xF:  raise ValueError(f"opcode {opcode:#x} exceeds 4 bits")
     if dep_id      & ~0xF:  raise ValueError(f"dep_id {dep_id:#x} exceeds 4 bits")
     if dram_addr   & ~0xFFFF_FFFF: raise ValueError(f"dram_addr {dram_addr:#x} exceeds 32 bits")
@@ -141,11 +152,12 @@ def encode(
     if activation  & ~0x7F:        raise ValueError(f"activation {activation:#x} exceeds 7 bits (bit 7 is accumulate)")
     if scale_shift & ~0x1F:        raise ValueError(f"scale_shift {scale_shift} exceeds 5 bits (0-31)")
     if c_slot      & ~0xF:         raise ValueError(f"c_slot {c_slot} exceeds 4 bits (0-15)")
-    if dtype       & ~0x3:         raise ValueError(f"dtype {dtype} exceeds 2 bits (0-3)")
+    if dtype       & ~0x7:         raise ValueError(f"dtype {dtype} exceeds 3 bits (0-4 valid)")
+    if dtype > 4:                  raise ValueError(f"dtype {dtype} is not a defined dtype (0-4)")
 
-    wire_dim_m = (((dtype & 0x3) << 13) | ((scale_shift & 0x1F) << 8)
+    wire_dim_m = (((dtype & 0x7) << 13) | ((scale_shift & 0x1F) << 8)
                   | (dim_m & 0xFF))
-    wire_dim_k = ((c_slot      & 0xF)  << 8) | (dim_k & 0xFF)
+    wire_dim_k = ((dram_hi & 0xF) << 12) | ((c_slot & 0xF) << 8) | (dim_k & 0xFF)
     wire_act   = (0x80 if accumulate else 0x00) | (activation & 0x7F)
 
     hi = (
@@ -198,7 +210,8 @@ def decode(word: int) -> dict:
         "accumulate":  bool((wire_act >> 7) & 1),
         "scale_shift": (wire_dim_m >> 8) & 0x1F,
         "c_slot":      (wire_dim_k >> 8) & 0xF,
-        "dtype":       DType((wire_dim_m >> 13) & 0x3),
+        "dtype":       DType((wire_dim_m >> 13) & 0x7),
+        "dram_hi":     (wire_dim_k >> 12) & 0xF,
     }
 
 
@@ -241,6 +254,8 @@ def disassemble(word: int) -> str:
         line += f" cslot={f['c_slot']}"
     if f["dtype"]:
         line += f" dtype={f['dtype'].name}"
+    if f["dram_hi"]:
+        line += f" dramhi={f['dram_hi']}"
     return line
 
 

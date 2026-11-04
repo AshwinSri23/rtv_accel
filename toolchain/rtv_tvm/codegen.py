@@ -45,6 +45,11 @@ TILE = 16
 SCALAR_MAX = SRAMMap.SCALAR_SCRATCH_BASE
 SCALAR_SUM = SRAMMap.SCALAR_SCRATCH_BASE + 4
 DEP = {"A": 1, "B": 2}
+# Rotating tags for the K-loop's prefetch pipeline. DEP above is one fixed tag
+# per operand role, which caps prefetch at one step ahead (dep_done[tag] is
+# overwritten by a newer load). Tags 8-15 are unused elsewhere: A takes 8-11,
+# B takes 12-15, so up to 4 steps can be in flight with distinct tags.
+ROT_A_BASE, ROT_B_BASE, MAX_PIPE_DEPTH = 8, 12, 4
 
 
 def _slot_map(kind: str, width: int) -> dict:
@@ -193,7 +198,7 @@ class Codegen:
         word = encode(opcode=Opcode.WAIT_SYNC, dep_id=dep_id)
         self._emit_word(word)
 
-    def _tile_copy(self, realize, env, slot_override=None):
+    def _tile_copy(self, realize, env, slot_override=None, dep_override=None):
         """A 16x16 staging block: emit one LOAD_TILE or STORE_TILE.
 
         The block's body copies element by element; the instruction moves the
@@ -204,6 +209,9 @@ class Codegen:
         fixed slot. Only _gemm_k_loop uses this, to alternate the weight
         (B) operand between two slots for double buffering -- everything
         else keeps a fixed slot per operand, unchanged.
+
+        dep_override: use this dep_id tag for the LOAD_TILE instead of the
+        operand's fixed one (the K-loop rotates tags per step).
         """
         block = realize.block
         store = block.body
@@ -249,7 +257,8 @@ class Codegen:
         slot = slot_override if slot_override is not None else self.slot[key]
 
         if to_sram:
-            word = encode(opcode=Opcode.LOAD_TILE, dep_id=DEP.get(key, 3),
+            word = encode(opcode=Opcode.LOAD_TILE, dep_id=(dep_override if dep_override is not None
+                                  else DEP.get(key, 3)),
                           dram_addr=addr, sram_addr=slot, dim_m=self.dim_m,
                           dim_n=TILE * self.w, stride=pitch,
                           dtype=int(self.dtype))
@@ -399,36 +408,50 @@ class Codegen:
                 self.visit(node.body, dict(env, **{name: v, "__k__": v}))
             return
 
+        # Pipeline depth: how many K-steps' operands are resident at once.
+        # Limited by SRAM slot capacity per zone and by the rotating tags.
+        # D slots means prefetching D-1 steps ahead of the compute.
+        slot_bytes = 0x100 * self.w if self.w < 4 else 0x400
+        zone = 0x400 if self.w < 4 else 0x400 * MAX_PIPE_DEPTH
+        depth = max(1, min(k_tiles, MAX_PIPE_DEPTH, zone // slot_bytes,
+                           getattr(self, "pipe_depth", MAX_PIPE_DEPTH)))
+        if depth < 2:
+            for v in range(k_tiles):
+                self.visit(node.body, dict(env, **{name: v, "__k__": v}))
+            return
+
         def load_a(step, slot_addr):
             self._tile_copy(a_realize, dict(env, **{name: step, "__k__": step}),
-                            slot_override=slot_addr)
+                            slot_override=slot_addr,
+                            dep_override=ROT_A_BASE + step % depth)
 
         def load_b(step, slot_addr):
             self._tile_copy(b_realize, dict(env, **{name: step, "__k__": step}),
-                            slot_override=slot_addr)
+                            slot_override=slot_addr,
+                            dep_override=ROT_B_BASE + step % depth)
 
-        # A is ALSO double-buffered here, unlike compile_linear's version
-        # (which leaves A single-slot, reloaded fresh every step). Measured
-        # directly why that matters: with only B double-buffered, A's own
-        # un-overlapped reload still takes its full latency every step, and
-        # WAIT_SYNC's "stall to the LATEST unmet dependency" means A's fresh
-        # wait dominates the critical path regardless of how well B's
-        # prefetch overlapped -- B-only double buffering measured as a
-        # complete no-op on rtv_sim's own cycle model (identical serial/db
-        # numbers whether B was double-buffered or not). Buffering both
-        # closes that gap.
-        a_slots = [self.slot["A"], SRAMMap.input_slot(1, self.w)]
-        b_slots = [self.slot["B"], SRAMMap.weight_slot(1, self.w)]
-        load_a(0, a_slots[0])
-        load_b(0, b_slots[0])
+        # Both operands are pipelined (buffering only B measured as a no-op:
+        # WAIT_SYNC stalls to the latest unmet dependency, so A's un-overlapped
+        # reload dominates). Step s uses slot s % depth and tags (A, B) =
+        # (ROT_A_BASE, ROT_B_BASE) + s % depth, so every in-flight load has its
+        # own tag and dep_done[tag] always refers to exactly that load. At
+        # iteration s we prefetch step s+depth-1 into slot (s-1) % depth, which
+        # the already-executed GEMM s-1 was the last to read.
+        a_slots = [self.slot["A"]] + [SRAMMap.input_slot(i, self.w)
+                                      for i in range(1, depth)]
+        b_slots = [self.slot["B"]] + [SRAMMap.weight_slot(i, self.w)
+                                      for i in range(1, depth)]
+        for pre in range(min(depth - 1, k_tiles)):
+            load_a(pre, a_slots[pre % depth])
+            load_b(pre, b_slots[pre % depth])
         for step in range(k_tiles):
-            cur = step % 2
-            self._wait(DEP["A"])
-            self._wait(DEP["B"])
-            nxt = step + 1
+            cur = step % depth
+            nxt = step + depth - 1
             if nxt < k_tiles:
-                load_a(nxt, a_slots[nxt % 2])
-                load_b(nxt, b_slots[nxt % 2])
+                load_a(nxt, a_slots[nxt % depth])
+                load_b(nxt, b_slots[nxt % depth])
+            self._wait(ROT_A_BASE + cur)
+            self._wait(ROT_B_BASE + cur)
             saved_a, saved_b = self.slot["A"], self.slot["B"]
             self.slot["A"], self.slot["B"] = a_slots[cur], b_slots[cur]
             self._gemm(dict(env, **{name: step, "__k__": step}), skip_wait=True)

@@ -15,10 +15,10 @@ Two real pieces, both driven by the "constant matrix through GEMM" trick
 this codebase already uses for broadcast/mask/RoPE (no hardware
 broadcast/permute/partial-write primitive exists for any of them):
 
-1. _emit_kv_cache_append_fp32 -- LOAD_TILE/STORE_TILE only move WHOLE
-   16x16 tiles (confirmed against pe_array.cpp: no sub-tile partial-row
-   write opcode), so "append one token" can't literally write one row of
-   an existing tile. Blends the new row in via
+1. _emit_kv_cache_append_fp32 -- the GEMM-blend form. (Its premise, that
+   LOAD_TILE/STORE_TILE only move whole 16x16 tiles, was wrong: they take
+   rows/bytes/stride, and the decode path now appends with a one-row
+   STORE_TILE via _emit_kv_cache_append_dma_fp32.) Blends the new row in via
    `mask_keep @ old_tile + mask_insert @ new_row_bcast`, two compile-time
    constant matrices selecting "every row except `row`" and "only row
    `row`" respectively.

@@ -156,3 +156,248 @@ already fully answer the question this project set out to answer without
 it. Same treatment Phase 4 (ARM NEON validation) already got: removed
 from the roadmap as out of scope, not left as a stale "to do" nobody
 intends to pick up.
+
+---
+
+## Phase 5: Generalize beyond Qwen3 — MoE models and arbitrary graphs (opened 2026-10-25)
+
+**Goal.** Run models this compiler was not hand-written for, MoE
+architectures specifically. Nothing here is built; this is a scoping
+entry, written before any code, to record the architectural consequences
+while they are clear.
+
+**This reverses a decision Phase 1-4 made implicitly.** Every compiler
+choice so far is justified by the DAG being *fixed and known*: one model,
+28 structurally identical layers, so `tvm_backend.py` builds the loop
+nests for each pass directly from the model config and no graph IR is
+needed. `patterns.py` exists and is tested but nothing in production
+calls `partition()` — see `test_composite_dispatch.py`, and the
+`offloaded_matmuls()` docstring there recording that it silently returned
+`[]` for every real module without anyone noticing, because the
+production path routes around it. Arbitrary models remove that
+justification: you cannot hand-write an `_emit_*` function per operator
+for a graph you have not seen. **Promoting the BYOC path
+(`patterns.py` → `offloaded_composites` → `emit_composite`) from
+test-only to production is therefore a prerequisite for this phase, not
+an optional cleanup.**
+
+### 5.1. The hard blocker: MoE routing is data-dependent dispatch
+
+A mixture-of-experts layer picks which expert weights a token is routed
+to *at runtime*, from a gate network's top-k. This ISA has no computed
+addressing, no branches and no indirect loads — `LOAD_TILE`'s
+`dram_addr` is a 32-bit literal fixed at compile time. So
+"load expert `i`'s weights, where `i` is a runtime value" is not
+expressible, in the same way and for the same reason that embedding
+lookup and argmax sampling are host-side by necessity (see
+`generate.py`'s host/device split).
+
+Three options, in preference order:
+
+- **(a) Host-side routing, expert addresses baked per token — recommended, but see the 2026-11-03 correction in 5.5: the gate runs mid-program, so this needs a program boundary at every MoE layer, not a single per-token program.**
+  Costs no ISA change and fits this architecture's existing grain: the
+  compiler *already* emits a fresh program per decode step, because the
+  ISA has no control flow. So the host runs the gate, picks top-k, and
+  the compiler bakes the selected experts' addresses into that token's
+  program as literals. The data dependence is resolved at compile time
+  of a program that only ever runs for one token. Keeps every property
+  the rest of the project rests on — static analyzability, determinism,
+  relocation-as-field-rewrite. Note the gate itself is a small dense
+  matmul and can run on-device; only the top-k needs the host, same
+  `REDUCE_MAX`-has-no-index limitation as sampling.
+- **(b) Compile all experts and mask.** Correct, trivially expressible,
+  and discards the entire point of MoE — you pay dense compute for every
+  expert. Useful only as a correctness oracle to check (a) against.
+- **(c) Add indirect addressing to the ISA.** A real design change
+  (`rtv_isa.py` + `decoder.cpp` + `pe_array.cpp`), and it would delete
+  the no-control-flow constraint that motivates schedule relocation and
+  the static cost model. Not recommended; recorded so the trade is
+  explicit rather than forgotten.
+
+### 5.2. What a production graph IR path needs that the current one lacks
+
+- **Liveness-based memory planning.** `compiler_state.py` already has
+  `reset_staging()` and **nothing calls it** — `_staging_cursor` only
+  moves forward, so every intermediate buffer in every layer gets a
+  fresh address and none are ever reused. Hand-written emitters got away
+  with this because the per-layer footprint is known and small relative
+  to ~1.5 GB of weights. An arbitrary graph has no such guarantee. This
+  is the cheapest item in this phase and is worth doing on its own
+  merits first (see 5.4).
+- **Attention still cannot be pattern-matched.** `patterns.py` says so
+  about itself: per-head loops are not a static shape. So the BYOC path
+  will claim the easy operators and leave attention to configuration-aware
+  hand-written code regardless — meaning both paths get maintained. Decide
+  deliberately how that boundary is drawn rather than discovering it.
+- **Fusion needs a lowering target.** A graph IR will correctly identify
+  fusable sequences (RMSNorm's `rms_scale`→`mul` is elementwise with no
+  barrier between the two) that this ISA has no single opcode for. Fusion
+  findings become ISA tickets, not compiler transformations, until a fused
+  opcode or activation mode exists. Worth using the graph IR as a
+  *discovery* tool for which opcodes to add.
+
+### 5.3. Open questions, to settle before building
+
+- Which MoE model is the target? Expert count, expert width and top-k
+  determine whether option (a)'s per-token recompile cost is acceptable
+  against the ~7.6s/layer TVM schedule+codegen cost that schedule
+  relocation exists to amortize. Relocation assumes every layer is
+  structurally identical; MoE layers differ by *which* experts they
+  reference, which relocation's address-patching may already handle —
+  unverified, and worth checking early since it is cheap to check.
+- Does the FP32-only decision hold? Most published MoE work is
+  quantization-sensitive in ways Phase 2 was dropped rather than solved.
+
+### 5.4. Suggested ordering
+
+1. ~~Fix the double-buffering shortfall~~ **Re-diagnosed 2026-11-04, see 5.5:** the 1.20× was mostly a DMA-bandwidth floor, not a tag problem. Tag rotation is in; real-layer speedup is now 2.28× under a shared-DMA model.
+   (Original note: measured 1.20× against a ~2× ceiling; diagnosed in `simulator.cpp`'s scoreboard — dep tags are
+   assigned by operand role, so prefetch distance is not a parameter
+   anywhere.) Independent of this phase and the largest known real number
+   outstanding.
+2. Call `reset_staging()` / add per-layer liveness. Cheap, the method is
+   already written, and it is a prerequisite for 5.2.
+3. Verify whether schedule relocation survives differing expert
+   references, before committing to option (a).
+4. Promote the BYOC path to production on Qwen3 *first* — same model,
+   same expected output, so any divergence is the path's fault and not
+   the model's. Byte-identical instruction streams against the current
+   path is the acceptance test, the same bar schedule relocation was held
+   to.
+5. Then MoE itself.
+
+
+### 5.5. Work since this entry (2026-11-03 / 2026-11-04)
+
+**Done**
+
+- [x] **ISA audit** (`decoder.hpp`, `rtv_isa.py`, `simulator.cpp` handlers,
+  `memory_controller.cpp`). Findings: no control flow or base registers are
+  needed; `dram_addr` is 32-bit (4 GB), a hard blocker for any real MoE;
+  `dtype` is a full 2-bit field with no BF16; only `LOAD` is async in the
+  simulator; INT8-era modes/fields are dead weight but harmless. Free bits:
+  `dim_k[15:12]`, `dim_m[15]`, opcodes 0x8–0xF.
+- [x] **KV-cache append via one-row DMA** —
+  `tvm_backend._emit_kv_cache_append_dma_fp32`. `LOAD_TILE`/`STORE_TILE` take
+  rows/bytes/stride and `memcpy` exactly that, so appending a token is one
+  `STORE_TILE` with `rows=1`, not two GEMMs and two constant matrices. 3
+  instructions against 18–144, bit-exact for rows 0/5/15 at widths 16/32/128,
+  and no broadcast of the new row is needed. Wired into
+  `_emit_attention_block_kvcache_fp32`; real-layer instruction count 332,464 →
+  329,440 (~1%; the old figure is TODO's, not re-measured). **Correction:** the
+  docs' claim that LOAD/STORE only move whole 16×16 tiles is wrong.
+  `_emit_kv_cache_append_fp32` is kept (still exercised by `test_kv_cache.py`).
+- [x] **Instruction profile** of one real Qwen3 layer step (329,440 instrs):
+  LOAD_TILE 39.6%, WAIT_SYNC 39.6% (one wait per load), COMPUTE_GEMM 19.2%,
+  STORE_TILE 1.0%, EXEC_ALU 0.5%, REDUCE/SCALAR_ALU 0.2%. ~98% is the
+  load/wait/GEMM pattern.
+- [x] **Gemmini chosen as the reference design** — `GEMMINI_MAPPING.md`
+  (adopt/adapt/skip per instruction). **Decision: the compiler keeps
+  scheduling**; no Gemmini-style internal-double-buffering loop unit.
+  Reasons: fusion across ops (e.g. SwiGLU gate/up resident in SRAM), shape
+  tuning, and explicit streams keep relocation and byte-identical tests valid.
+  Details of Gemmini's `loop_ws` field layouts and BF16 support are still
+  unverified from source.
+- [x] **K-loop dependency-tag rotation** (`codegen.py::_gemm_k_loop`): each
+  K-step gets its own `dep_id` (tags 8–11 for A, 12–15 for B), prefetching up
+  to `MAX_PIPE_DEPTH-1` = 3 steps ahead with up to 4 SRAM slots (capped by zone
+  capacity per dtype). No ISA change.
+- [x] **Shared-DMA-engine timing model** (`simulator.cpp`): loads/stores queue
+  on one engine; only fixed latency overlaps. Bandwidth from
+  `dram_bytes_per_cycle`, else `bus_width_bits/8` (128 bits → 16 B/cycle).
+  **Outcomes:** (1) the earlier 4.56× from tag rotation was an artifact of
+  unlimited parallel DMA; (2) with a shared engine, an 8-K-tile matmul is 2.09×
+  at depth 2, 3 and 4 alike; (3) at 1 B/cycle it is 1.20× at every depth, so
+  the 1.20× above was a bandwidth floor, not a scheduling bug; (4) depth helps
+  only when memory latency exceeds compute time (600-cycle latency: 3.15× /
+  4.57× / 5.74× at depth 2/3/4); (5) **real Qwen3 layer step: 41,273,856 serial
+  vs 18,105,472 double-buffered cycles = 2.28×, same at depth 2 and 4**.
+  `test_swiglu_resident` speedup is 1.22× under the new model (was 1.65×). All
+  22 ctest targets pass.
+
+**Open**
+
+- [x] **36-bit DRAM address** (ISA v1.6) via `dim_k[15:12]` = address bits 35:32 on
+  LOAD/STORE (zero = old behavior). `Decoder::DecodedInstruction::dram_hi`, `rtv_isa.encode`
+  splits any LOAD/STORE address above 32 bits automatically, `MemoryController`
+  load/store take `uint64_t`. Tests: `decoder_test` round trip, `test_dram36.py`
+  (round trip + a 2**32+x address must NOT wrap to the low 32 bits). Note the
+  simulator still holds DRAM in host memory, so a >4 GB run needs that much RAM.
+- [x] **BF16 weights, ISA + simulator side** (ISA v1.6): `dtype` widened to 3 bits via
+  `dim_m[15]`; `DType.BF16W = 4` is `COMPUTE_GEMM`-only (FP32 A x BF16 B -> FP32,
+  exact widening), rejected by the simulator on every other opcode. Tests:
+  `pe_array_test` (matches FP32 GEMM bit-for-bit for bf16-representable weights,
+  accumulate), `decoder_test`, `test_bf16w.py` (end to end, 1 and 4 K-tiles).
+  **Not done:** compiler plumbing (a BF16 weight buffer dtype through
+  `intrin.py`/`schedule.py`/`codegen.py`, `build_*_dram_image` and the checkpoint
+  loader converting weights). Until then nothing emits BF16W.
+- [x] **Async `STORE_TILE`: decided not to do.** Measured on one real layer step: 2,912
+  stores x ~184 cycles = ~0.54M of ~17.6M double-buffered cycles (~3%), so the
+  ceiling on the win is small, and it would add a hazard class (a load racing a
+  pending store) to every program. Reopen only if a future workload is
+  store-heavy. Original design, if ever needed: opt-in (`dep_id != 0` = non-blocking, program must
+  `WAIT_SYNC` before reading that data; `dep_id == 0` stays blocking). Only if
+  measurements justify it: stores are 1% of instructions. Existing programs
+  rely on blocking stores (each op stores, the next reloads), so it cannot be
+  made the default.
+- [x] **"Constant matrix via GEMM" helpers replaced with DMA** (done 2026-11-04):
+  `_emit_rotate_half_dma_fp32` (RoPE swap, both RoPE variants),
+  `_emit_broadcast_row0_fp32` (1 load + 16 one-row stores), `_emit_copy_slice_fp32`
+  (strided copy), via a shared `_emit_dma_copy` staging through SRAM at 0x8000.
+  **Outcome: real-layer instructions 329,440 -> 320,962 (-2.6%), cycles 18.1M ->
+  17.6M.** Far smaller than guessed: 61,696 of the 320,962 instructions are GEMMs and
+  they are essentially the layer's weight matmuls (q/k/v/o/gate/up/down =
+  61,440 tiles), so the stream is dominated by weight traffic that no helper rewrite
+  removes; only a repetition-style loop opcode or batching reduces it.
+  `_emit_mask_to_row0_fp32`/`_emit_mask_to_n_real_rows_fp32` are NOT replaced (they
+  need zero-fill, a multiply by a mask constant). 23/23 ctest. Original item text:: `_emit_broadcast_row0_fp32`, `_emit_copy_slice_fp32`,
+  `_emit_mask_to_row0_fp32`, RoPE's rotate_half permutation (672 GEMM
+  sequences per decode step, ~64 KB permutation matrix). DMA with byte offsets
+  looks sufficient for the swap. Profile which of these dominate first.
+- [x] **Persistent simulator session** (done 2026-11-04): `rtv_sim --serve` keeps DRAM
+  resident; stdin commands `RUN <prog> [ADDR:LEN:FILE ...]`, `WRITE <addr> <file>`,
+  `QUIT`; replies `OK ...`/`ERR ...`; timing state resets per RUN. `generate.py`
+  now uses it (`_SimSession`): the image is loaded once, each step WRITEs only its
+  constants and dumps only its output, instead of round-tripping the whole
+  multi-GB DRAM through a file. Verified token-for-token identical to the old
+  path on 3 cases (1 layer; 4 layers with relocation; a 19-token prompt past one
+  batch tile). Test: `test_persistent_session.py` (DRAM persists across programs,
+  WRITE, per-RUN timing reset, ERR recovery). Required for host-segmented MoE
+  routing. Not measured: wall-clock gain at 28 layers (compile still dominates
+  small runs; 1-layer runs were 21.4 s vs 20.6 s).
+- [ ] **MoE routing decision.** Host-segmented (no ISA change: a program
+  boundary and host round trip at every MoE layer, gate logits come out
+  mid-program) vs on-device (argmax-with-index `REDUCE` mode + SRAM-indirect
+  `LOAD_TILE` address; no branches, top-k unrolled at fixed k). Recommended:
+  start host-segmented. Correct 5.1(a) accordingly.
+- [ ] **Repetition-only loop opcode** (strides/bounds, compiler names slots and
+  tags). Deferred; revisit if stream size (329k instrs/layer, ~150 MB over 28
+  layers) becomes the binding constraint.
+- [x] **Gemmini details verified from `gemmini.h`** (2026-11-04): LOOP_WS is one RoCC
+  instruction (funct 8) with 16-bit I/J/K bounds and two scratchpad base addresses,
+  plus CISC config instructions (funct 11-15); no BF16 in the header. See
+  `GEMMINI_MAPPING.md`. The Scala generator was not read.
+- [x] **ISA spec update**: new "Instruction Bit-Layout — v1.6" section (dram_hi,
+  BF16W, byte-granular DMA, dep-tag rotation, shared-DMA timing).
+- [x] **Doc cleanups** (done 2026-11-04; remaining text below is the original list;
+  only the undefined "L3" and the untested 5.4 step 3 remain open): spec §4/§5 still say `head_dim > 16` is unsupported;
+  TESTING.md says `generate.py` prefills one token at a time (no longer true)
+  and counts 19 tests (TODO says 22); spec lists `generate.py`/`hf_loader.py`
+  as retired though they are in use; `test_kv_cache.py` docstring and
+  `_emit_kv_cache_append_fp32` repeat the wrong "whole tile only" claim; "L3"
+  is undefined; Phase 5.4 step 3 (relocation vs differing experts) is untested.
+- [ ] **Prefill beyond one tile** (>16 tokens currently raises
+  `NotImplementedError` in the batched path). Analysis 2026-11-04: this is a speed gap,
+  not a correctness one: `generate.py` already feeds tokens past 16 through the
+  one-at-a-time decode path (verified with a 19-token prompt). Doing it for real needs
+  `_emit_softmax_rows_fp32` to span several key tiles (it is limited to `seq_k ==
+  tile_dim`) plus causal attention across cached tiles; not started.
+- [ ] **End-to-end validation** (blocked: no `torch` in any environment here; `transformers`
+  5.12.1 is installed system-wide but needs it. Installing PyTorch is a ~2 GB environment
+  change, so not done without sign-off) of a full 28-layer run against the real
+  HF/PyTorch Qwen3 (currently only 1–2 layer checks against a numpy reference
+  built from the same weights; `generate.py` is not in CI).
+- [ ] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
+  half unstaged, plus the work above).
+
+**Status (2026-11-04):** 5.4 steps 1 (re-diagnosed and addressed) done; steps 2–5 not started. See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.

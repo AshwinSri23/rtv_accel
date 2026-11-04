@@ -54,7 +54,7 @@ from tvm.script import tirx as T                    # noqa: E402
 from compiler_state import NPUCompiler, DType, SRAMMap, _padded, _align   # noqa: E402
 
 from rtv_tvm import patterns, schedule, codegen, intrin
-from rtv_isa import DType, Opcode, ActivationMode, encode, decode
+from rtv_isa import DType, Opcode, ActivationMode, encode, decode, to_bytes
 
 CODEGEN = patterns.CODEGEN
 
@@ -1160,6 +1160,50 @@ def _emit_gqa_attention_batched_fp32(compiler, n_heads, n_kv_heads, seq_k, head_
         )
 
 
+# SRAM region the DMA-copy helpers stage through: above every zone the codegen
+# uses (WIDE_WEIGHT_BASE ends at 0x7000), so it cannot collide with a K-loop's
+# operand slots. 32 KiB.
+DMA_SCRATCH_BASE, DMA_SCRATCH_BYTES = 0x8000, 0x8000
+
+
+def _emit_dma_copy(compiler, src_addr, dst_addr, rows, row_bytes,
+                   src_stride_bytes, dst_stride_bytes):
+    """DRAM -> SRAM -> DRAM strided copy using only LOAD_TILE/STORE_TILE.
+
+    LOAD/STORE take (rows, bytes-per-row, DRAM stride) and memcpy exactly
+    that, at any byte offset, so a column-range move, a half-swap or a
+    de-interleave is just two DMAs -- no GEMM and no constant matrix. Splits
+    the row width into chunks when rows*row_bytes would not fit the scratch.
+    """
+    per = max(4, (DMA_SCRATCH_BYTES // rows) // 4 * 4)
+    off = 0
+    while off < row_bytes:
+        n = min(per, row_bytes - off)
+        for word in (
+            encode(opcode=Opcode.LOAD_TILE, dep_id=0, dram_addr=src_addr + off,
+                   sram_addr=DMA_SCRATCH_BASE, dim_m=rows, dim_n=n,
+                   stride=src_stride_bytes, dtype=int(DType.FP32)),
+            encode(opcode=Opcode.WAIT_SYNC, dep_id=0),
+            encode(opcode=Opcode.STORE_TILE, dram_addr=dst_addr + off,
+                   sram_addr=DMA_SCRATCH_BASE, dim_m=rows, dim_n=n,
+                   stride=dst_stride_bytes, dtype=int(DType.FP32)),
+        ):
+            compiler.instruction_stream.extend(to_bytes(word))
+        off += n
+
+
+def _emit_rotate_half_dma_fp32(compiler, head_dim, in_addr, out_addr, in_stride=None):
+    """out = rotate_half-swap of `in` (16, head_dim): out[:, j] = in[:, (j+h)%hd],
+    h = head_dim/2. Two strided copies instead of an (hd x hd) permutation GEMM.
+    in_stride (elements) lets `in` be a column slice of a wider buffer."""
+    M = compiler.tile_dim
+    h = head_dim // 2
+    in_pitch = (in_stride if in_stride is not None else head_dim) * 4
+    out_pitch = head_dim * 4
+    _emit_dma_copy(compiler, in_addr + h * 4, out_addr, M, h * 4, in_pitch, out_pitch)
+    _emit_dma_copy(compiler, in_addr, out_addr + h * 4, M, h * 4, in_pitch, out_pitch)
+
+
 def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None):
     """Replicate row 0 of a (16, width) "row0 real, rest zero" buffer into
     all 16 rows -- bridges the layer-level convention (row0 real, rest
@@ -1171,15 +1215,12 @@ def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None
     so REDUCE_MAX/REDUCE's whole-tile collapse gives that row's own
     softmax rather than mixing padding into it).
 
-    No hardware broadcast primitive exists for this (checked: a stride of
-    0 on LOAD_TILE is reinterpreted by the simulator as "not set, use the
-    natural width," not a literal zero-stride broadcast). Done instead via
-    GEMM against a compile-time constant "one-hot" matrix: broadcast[m,0]=1,
-    broadcast[m,k>0]=0 for every row m, so
-        out[m, n] = sum_k broadcast[m,k] * in[k, n] = in[0, n]
-    for every m -- exactly the replication wanted, using only the existing
-    GEMM primitive and a constant injected via compiler._const_regions
-    (same mechanism the row0 padding-mask inside the attention core uses).
+    Done with DMA, not GEMM: one LOAD_TILE brings row 0 into SRAM and sixteen
+    one-row STORE_TILEs write it to rows 0-15 (a stride of 0 on LOAD_TILE
+    means "not set" to the simulator, so a zero-stride broadcast load is not
+    available). This used to be a GEMM against a compile-time one-hot matrix;
+    LOAD/STORE are byte-granular (rows, bytes, stride), which makes the
+    constant matrix unnecessary.
 
     in_stride lets `in` be a column slice of a wider matrix (the same
     mechanism attention's Q/out and RoPE already use) -- needed to
@@ -1188,14 +1229,29 @@ def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None
     KV-cache tile, without first de-interleaving it into its own buffer.
     """
     M = compiler.tile_dim
-
-    def _build():
-        bcast = np.zeros((M, M), dtype=np.float32)
-        bcast[:, 0] = 1.0
-        return bcast
-
-    bcast_addr = _get_or_build_const(compiler, ("bcast_row0", M), M * M * 4, _build)
-    _emit_matmul_fp32(compiler, M, width, M, bcast_addr, in_addr, out_addr, b_stride=in_stride)
+    # DMA version: load row 0 once, store it to each of the 16 rows. 1 LOAD +
+    # 1 WAIT + 16 STOREs regardless of width, against ~3 instructions per
+    # 16-wide column tile for the one-hot GEMM it replaces. (in_stride is
+    # irrelevant for a single row: only row 0's start address matters.)
+    row_bytes = width * 4
+    per = max(4, (DMA_SCRATCH_BYTES) // 4 * 4)
+    off = 0
+    while off < row_bytes:
+        n = min(per, row_bytes - off)
+        for word in (
+            encode(opcode=Opcode.LOAD_TILE, dep_id=0, dram_addr=in_addr + off,
+                   sram_addr=DMA_SCRATCH_BASE, dim_m=1, dim_n=n, stride=n,
+                   dtype=int(DType.FP32)),
+            encode(opcode=Opcode.WAIT_SYNC, dep_id=0),
+        ):
+            compiler.instruction_stream.extend(to_bytes(word))
+        for r in range(M):
+            compiler.instruction_stream.extend(to_bytes(
+                encode(opcode=Opcode.STORE_TILE,
+                       dram_addr=out_addr + r * row_bytes + off,
+                       sram_addr=DMA_SCRATCH_BASE, dim_m=1, dim_n=n, stride=n,
+                       dtype=int(DType.FP32))))
+        off += n
 
 
 def _emit_mask_to_row0_fp32(compiler, in_addr, out_addr, width):
@@ -1284,12 +1340,12 @@ def _emit_kv_cache_append_fp32(compiler, cache_tile_addr, new_row_bcast_addr, ro
     other 15 rows exactly as they were -- the actual "append a token"
     primitive a KV-cache needs.
 
-    LOAD_TILE/STORE_TILE only move WHOLE 16x16 tiles -- there's no
-    sub-tile partial-row write opcode (confirmed against pe_array.cpp /
-    the ISA doc's LOAD_TILE/STORE_TILE fields) -- so this can't literally
-    write one row. Uses the same "constant matrix via GEMM" trick as
-    _emit_broadcast_row0_fp32/_emit_mask_to_row0_fp32/_emit_rope_fp32
-    instead:
+    NOTE: this GEMM form is superseded by _emit_kv_cache_append_dma_fp32,
+    which the decode path now uses. The claim that LOAD_TILE/STORE_TILE only
+    move whole 16x16 tiles was WRONG: both take (rows, bytes, stride) and
+    memcpy exactly that, so a one-row STORE_TILE writes a single row. This
+    version is kept as a second, independent implementation (test_kv_cache
+    still exercises it). It blends with constant matrices instead:
 
         blended = mask_keep @ old_tile + mask_insert @ new_row_bcast
 
@@ -1335,6 +1391,34 @@ def _emit_kv_cache_append_fp32(compiler, cache_tile_addr, new_row_bcast_addr, ro
     _emit_matmul_fp32(compiler, M, width, M, keep_addr, cache_tile_addr, kept)
     _emit_matmul_fp32(compiler, M, width, M, insert_addr, new_row_bcast_addr, inserted)
     _emit_residual_add_fp32(compiler, kept, inserted, cache_tile_addr, width)
+
+
+def _emit_kv_cache_append_dma_fp32(compiler, cache_tile_addr, new_row_addr, row, width):
+    """Same effect as _emit_kv_cache_append_fp32, with plain DMA instead of
+    two GEMMs and two constant matrices.
+
+    LOAD_TILE/STORE_TILE take (rows, cols-in-bytes, stride) and memcpy
+    exactly that, so a one-row STORE_TILE writes row `row` of the cache tile
+    and touches nothing else. `new_row_addr` is the DRAM address of the new
+    row's `width` floats (row 0 of whatever buffer holds it); unlike the GEMM
+    version it need NOT be broadcast to 16 rows first.
+    """
+    M = compiler.tile_dim
+    if not (0 <= row < M):
+        raise ValueError(f"row must be in [0, {M}); got {row}")
+    nbytes = width * 4
+    sram = SRAMMap.input_slot(0, 4)
+    dep = 0
+    for word in (
+        encode(opcode=Opcode.LOAD_TILE, dep_id=dep, dram_addr=new_row_addr,
+               sram_addr=sram, dim_m=1, dim_n=nbytes, stride=nbytes,
+               dtype=int(DType.FP32)),
+        encode(opcode=Opcode.WAIT_SYNC, dep_id=dep),
+        encode(opcode=Opcode.STORE_TILE, dram_addr=cache_tile_addr + row * nbytes,
+               sram_addr=sram, dim_m=1, dim_n=nbytes, stride=nbytes,
+               dtype=int(DType.FP32)),
+    ):
+        compiler.instruction_stream.extend(to_bytes(word))
 
 
 def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len):
@@ -1484,17 +1568,15 @@ def _emit_copy_slice_fp32(compiler, in_addr, out_addr, in_stride, width=None):
     (worked out to be reading rows of the wide buffer at the wrong pitch,
     not respecting head boundaries).
 
-    Implemented as a GEMM against a compile-time IDENTITY matrix, reading
-    `in` with `in_stride` (the wide buffer's true row pitch) -- the same
-    "constant matrix via GEMM" trick _emit_broadcast_row0_fp32 uses, just
-    with an identity instead of a one-hot broadcast matrix, since here the
-    goal is a faithful copy, not a replication.
+    Implemented as a strided DRAM->SRAM->DRAM copy (_emit_dma_copy), reading
+    `in` with `in_stride` (the wide buffer's true row pitch in elements).
+    Previously a GEMM against an identity matrix; the DMA carries the stride
+    directly.
     """
     M = compiler.tile_dim
     width = M if width is None else width
-    ident_addr = _get_or_build_const(compiler, ("copy_ident", M), M * M * 4,
-                                     lambda: np.eye(M, dtype=np.float32))
-    _emit_matmul_fp32(compiler, M, width, M, ident_addr, in_addr, out_addr, b_stride=in_stride)
+    in_pitch = (in_stride if in_stride is not None else width) * 4
+    _emit_dma_copy(compiler, in_addr, out_addr, M, width * 4, in_pitch, width * 4)
 
 
 def _emit_transpose_wide_fp32(compiler, head_dim, in_addr, out_addr, in_stride=None,
@@ -1625,16 +1707,14 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     a genuine limit of the approach -- fixed by sizing P correctly instead
     of restricting the input.
 
-    Uses the same "constant matrix through GEMM" trick as
-    _emit_broadcast_row0_fp32/_emit_copy_slice_fp32: rotate_half(in) =
-    in @ P, where P is a compile-time constant (head_dim, head_dim) matrix
-    swapping the two head_dim/2-wide halves (P[k, (k+head_dim/2) mod
-    head_dim] = 1, else 0) -- confirmed directly against numpy that a
-    PLAIN swap (no negation in P itself) combined with rope_tables'
-    sign-folded sin table reproduces the standard RoPE rotation exactly
-    (the negation rope_tables already bakes into the first half of its
-    sin table is exactly what a plain swap needs to be correct, since a
-    signed swap would double the negation).
+    rotate_half(in) is a plain swap of the two head_dim/2-wide halves
+    (out[:, j] = in[:, (j + head_dim/2) mod head_dim]), done as two strided
+    DMA copies (_emit_rotate_half_dma_fp32). It used to be `in @ P` with a
+    constant (head_dim, head_dim) permutation matrix; the DMA form needs no
+    constant and far fewer instructions. A PLAIN swap (no negation) combined
+    with rope_tables' sign-folded sin table reproduces the standard RoPE
+    rotation exactly (the negation is already baked into the first half of
+    the sin table, so a signed swap would double it).
 
     in_stride lets `in` be a column slice of a wider (M, n_heads*head_dim)
     Q/K projection buffer, so RoPE can be applied per-head directly on the
@@ -1671,22 +1751,12 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     cos_addr = cossin_addr
     sin_addr = cossin_addr + M * head_dim * 4
 
-    def _build_perm():
-        half = head_dim // 2
-        perm = np.zeros((head_dim, head_dim), dtype=np.float32)
-        for k in range(head_dim):
-            perm[k, (k + half) % head_dim] = 1.0
-        return perm
-
-    perm_addr = _get_or_build_const(compiler, ("rope_perm", head_dim),
-                                    head_dim * head_dim * 4, _build_perm)
 
     rot_stage = compiler.alloc_staging(M * head_dim * 4)
     term1 = compiler.alloc_staging(M * head_dim * 4)
     term2 = compiler.alloc_staging(M * head_dim * 4)
 
-    _emit_matmul_fp32(compiler, M, head_dim, head_dim, in_addr, perm_addr, rot_stage,
-                      a_stride=in_stride)
+    _emit_rotate_half_dma_fp32(compiler, head_dim, in_addr, rot_stage, in_stride=in_stride)
     _emit_mul_fp32(compiler, in_addr, cos_addr, term1, head_dim, a_stride=in_stride)
     _emit_mul_fp32(compiler, rot_stage, sin_addr, term2, head_dim)
     _emit_residual_add_fp32(compiler, term1, term2, out_addr, head_dim, out_stride=in_stride)
@@ -1741,22 +1811,12 @@ def _emit_rope_batched_fp32(compiler, head_dim, positions, in_addr, out_addr,
     cos_addr = cossin_addr
     sin_addr = cossin_addr + M * head_dim * 4
 
-    def _build_perm():
-        half = head_dim // 2
-        perm = np.zeros((head_dim, head_dim), dtype=np.float32)
-        for k in range(head_dim):
-            perm[k, (k + half) % head_dim] = 1.0
-        return perm
-
-    perm_addr = _get_or_build_const(compiler, ("rope_perm", head_dim),
-                                    head_dim * head_dim * 4, _build_perm)
 
     rot_stage = compiler.alloc_staging(M * head_dim * 4)
     term1 = compiler.alloc_staging(M * head_dim * 4)
     term2 = compiler.alloc_staging(M * head_dim * 4)
 
-    _emit_matmul_fp32(compiler, M, head_dim, head_dim, in_addr, perm_addr, rot_stage,
-                      a_stride=in_stride)
+    _emit_rotate_half_dma_fp32(compiler, head_dim, in_addr, rot_stage, in_stride=in_stride)
     _emit_mul_fp32(compiler, in_addr, cos_addr, term1, head_dim, a_stride=in_stride)
     _emit_mul_fp32(compiler, rot_stage, sin_addr, term2, head_dim)
     _emit_residual_add_fp32(compiler, term1, term2, out_addr, head_dim, out_stride=in_stride)
@@ -2159,17 +2219,11 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
         # Broadcast this head's NEW (already-rotated) K/V to all 16 rows
         # -- _emit_kv_cache_append_fp32's contract needs the inserted row
         # replicated, the same way GEMM needs any full operand tile.
-        k_new_bcast = compiler.alloc_staging(M * head_dim * w)
-        _emit_broadcast_row0_fp32(compiler, k_proj_stage + off, k_new_bcast, head_dim,
-                                  in_stride=kv_dim)
-        _emit_kv_cache_append_fp32(compiler, k_cache_tiles[kv_h][tile_idx],
-                                   k_new_bcast, row, head_dim)
+        _emit_kv_cache_append_dma_fp32(compiler, k_cache_tiles[kv_h][tile_idx],
+                                       k_proj_stage + off, row, head_dim)
 
-        v_new_bcast = compiler.alloc_staging(M * head_dim * w)
-        _emit_broadcast_row0_fp32(compiler, v_proj_stage + off, v_new_bcast, head_dim,
-                                  in_stride=kv_dim)
-        _emit_kv_cache_append_fp32(compiler, v_cache_tiles[kv_h][tile_idx],
-                                   v_new_bcast, row, head_dim)
+        _emit_kv_cache_append_dma_fp32(compiler, v_cache_tiles[kv_h][tile_idx],
+                                       v_proj_stage + off, row, head_dim)
 
         # Transpose every ACTIVE cache tile into one contiguous
         # (head_dim, seq_k) K^T -- matmul(q, k)'s literal semantics need

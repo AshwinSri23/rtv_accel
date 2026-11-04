@@ -230,7 +230,7 @@ class NPUCompiler:
 
     def _emit(self, node: ScheduleNode) -> None:
         """Assemble one ScheduleNode to bytes and append to the stream."""
-        wire_dim_m = (((node.dtype & 0x3) << 13)
+        wire_dim_m = (((node.dtype & 0x7) << 13)
                       | ((node.scale_shift & 0x1F) << 8) | (node.dim_m & 0xFF))
         wire_dim_k = ((node.c_slot & 0xF) << 8) | (node.dim_k & 0xFF)
         wire_act = (0x80 if node.accumulate else 0x00) | (node.activation & 0x7F)

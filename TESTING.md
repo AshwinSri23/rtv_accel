@@ -15,8 +15,12 @@ cd build && ctest
 layer only registers itself when `.venv-tvm/` exists (`cmake` prints
 `TVM path tests skipped: .venv-tvm not present` otherwise) — a checkout
 without that venv still configures and builds cleanly, it just doesn't
-get compiler coverage. As of this writing: 3 C++ tests + 16 TVM-path
-tests = 19 total, all passing.
+get compiler coverage. As of 2026-11-04: 3 C++ tests + 22 TVM-path
+tests = 25 total, all passing. (Newer than the numbered tour below:
+`test_schedule_relocation`, `test_prefill_batching`, `test_const_memoization`,
+`test_swiglu_resident`, `test_dram36` (ISA v1.6 36-bit addresses),
+`test_bf16w` (ISA v1.6 BF16 weights), `test_persistent_session`
+(`rtv_sim --serve`).)
 
 Any individual TVM-path file is also directly runnable without `ctest`,
 which is faster when iterating on one thing:
@@ -229,12 +233,13 @@ reading a "PASS" as more than it claims:
   token except #16**, which genuinely grows the context — but even there,
   the model itself is only ever run 1-2 layers deep in the checkpoint
   tests (real dimensions are slow to schedule/codegen; see below).
-- **Genuinely batched (prefill-style) multi-row processing** exists at the
-  attention-core level (`test_attention_batched.py`) but was never wired
-  into the decode loop — decode is inherently single-token, so it was
-  never on that loop's critical path. `toolchain/generate.py` prefills a
-  prompt one token at a time for this reason, not because batching is
-  unimplemented everywhere.
+- **Batched prefill is wired into `toolchain/generate.py`**: the first up
+  to 16 prompt tokens go through one causal batch
+  (`test_prefill_batching.py`); any remaining prompt tokens, and every
+  generated token, run one at a time through the relocated decode path
+  (`test_schedule_relocation.py`). Prompts spanning more than one tile
+  are not batched across tiles (the batch path raises
+  `NotImplementedError` past 16 real tokens).
 - **`toolchain/generate.py` itself is not part of this test suite.** It's
   a demo/driver script with no numpy oracle of its own to check against —
   its correctness rests entirely on the fact that it calls the exact same

@@ -484,6 +484,31 @@ static void test_int16_residual_ops() {
     for (int i = 0; i < 4; ++i) CHECK_EQ(static_cast<int>(out[i]), 127);
 }
 
+// ISA v1.6 BF16W: FP32 A x BF16 B -> FP32. BF16 = top 16 bits of an FP32, so
+// bf16-representable weights must give the identical result as FP32 GEMM.
+static void test_bf16w_gemm() {
+    MemoryController mem;
+    PEArray pe;
+    const uint16_t A = 0x0000, B = 0x0400, B16 = 0x0800, C = 0x0C00, C2 = 0x1000;
+    float* a = reinterpret_cast<float*>(mem.sram_ptr(A));
+    float* b = reinterpret_cast<float*>(mem.sram_ptr(B));
+    uint16_t* bh = reinterpret_cast<uint16_t*>(mem.sram_ptr(B16));
+    a[0] = 1e-4f; a[1] = 2.0f; a[2] = -3.5f; a[3] = 1e4f;
+    b[0] = 2.0f;  b[1] = 0.5f; b[2] = -1.0f; b[3] = 4.0f;   // exactly bf16-representable
+    for (int i = 0; i < 4; ++i) {
+        uint32_t bits; std::memcpy(&bits, &b[i], 4);
+        bh[i] = static_cast<uint16_t>(bits >> 16);
+    }
+    pe.compute_gemm(mem, A, B,   C,  2, 2, 2, Decoder::ActivationMode::NONE, false, 7, Decoder::DType::FP32);
+    pe.compute_gemm(mem, A, B16, C2, 2, 2, 2, Decoder::ActivationMode::NONE, false, 7, Decoder::DType::BF16W);
+    const float* c  = reinterpret_cast<const float*>(mem.sram_ptr(C));
+    const float* c2 = reinterpret_cast<const float*>(mem.sram_ptr(C2));
+    for (int i = 0; i < 4; ++i) CHECK(c[i] == c2[i]);
+    // accumulate works too
+    pe.compute_gemm(mem, A, B16, C2, 2, 2, 2, Decoder::ActivationMode::NONE, true, 7, Decoder::DType::BF16W);
+    CHECK(std::fabs(c2[0] - 2.0f * c[0]) < 1e-5f);
+}
+
 // FP32: the no-quantisation path. Exists so a lowering bug can be told apart
 // from a quantisation limit -- if this path is correct, every address, tile
 // and accumulation in the compiler is proven independently of any scale.
@@ -567,6 +592,7 @@ int main() {
         {"ExecAluRescale",        test_exec_alu_rescale},
         {"Int16ResidualOps",      test_int16_residual_ops},
         {"Fp32Ops",               test_fp32_ops},
+        {"Bf16wGemm",             test_bf16w_gemm},
         {"GemmOobThrows",         test_gemm_oob_throws},
     };
 

@@ -65,14 +65,14 @@ public:
     //                (equals the full matrix column count for INT8)
     // Adds dram_latency + rows*cols to the cycle counter.
     // Throws std::out_of_range on any out-of-bounds access.
-    void load_tile(uint32_t dram_addr, uint16_t sram_addr,
+    void load_tile(uint64_t dram_addr, uint16_t sram_addr,
                    uint16_t rows, uint16_t cols, uint16_t stride);
 
     // Copy a rows×cols tile from SRAM back to DRAM.
     // Inverse of load_tile; stride has the same meaning.
     // Adds dram_latency + rows*cols to the cycle counter.
     // Throws std::out_of_range on any out-of-bounds access.
-    void store_tile(uint16_t sram_addr, uint32_t dram_addr,
+    void store_tile(uint16_t sram_addr, uint64_t dram_addr,
                     uint16_t rows, uint16_t cols, uint16_t stride);
 
     // ── Direct SRAM access for the PE array ──────────────────────────────────

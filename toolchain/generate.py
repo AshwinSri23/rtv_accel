@@ -99,27 +99,76 @@ def _find_checkpoint():
     return None
 
 
-def _run_sim(sim, hal, instr_stream, dram_path_in, dram_path_out, extra_dumps=()):
-    """One decode step: load dram_path_in, execute, dump the WHOLE
-    updated DRAM to dram_path_out (so the next step can load it), plus
-    any extra_dumps (addr, nbytes, label) -- the same round-trip pattern
-    rtv_tvm/test_decode_loop.py and test_checkpoint_decode_loop.py use."""
-    with tempfile.TemporaryDirectory(prefix="rtv_generate_step_") as wd:
-        p = os.path.join(wd, "p.bin")
-        open(p, "wb").write(bytes(instr_stream))
-        dram_size = os.path.getsize(dram_path_in)
-        mb = max(1, dram_size // (1024 * 1024) + 2)
-        args = [sim, p, hal, str(mb), "--dram-image", dram_path_in,
-                "--dump", f"0:{dram_size}:{dram_path_out}"]
-        extra_paths = []
-        for i, (addr, nbytes, _) in enumerate(extra_dumps):
-            ep = os.path.join(wd, f"extra{i}.bin")
-            args += ["--dump", f"{addr}:{nbytes}:{ep}"]
-            extra_paths.append(ep)
-        r = subprocess.run(args, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"simulator failed: {r.stdout[-800:]}{r.stderr[-800:]}")
-        return [open(ep, "rb").read() for ep in extra_paths]
+class _SimSession:
+    """A persistent `rtv_sim --serve` process: the DRAM image (all the model
+    weights and the KV-cache) is loaded ONCE and stays resident; each decode
+    step writes only its own small constants, runs its program, and reads back
+    only the output region. Replaces the old per-step round trip of the WHOLE
+    multi-GB DRAM through a file."""
+
+    def __init__(self, sim, hal, image_path, dram_bytes, workdir):
+        self.wd = workdir
+        mb = dram_bytes // (1024 * 1024) + 2
+        self.p = subprocess.Popen([sim, "--serve", hal, str(mb), "--dram-image", image_path],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.dram_bytes = mb * 1024 * 1024
+        self.n = 0
+        while self._readline() != "READY":
+            pass
+
+    def _readline(self):
+        line = self.p.stdout.readline()
+        if not line:
+            raise RuntimeError(f"simulator exited: {self.p.stderr.read()[-800:]}")
+        return line.strip()
+
+    def _cmd(self, line):
+        self.p.stdin.write(line + "\n")
+        self.p.stdin.flush()
+        reply = self._readline()
+        while not (reply.startswith("OK") or reply.startswith("ERR")):
+            reply = self._readline()
+        if reply.startswith("ERR"):
+            raise RuntimeError(f"simulator: {reply}")
+        return reply
+
+    def run_step(self, comp, extra_dumps=()):
+        """Write this step's compile-time constants into the resident DRAM,
+        run its instruction stream, return the extra_dumps (addr, nbytes, _)."""
+        if comp.dram_bytes_needed > self.dram_bytes:
+            raise RuntimeError(
+                f"step needs {comp.dram_bytes_needed} bytes of DRAM but the session "
+                f"has {self.dram_bytes}; raise _SESSION_HEADROOM")
+        self.n += 1
+        for i, (addr, data) in enumerate(comp._const_regions.items()):
+            fp = os.path.join(self.wd, f"c{self.n}_{i}.bin")
+            open(fp, "wb").write(bytes(data))
+            self._cmd(f"WRITE {addr} {fp}")
+            os.remove(fp)
+        prog = os.path.join(self.wd, f"p{self.n}.bin")
+        open(prog, "wb").write(bytes(comp.instruction_stream))
+        outs = [os.path.join(self.wd, f"o{self.n}_{i}.bin") for i in range(len(extra_dumps))]
+        specs = " ".join(f"{a}:{nb}:{o}" for (a, nb, _), o in zip(extra_dumps, outs))
+        self._cmd(f"RUN {prog} {specs}")
+        os.remove(prog)
+        res = [open(o, "rb").read() for o in outs]
+        for o in outs:
+            os.remove(o)
+        return res
+
+    def close(self):
+        try:
+            self.p.stdin.write("QUIT\n")
+            self.p.stdin.flush()
+            self.p.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            self.p.kill()
+
+
+# Extra DRAM beyond the initial image for per-step staging (the first step's
+# footprint is measured; later steps reuse the same staging region).
+_SESSION_HEADROOM = 256 * 1024 * 1024
 
 
 def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
@@ -195,6 +244,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
         # configs never grew large enough to reveal it.
         cur_path = os.path.join(wd, "state.img")
         open(cur_path, "wb").write(bytes(dram))
+        session = None
 
         comp = NPUCompiler(hal)
         comp.dtype = DType.FP32
@@ -210,18 +260,11 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
             scratch_b=scratch_b, n_real=n_batch, rope_theta=rope_theta,
         )
-        step_dram = bytearray(open(cur_path, "rb").read())
-        needed = max(comp.dram_bytes_needed, len(step_dram))
-        if needed > len(step_dram):
-            step_dram += bytearray(needed - len(step_dram) + 0x10000)
-        for addr, data in comp._const_regions.items():
-            step_dram[addr:addr + len(data)] = data
-        open(cur_path, "wb").write(bytes(step_dram))
-
-        (out_raw,) = _run_sim(
-            sim, hal, comp.instruction_stream, cur_path, cur_path,
-            extra_dumps=[(final_addr, M * hidden * 4, "out")],
-        )
+        session = _SimSession(
+            sim, hal, cur_path,
+            max(comp.dram_bytes_needed, len(dram)) + _SESSION_HEADROOM, wd)
+        (out_raw,) = session.run_step(
+            comp, extra_dumps=[(final_addr, M * hidden * 4, "out")])
         batch_out = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)
 
         if n_batch == P and total_steps >= n_batch:
@@ -263,18 +306,8 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                 scratch_b=scratch_b, pos=pos, rope_theta=rope_theta,
             )
 
-            step_dram = bytearray(open(cur_path, "rb").read())
-            needed = max(comp.dram_bytes_needed, len(step_dram))
-            if needed > len(step_dram):
-                step_dram += bytearray(needed - len(step_dram) + 0x10000)
-            for addr, data in comp._const_regions.items():
-                step_dram[addr:addr + len(data)] = data
-            open(cur_path, "wb").write(bytes(step_dram))
-
-            (out_raw,) = _run_sim(
-                sim, hal, comp.instruction_stream, cur_path, cur_path,
-                extra_dumps=[(final_addr, M * hidden * 4, "out")],
-            )
+            (out_raw,) = session.run_step(
+                comp, extra_dumps=[(final_addr, M * hidden * 4, "out")])
 
             if pos >= P - 1:
                 hidden_row = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)[0]
@@ -284,6 +317,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                     piece = tok.decode([next_input_id])
                     print(f"  step {pos}: token {next_input_id}  {piece!r}", file=sys.stderr)
 
+        session.close()
     return all_ids, tok.decode(all_ids)
 
 

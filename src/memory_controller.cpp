@@ -21,7 +21,7 @@ void MemoryController::read_dram(uint32_t addr, uint8_t* dst, std::size_t len) c
     std::memcpy(dst, _dram.data() + addr, len);
 }
 
-void MemoryController::load_tile(uint32_t dram_addr, uint16_t sram_addr,
+void MemoryController::load_tile(uint64_t dram_addr, uint16_t sram_addr,
                                  uint16_t rows, uint16_t cols, uint16_t stride)
 {
     // Bounds check: last DRAM byte read is at dram_addr + (rows-1)*stride + (cols-1)
@@ -45,7 +45,7 @@ void MemoryController::load_tile(uint32_t dram_addr, uint16_t sram_addr,
     _cycles += _dram_latency + static_cast<uint64_t>(rows) * cols;
 }
 
-void MemoryController::store_tile(uint16_t sram_addr, uint32_t dram_addr,
+void MemoryController::store_tile(uint16_t sram_addr, uint64_t dram_addr,
                                   uint16_t rows, uint16_t cols, uint16_t stride)
 {
     std::size_t sram_end = static_cast<std::size_t>(sram_addr)

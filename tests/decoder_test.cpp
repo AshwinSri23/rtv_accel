@@ -42,7 +42,8 @@ static bool instr_eq(const Decoder::DecodedInstruction& a,
         && a.activation  == b.activation
         && a.accumulate  == b.accumulate
         && a.scale_shift == b.scale_shift
-        && a.c_slot      == b.c_slot;
+        && a.c_slot      == b.c_slot
+        && a.dram_hi     == b.dram_hi;
 }
 
 // Build a RawInstruction from named fields using the new 32-bit dram_addr layout.
@@ -257,6 +258,38 @@ static void test_v15_subfields_round_trip() {
     CHECK_EQ(out.c_slot,      3u);
 }
 
+// ISA v1.6 dram_hi (DRAM address bits 35:32) coexists with c_slot in dim_k's
+// wire word and survives encode/decode; older words decode with dram_hi == 0.
+static void test_v16_dram_hi_round_trip() {
+    Decoder::DecodedInstruction d{};
+    d.opcode    = Decoder::Opcode::LOAD_TILE;
+    d.dram_addr = 0xDEADBEEFu;
+    d.dram_hi   = 0xB;
+    d.c_slot    = 0x5;    // shares the dim_k wire word; must not interfere
+    d.sram_addr = 0x1000;
+    d.dim_m     = 1;
+    d.dim_n     = 64;
+    d.dim_k     = 0x21;
+    d.stride    = 64;
+    Decoder::DecodedInstruction out = Decoder::decode(Decoder::encode(d));
+    CHECK(instr_eq(d, out));
+    CHECK_EQ(out.dram_hi, 0xBu);
+    CHECK_EQ(out.c_slot,  0x5u);
+    CHECK_EQ(out.dim_k,   0x21u);
+    CHECK_EQ(Decoder::decode(make_raw(0x1, 0x0, 0x001000, 0x0000, 16, 16, 0, 16, 0)).dram_hi, 0u);
+    // BF16W dtype (value 4, needs dim_m wire bit 15) round-trips; 5..7 are rejected.
+    Decoder::DecodedInstruction g{};
+    g.opcode = Decoder::Opcode::COMPUTE_GEMM;
+    g.dim_m = 16; g.dim_n = 16; g.dim_k = 16;
+    g.dtype = Decoder::DType::BF16W;
+    CHECK(instr_eq(g, Decoder::decode(Decoder::encode(g))));
+    CHECK_EQ((int)Decoder::decode(Decoder::encode(g)).dtype, 4);
+    g.dtype = static_cast<Decoder::DType>(6);
+    bool threw = false;
+    try { Decoder::decode(Decoder::encode(g)); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+}
+
 // v1.5 backward compat: a v1-encoded instruction (all new bits zero) decodes
 // with accumulate=false, scale_shift=0, c_slot=0.
 static void test_v15_backward_compat() {
@@ -293,6 +326,8 @@ int main() {
         {"V15AccumulateRoundTrip",       test_v15_accumulate_round_trip},
         {"V15SubfieldsRoundTrip",        test_v15_subfields_round_trip},
         {"V15BackwardCompat",            test_v15_backward_compat},
+        // ISA v1.6
+        {"V16DramHiRoundTrip",           test_v16_dram_hi_round_trip},
     };
 
     for (const auto& t : tests) {

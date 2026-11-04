@@ -130,6 +130,9 @@ if(EXISTS ${RTV_TVM_PY})
         test_checkpoint_loader   # real Qwen3-0.6B weights; skips cleanly if not downloaded locally
         test_checkpoint_decode_loop  # real Qwen3-0.6B weights through a genuine multi-step decode loop
         test_const_memoization   # repeated constant matrices (RoPE, masks) collapse to one cached copy
+        test_dram36              # ISA v1.6: 36-bit LOAD/STORE addressing via dim_k[15:12]
+        test_bf16w               # ISA v1.6: FP32 x BF16-weight GEMM (DType.BF16W)
+        test_persistent_session  # rtv_sim --serve: DRAM resident across programs
         test_schedule_relocation # compile layers 0-1 for real, relocate the rest -- byte-identical + real sim check
         test_prefill_batching    # a real batch of causal prompt tokens processed in one call, seeding the KV-cache
     )
