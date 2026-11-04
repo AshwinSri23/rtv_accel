@@ -172,7 +172,7 @@ _SESSION_HEADROOM = 256 * 1024 * 1024
 
 
 def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
-            verbose=False, bf16_weights=False):
+            verbose=False, bf16_weights=False, use_graph=False):
     """Run the actual decode loop; returns (all_token_ids, decoded_text)."""
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
@@ -207,6 +207,10 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             bf16_weights=bf16_weights,
         )
     base_dram_cursor = comp0._dram_cursor
+    if use_graph:
+        import decoder_graph
+        graph_cfg = dict(hidden=hidden, inter=inter, n_heads=n_heads, n_kv_heads=n_kv_heads,
+                         head_dim=head_dim, eps=eps)
 
     def _sample(hidden_row_f32):
         """Host-side tail: the model's own trailing RMSNorm, then lm_head
@@ -313,6 +317,11 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                 x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
                 scratch_b=scratch_b, pos=pos, rope_theta=rope_theta,
                 attn_scale=attn_scale,
+                # --graph: compile each decode layer through the Relax/BYOC graph path
+                # (decoder_graph.py) instead of the hand-driven emitter; the stream is
+                # byte-identical (test_byoc_decoder.py). Prefill stays hand-driven.
+                layer_emitter=(decoder_graph.make_layer_emitter(
+                    graph_cfg, layer_weights, pos, rope_theta, attn_scale) if use_graph else None),
             )
 
             (out_raw,) = session.run_step(
@@ -345,6 +354,8 @@ def main():
     ap.add_argument("--sim", default=os.path.join(ROOT, "build", "rtv_sim"))
     ap.add_argument("--hal", default=os.path.join(_HERE, "hal_config.json"))
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--graph", action="store_true",
+                    help="compile decode layers through the graph-driven (Relax/BYOC) path")
     ap.add_argument("--bf16-weights", action="store_true",
                     help="store the 7 per-layer weight matrices as BF16 (ISA v1.6 BF16W): "
                          "half the weight bytes in DRAM, FP32 accumulate")
@@ -366,7 +377,7 @@ def main():
     print(f"prompt  : {args.prompt!r}", file=sys.stderr)
     ids, text = generate(model_dir, args.prompt, args.steps, n_layers=args.n_layers,
                          sim=args.sim, hal=args.hal, verbose=args.verbose,
-                         bf16_weights=args.bf16_weights)
+                         bf16_weights=args.bf16_weights, use_graph=args.graph)
     print(f"ids     : {ids}")
     print(f"text    : {text}")
     return 0

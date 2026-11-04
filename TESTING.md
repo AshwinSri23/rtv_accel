@@ -16,7 +16,7 @@ layer only registers itself when `.venv-tvm/` exists (`cmake` prints
 `TVM path tests skipped: .venv-tvm not present` otherwise) — a checkout
 without that venv still configures and builds cleanly, it just doesn't
 get compiler coverage. As of 2026-11-04: 3 C++ tests + 22 TVM-path
-tests = 32 total, all passing. (Newer than the numbered tour below:
+tests = 33 total, all passing. (Newer than the numbered tour below:
 `test_schedule_relocation`, `test_prefill_batching`, `test_const_memoization`,
 `test_swiglu_resident`, `test_dram36` (ISA v1.6 36-bit addresses),
 `test_bf16w` (ISA v1.6 BF16 weights + the compiler's BF16-weight matmul),
@@ -26,6 +26,7 @@ routing), `test_prefill_multitile` (prompts past one tile, incl. attention scale
 (whole model on BF16 weights, relocation byte-identical), `test_moe_model` (a whole tiny
 Qwen3-MoE vs a recorded Hugging Face reference; skips without the checkpoint),
 `test_byoc_graph` (graph-driven FFN half-layer, byte-identical to the hand-driven path),
+`test_byoc_decoder` (graph-driven decode layer / model / relocated model, byte-identical),
 `test_moe_ondevice` (ISA v1.7 on-device top-1 routing, one fixed stream).
 There is no automated test against Hugging Face: that comparison needs PyTorch, which
 is not a project dependency; its result is recorded in `TODO.md` 5.5.)

@@ -152,7 +152,7 @@ residue that was never the point of the test.
 
 **The codegen computes no addresses.** Every offset and stride is read off the TIR, which TVM derives from typed buffer definitions — the ~276 lines of byte-vs-element arithmetic the hand-written compiler carried, and the source of most of its bugs, has no place to live in this design.
 
-**All 11 hardware intrinsics have FP32 `TensorIntrin` coverage** (`gemm`/`mul`/`sumsq`/`rms_scale`/`silu`/`rowmax`/`rowsum`/`exp_sub`/`scalar_div`/`transpose`/`add`), alongside the original INT8 versions kept for hardware-capability coverage. Composed into RMSNorm, SwiGLU FFN, multi-head/GQA attention (including RoPE and a real, growing multi-tile KV-cache), and whole transformer layers chained with ping-ponged DRAM buffers — verified against `rtv_sim` and numpy across the TVM-path tests (32 `ctest` targets in total as of 2026-11-04, 3 of them C++), registered individually in `CMakeLists.txt`.
+**All 11 hardware intrinsics have FP32 `TensorIntrin` coverage** (`gemm`/`mul`/`sumsq`/`rms_scale`/`silu`/`rowmax`/`rowsum`/`exp_sub`/`scalar_div`/`transpose`/`add`), alongside the original INT8 versions kept for hardware-capability coverage. Composed into RMSNorm, SwiGLU FFN, multi-head/GQA attention (including RoPE and a real, growing multi-tile KV-cache), and whole transformer layers chained with ping-ponged DRAM buffers — verified against `rtv_sim` and numpy across the TVM-path tests (33 `ctest` targets in total as of 2026-11-04, 3 of them C++), registered individually in `CMakeLists.txt`.
 
 **It fully unrolls, and must.** The ISA has no control flow, so a TIR loop becomes repeated instructions. The same property forces a fresh program per decode step, which no compiler change fixes — see "What TVM does not fix" below.
 

@@ -450,19 +450,32 @@ Three options, in preference order:
   not compared numerically, so small FP32 deviations that don't flip a token would not show.
 - [x] **`reset_staging` / per-layer liveness (5.4 step 2): measured, deferred** (2026-11-04). One real 28-layer decode step needs 70.7 MB of staging (2.52 MB/layer) on top of a 1,772.8 MB image: ~4% of the footprint. Reusing it per layer would save ~66 MB but touches relocation's address tables, which the byte-identical tests depend on. Not worth the risk for this model; revisit for arbitrary graphs with large activations.
 - [x] **HF comparison automated as a script** (`toolchain/hf_compare.py`, 2026-11-04): runs HF greedy and `generate.py` on a prompt and compares token ids (exit 0 identical / 1 differ / 77 skipped without torch). Deliberately not in `ctest` (PyTorch is not a project dependency, minutes per prompt). Verified identical for FP32 and `--chip-args=--bf16-weights`.
-- [x] **BYOC graph path: promoted for the FFN half-layer; attention half measured** (2026-11-04).
-  `toolchain/byoc_graph.py` (`emit_graph`, `coverage`) walks a partitioned Relax `main` and lowers each
-  claimed composite with `emit_composite` (which gained `add`, `mul` and `linear_bias`). Acceptance bar from
-  5.4 step 4 met for `out = x + SwiGLU(RMSNorm(x))`: the patterns claim EVERY op (rmsnorm, swiglu_ffn,
-  add), the emitted stream is **byte-identical** (169 instructions) to the hand-driven emitters, and it
-  matches numpy to 1.4e-7 (`test_byoc_graph.py`). **Measured scope of the rest:** a full decoder-layer
-  graph in standard Relax ops (projections, reshape/permute head split, batched attention, softmax,
-  residuals, FFN) partitions into 9 composites; the ONLY ops left unclaimed are the 8 reshape/permute_dims
-  (layout glue). Still NOT graph-driven: lowering those layout ops (reshape is a view; the head
-  permutes are strided DMA, which `_emit_dma_copy` already does), a batched/per-head attention composite
-  using the real-rows softmax, and RoPE/KV-cache (not discoverable from graph structure, as patterns.py
-  documents). So production decode still uses the hand-driven emitters; the graph path is proven correct
-  for a real fragment and its remaining gap is now enumerated rather than guessed.
+- [x] **BYOC graph path promoted to production decode on Qwen3, byte-identical** (5.4 step 4,
+  completed 2026-11-04 after first being only a fragment). `toolchain/decoder_graph.py` builds a Qwen3
+  decode step as a Relax graph; `byoc_graph.emit_graph` lowers it. Per layer: `rms_norm`, residual `add`s
+  and the SwiGLU matmul chain are CLAIMED by the RTV-Accel patterns and lowered by `emit_composite`
+  (which gained `add`, `mul`, `linear_bias`); the config-aware attention block (per-head q/k-norm,
+  RoPE at the current position, KV-cache append, GQA over the growing cache) cannot be discovered from
+  graph structure (patterns.py says why), so it is an EXTERN op in the graph (`rtv.attention_kv:<layer>`)
+  lowered by the existing `_emit_attention_block_kvcache_fp32` through a registered lowering. Acceptance
+  bar met in `test_byoc_decoder.py`: the instruction stream is **byte-identical** to the hand-driven
+  path for one layer (806 instrs), a 3-layer model (2,418), 5 layers under schedule relocation (4,030;
+  also equal to the full hand recompile), with GQA, q/k-norm, RoPE at pos 5, attention scale and RMSNorm
+  epsilon on; a graph-driven step on `rtv_sim` equals the hand-driven step exactly. `generate.py --graph`
+  runs decode through it (graph-compiled layers 0-1 + relocation). **Full 28-layer Qwen3-0.6B through
+  `--graph` generates exactly Hugging Face's tokens on both prompts** (" Paris. The capital"; and the
+  26-token two-tile prompt, " Italy. Which of"). **Honest scope:** (1) batched PREFILL stays hand-driven (its per-row RMSNorm and
+  causal multi-tile attention are not pattern-expressible); (2) the attention block is graph-visible but
+  lowered by the hand emitter, as TODO 5.2 anticipated; (3) the graph does not use reshape/permute (the
+  hand attention emitter owns head layout), so graph-level lowering of those layout ops, measured earlier
+  as the ONLY ops a standard-ops layer graph leaves unclaimed, is not needed by this path and not built.
+  **Bug found on the way:** after partitioning, distinct dataflow variables share a name (`lv, lv1, lv,
+  lv1, lv, gv`), and a name-keyed environment handed ops the wrong buffer (2 of 806 instructions wrong,
+  simulator output off by 7.8); the driver now keys by Var identity (this also affects the earlier FFN
+  fragment, which passed by luck).
+  Earlier fragment result kept for the record: `x + SwiGLU(RMSNorm(x))` byte-identical (169 instrs),
+  1.4e-7 vs numpy; a full standard-ops layer graph partitions into 9 composites with only the 8
+  reshape/permute_dims unclaimed.
 - [x] **On-device MoE routing built** (2026-11-04, ISA v1.7). `REDUCE_ARGMAX` (first-max index times an
   immediate byte multiplier, as a uint32 in SRAM) and `INDIRECT_ADDR` (LOAD/STORE address = dram_addr +
   an SRAM word) give data-dependent addressing without a branch or loop. `_emit_moe_top1_ondevice_fp32`
@@ -475,4 +488,4 @@ Three options, in preference order:
 - [x] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
   half unstaged, plus the work above).
 
-**Status (2026-11-04, end):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred; step 3 answered by `test_moe_ffn.py`; step 4 done for the FFN half-layer with the byte-identical bar, remaining gap enumerated; step 5 done: host-segmented MoE validated against a real Qwen3-MoE architecture, plus on-device top-1 routing (ISA v1.7). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.
+**Status (2026-11-04, end):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred; step 3 answered by `test_moe_ffn.py`; step 4 done: decode is graph-driven and byte-identical to the hand path (prefill stays hand-driven); step 5 done: host-segmented MoE validated against a real Qwen3-MoE architecture, plus on-device top-1 routing (ISA v1.7). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.

@@ -3204,7 +3204,7 @@ def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delt
 def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_heads,
                                        n_kv_heads, head_dim, x_addr, layer_weights,
                                        scratch_a, scratch_b, pos, rope_theta=1e6,
-                                       attn_scale=None):
+                                       attn_scale=None, layer_emitter=None):
     """_emit_model_kvcache_fp32, but compiling only the first TWO layers
     for real through TVM's schedule+codegen and RELOCATING that result
     for every layer after that instead of recompiling. Every layer at a
@@ -3258,6 +3258,11 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
     def _emit_real_layer(i):
         lw = layer_weights[i]
         xi, outi = _io_addrs(i)
+        if layer_emitter is not None:
+            # e.g. decoder_graph.make_layer_emitter: compile this layer through the
+            # graph-driven (BYOC) path instead of the hand-driven one.
+            layer_emitter(compiler, i, xi, outi, lw)
+            return xi, outi
         _emit_transformer_layer_kvcache_fp32(
             compiler, hidden, inter, n_heads, n_kv_heads, head_dim,
             x_addr=xi, gamma1_addr=lw["gamma1"], gamma2_addr=lw["gamma2"],
