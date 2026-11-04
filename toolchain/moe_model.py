@@ -90,7 +90,8 @@ def load_moe_checkpoint(model_dir):
     return cfg, layers, embed, lm_head, t("model.norm.weight")
 
 
-def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=None):
+def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=None,
+                 int8_weights=False):
     """Greedy-generate n_new tokens. Returns (all_ids, per_step) where per_step[i] is the
     (top5_ids, top5_logits) at the position that produced generated token i."""
     cfg, layers, embed, lm_head, final_norm = load_moe_checkpoint(model_dir)
@@ -121,14 +122,17 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
     comp0.dtype = DType.FP32
     dram, x_addr, lws, _sa, _sb, _ = tvm_backend.build_kvcache_model_dram_image(
         comp0, hidden, n_layers, n_kv, head_dim, max_seq_len=total,
-        layer_weights_np=builder_layers)
+        layer_weights_np=builder_layers, int8_weights=int8_weights)
     cursor = [(comp0._dram_cursor + 0xFFF) & ~0xFFF]
     extra = []
 
-    def place(arr):
+    def place(arr, quant=False):
+        # quant: store an expert matrix as INT8 bytes + FP32 per-channel scales (ISA v1.8)
+        arr = tvm_backend.int8_weight_blob(arr) if (quant and int8_weights) else \
+            np.ascontiguousarray(arr, dtype=np.float32)
         a = cursor[0]
         cursor[0] += (arr.nbytes + 0xFFF) & ~0xFFF
-        extra.append((a, np.ascontiguousarray(arr, dtype=np.float32)))
+        extra.append((a, arr))
         return a
 
     routers, expert_addrs = [], []
@@ -136,8 +140,8 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
         rp = np.zeros((hidden, M), np.float32)
         rp[:, :E] = lw["router"].T
         routers.append(place(rp))
-        expert_addrs.append([dict(w_gate=place(e["w_gate"]), w_up=place(e["w_up"]),
-                                  w_down=place(e["w_down"])) for e in lw["experts"]])
+        expert_addrs.append([dict(w_gate=place(e["w_gate"], True), w_up=place(e["w_up"], True),
+                                  w_down=place(e["w_down"], True)) for e in lw["experts"]])
     resid_addr = place(np.zeros((M, hidden), np.float32))
     norm2_addr = place(np.zeros((M, hidden), np.float32))
     logits_addr = place(np.zeros((M, M), np.float32))
@@ -153,6 +157,7 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
         c.instruction_stream = bytearray()
         c._dram_cursor = staging_base
         c.rms_eps = eps
+        c.int8_weights = int8_weights
         return c
 
     def norm(c, src, gamma, dst):
@@ -244,9 +249,11 @@ def main():
     ap.add_argument("--sim", default=os.path.join(ROOT, "build", "rtv_sim"))
     ap.add_argument("--hal", default=os.path.join(_HERE, "hal_config.json"))
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--int8-weights", action="store_true",
+                    help="attention and expert weights as INT8 + per-channel scales (ISA v1.8)")
     a = ap.parse_args()
     ids, steps = generate_moe(a.model, [int(x) for x in a.prompt_ids.split(",")], a.steps,
-                              a.sim, a.hal, a.verbose)
+                              a.sim, a.hal, a.verbose, int8_weights=a.int8_weights)
     print("ids     :", ids)
     for i, (ti, tl) in enumerate(steps):
         print(f"  step {i}: top5 {ti}  logits {[round(v, 4) for v in tl]}")

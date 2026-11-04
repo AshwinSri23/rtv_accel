@@ -41,7 +41,18 @@ Attention-only INT8 is nearly free (+0.36%); the MLP carries most of the loss.
   footprint, not speed, and the dequant multiply (DRAM round trip) costs a little. On bandwidth-bound hardware the
   smaller weights would help; the simulator cannot show that.
 
+## 3b. MoE experts
+
+Experts take the same path: `_emit_swiglu_ffn_fp32` already goes through the weight-matmul dispatch, so
+`compiler.int8_weights` covers host-segmented routing unchanged. On-device top-1 routing needed one addition: the
+INDIRECT_ADDR offset applies to the INT8 weight tiles *and* to the scale-row load (`_emit_broadcast_row0_fp32(...,
+indirect_ptr=)`), so an expert's blob (weights then scales) must sit at the fixed routing stride. The router, norms,
+embeddings and lm_head stay FP32. Tests: `test_moe_int8` (both routing modes vs numpy on dequantised weights, one
+stream picking all 4 experts on-device; expert 9.44 MB -> 2.37 MB) and `test_moe_model` (whole tiny Qwen3-MoE on INT8
+attention + experts vs an INT8-fake-quantized Hugging Face reference, logits within 2e-7; the INT8 and FP32 references
+differ by 3e-3, so the INT8 path is genuinely exercised). Not measured: accuracy of INT8 on a *real* trained MoE.
+
 ## 4. Not done
 
-INT4 / group-wise (needs calibration); INT8 for MoE experts and on-device routed loads; applying the scale in SRAM
+INT4 / group-wise (needs calibration); BF16 with on-device routed loads; applying the scale in SRAM
 before the store to remove the round trip. Tracked in `TODO.md` Phase 2b.

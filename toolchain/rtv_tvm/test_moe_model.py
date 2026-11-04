@@ -6,7 +6,7 @@ Runs hf-internal-testing/tiny-random-Qwen3MoeForCausalLM (a real
 Qwen3MoeForCausalLM: 2 layers, 4 experts, top-2, norm_topk_prob, q_norm/k_norm,
 GQA) through toolchain/moe_model.py (host-segmented routing on a persistent
 rtv_sim session) and compares with the recorded Hugging Face reference in
-fixtures/moe_tiny_hf_reference.json: the generated token ids AND the top-5 logits at
+fixtures/moe_tiny_hf_reference.json (and moe_tiny_int8_hf_reference.json for --int8-weights): the generated token ids AND the top-5 logits at
 every step (the model's logits are nearly tied, so this is a tight check).
 
 Skips (exit 0) when the checkpoint is not in the local Hugging Face cache:
@@ -32,22 +32,24 @@ def main():
     if not hits:
         print("SKIP: tiny Qwen3-MoE checkpoint not in the local HF cache")
         return 0
-    ref = json.load(open(os.path.join(_HERE, "fixtures", "moe_tiny_hf_reference.json")))
-    prompt = ref["prompt"]
-    n_new = len(ref["steps"])
-    ids, steps = moe_model.generate_moe(
-        hits[0], prompt, n_new, os.path.join(ROOT, "build", "rtv_sim"),
-        os.path.join(ROOT, "toolchain", "hal_config.json"))
-    ok_ids = ids == ref["ids"]
-    worst = 0.0
-    ok_top = True
-    for s, r in zip(steps, ref["steps"]):
-        if s[0] != r["top_ids"]:
-            ok_top = False
-        worst = max(worst, max(abs(a - b) for a, b in zip(s[1], r["top_logits"])))
-    results = [("generated_ids_match_hf", ok_ids, f"chip {ids[len(prompt):]} vs hf {ref['ids'][len(prompt):]}"),
-               ("top5_ids_match_every_step", ok_top, ""),
-               ("top5_logits_within_2e-3", worst < 2e-3, f"max |delta| {worst:.2e}")]
+    results = []
+    for tag, fname, kw in (("", "moe_tiny_hf_reference.json", {}),
+                           ("int8_", "moe_tiny_int8_hf_reference.json", {"int8_weights": True})):
+        ref = json.load(open(os.path.join(_HERE, "fixtures", fname)))
+        prompt = ref["prompt"]
+        n_new = len(ref["steps"])
+        ids, steps = moe_model.generate_moe(
+            hits[0], prompt, n_new, os.path.join(ROOT, "build", "rtv_sim"),
+            os.path.join(ROOT, "toolchain", "hal_config.json"), **kw)
+        ok_ids = ids == ref["ids"]
+        worst, ok_top = 0.0, True
+        for st, r in zip(steps, ref["steps"]):
+            if st[0] != r["top_ids"]:
+                ok_top = False
+            worst = max(worst, max(abs(x - y) for x, y in zip(st[1], r["top_logits"])))
+        results += [(tag + "generated_ids_match_hf", ok_ids, f"chip {ids[len(prompt):]} vs hf {ref['ids'][len(prompt):]}"),
+                    (tag + "top5_ids_match_every_step", ok_top, ""),
+                    (tag + "top5_logits_within_2e-3", worst < 2e-3, f"max |delta| {worst:.2e}")]
     n = 0
     for name, ok, msg in results:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {msg}" if msg else ""))

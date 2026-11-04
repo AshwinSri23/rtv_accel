@@ -565,9 +565,12 @@ def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
     (build_kvcache_model_dram_image(..., bf16_weights=True))."""
     ptr = getattr(compiler, "indirect_weights_scalar", None)
     if ptr is not None:
-        if getattr(compiler, "bf16_weights", False) or getattr(compiler, "int8_weights", False):
-            raise NotImplementedError("indirect (on-device routed) weights are FP32-only")
-        _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
+        if getattr(compiler, "bf16_weights", False):
+            raise NotImplementedError("indirect (on-device routed) BF16 weights are not built")
+        if getattr(compiler, "int8_weights", False):
+            _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
+        else:
+            _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
     elif getattr(compiler, "int8_weights", False):
         _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
     elif getattr(compiler, "bf16_weights", False):
@@ -676,13 +679,20 @@ def int8_weight_blob(w):
 
 
 def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=None,
-                            depth=3):
+                            depth=3, indirect_b=None):
     """C(M,N) = A(M,K) fp32 @ dequant(B(K,N) int8) -> fp32. B is stored as
     int8_weight_blob(): K*N bytes then N FP32 per-column scales at
     b_addr + K*N. The GEMM (ISA v1.8 INT8W) multiplies by the raw integers;
     the scale is applied afterwards as an ordinary elementwise multiply
     (scale row broadcast to 16 rows by DMA), so nothing about the scale lives
-    in the instruction. Same loop shape as _emit_matmul_bf16w_fp32."""
+    in the instruction. Same loop shape as _emit_matmul_bf16w_fp32.
+
+    indirect_b: SRAM address of a uint32 byte offset (ISA v1.7). The weight tiles AND
+    the scale row are then fetched at b_addr + that offset (on-device MoE routing)."""
+    ind = {}
+    if indirect_b is not None:
+        ind = dict(activation=int(ActivationMode.INDIRECT_ADDR), dim_k=indirect_b & 0xFF,
+                   c_slot=(indirect_b >> 8) & 0xF, dram_hi=(indirect_b >> 12) & 0xF)
     T = compiler.tile_dim
     if M > T or N % T or K % T:
         raise NotImplementedError(
@@ -707,7 +717,7 @@ def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
              dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
              dram_addr=b_addr + kn * T * N + jn * T, sram_addr=b_slots[i % depth],
-             dim_m=T, dim_n=T, stride=N, dtype=int(DType.FP32))
+             dim_m=T, dim_n=T, stride=N, dtype=int(DType.FP32), **ind)
 
     for i in range(min(depth - 1, len(steps))):
         load(i)
@@ -724,7 +734,7 @@ def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
                  dim_m=T, dim_n=T * 4, stride=N * 4, dtype=int(DType.FP32))
     # Dequantise: C *= scale (per output column), in place.
     scale_tile = compiler.alloc_staging(T * N * 4)
-    _emit_broadcast_row0_fp32(compiler, b_addr + K * N, scale_tile, N)
+    _emit_broadcast_row0_fp32(compiler, b_addr + K * N, scale_tile, N, indirect_ptr=indirect_b)
     _emit_mul_fp32(compiler, c_addr, scale_tile, c_addr, N)
 
 
@@ -1520,7 +1530,7 @@ def _emit_rotate_half_dma_fp32(compiler, head_dim, in_addr, out_addr, in_stride=
     _emit_dma_copy(compiler, in_addr, out_addr + h * 4, M, h * 4, in_pitch, out_pitch)
 
 
-def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None):
+def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None, indirect_ptr=None):
     """Replicate row 0 of a (16, width) "row0 real, rest zero" buffer into
     all 16 rows -- bridges the layer-level convention (row0 real, rest
     zero, the one _emit_rmsnorm_row_fp32/emit_composite's "rmsnorm" kind
@@ -1551,13 +1561,17 @@ def _emit_broadcast_row0_fp32(compiler, in_addr, out_addr, width, in_stride=None
     # irrelevant for a single row: only row 0's start address matters.)
     row_bytes = width * 4
     per = max(4, (DMA_SCRATCH_BYTES) // 4 * 4)
+    ind = {}
+    if indirect_ptr is not None:       # source row is at in_addr + SRAM[indirect_ptr] (ISA v1.7)
+        ind = dict(activation=int(ActivationMode.INDIRECT_ADDR), dim_k=indirect_ptr & 0xFF,
+                   c_slot=(indirect_ptr >> 8) & 0xF, dram_hi=(indirect_ptr >> 12) & 0xF)
     off = 0
     while off < row_bytes:
         n = min(per, row_bytes - off)
         for word in (
             encode(opcode=Opcode.LOAD_TILE, dep_id=0, dram_addr=in_addr + off,
                    sram_addr=DMA_SCRATCH_BASE, dim_m=1, dim_n=n, stride=n,
-                   dtype=int(DType.FP32)),
+                   dtype=int(DType.FP32), **ind),
             encode(opcode=Opcode.WAIT_SYNC, dep_id=0),
         ):
             compiler.instruction_stream.extend(to_bytes(word))
