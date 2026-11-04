@@ -324,6 +324,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             comp.bf16_weights = bf16_weights
             comp.int8_weights = int8_weights
             comp.int4_group = int4_group
+            comp.reuse_layer_staging = True    # layers 2+ share layer 1's staging (test_staging_reuse)
             comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()

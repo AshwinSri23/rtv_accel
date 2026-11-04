@@ -3170,9 +3170,17 @@ def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
     keep working unchanged."""
     cur_in = x_addr
     bufs = [scratch_b, scratch_a]
+    reuse = getattr(compiler, "reuse_layer_staging", False)
     for i in range(n_layers):
         cur_out = bufs[i % 2]
         lw = layer_weights[i]
+        if reuse:
+            # Layer 0 is cold (it builds the shared constants); layer 1 is warm, so its staging
+            # is per-layer-only. Layers 2+ run in layer 1's staging region again.
+            if i == 1:
+                reuse_start, n_consts = compiler._staging_cursor, len(compiler._const_cache)
+            elif i >= 2:
+                compiler._staging_cursor = reuse_start
         _emit_transformer_layer_kvcache_fp32(
             compiler, hidden, inter, n_heads, n_kv_heads, head_dim,
             x_addr=cur_in, gamma1_addr=lw["gamma1"], gamma2_addr=lw["gamma2"],
@@ -3183,6 +3191,9 @@ def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
             q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
             attn_scale=attn_scale,
         )
+        if reuse and i >= 2 and len(compiler._const_cache) != n_consts:
+            raise RuntimeError("reuse_layer_staging: layer %d built a shared constant that layer 1 "
+                               "did not; it would live in reused staging" % i)
         cur_in = cur_out
     return cur_in
 
@@ -3520,6 +3531,7 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
     roles_1 = _layer_role_addrs(layer_weights[1], x1, out1, hidden, inter,
                                n_heads, n_kv_heads, head_dim, weight_bytes=wb, scale_tail=i8, wsize=ws)
     shared_ranges = list(compiler._const_cache.values())
+    reuse = getattr(compiler, "reuse_layer_staging", False)
 
     cur_in = out1
     for i in range(2, n_layers):
@@ -3528,14 +3540,15 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
         roles_i = _layer_role_addrs(lwi, xi, outi, hidden, inter,
                                     n_heads, n_kv_heads, head_dim, weight_bytes=wb, scale_tail=i8, wsize=ws)
         relocated = _relocate_instructions(template, roles_1, roles_i,
-                                           staging_delta=(i - 1) * S,
+                                           staging_delta=0 if reuse else (i - 1) * S,
                                            shared_ranges=shared_ranges)
         compiler.instruction_stream += relocated
         # No real alloc_staging calls happened for this layer -- advance
         # the bookkeeping manually so dram_bytes_needed still sizes the
         # image to hold this layer's (relocated) staging writes.
-        compiler._staging_cursor += S
-        compiler._staging_peak = max(compiler._staging_peak, compiler._staging_cursor)
+        if not reuse:
+            compiler._staging_cursor += S
+            compiler._staging_peak = max(compiler._staging_peak, compiler._staging_cursor)
         cur_in = outi
     return cur_in
 

@@ -15,8 +15,8 @@ cd build && ctest
 layer only registers itself when `.venv-tvm/` exists (`cmake` prints
 `TVM path tests skipped: .venv-tvm not present` otherwise) — a checkout
 without that venv still configures and builds cleanly, it just doesn't
-get compiler coverage. As of 2026-11-04: 3 C++ tests + 28 TVM-path
-tests = 39 total, all passing. (Newer than the numbered tour below:
+get compiler coverage. As of 2026-11-04: 3 C++ tests + 29 TVM-path
+tests = 40 total, all passing. (Newer than the numbered tour below:
 `test_schedule_relocation`, `test_prefill_batching`, `test_const_memoization`,
 `test_swiglu_resident`, `test_dram36` (ISA v1.6 36-bit addresses),
 `test_bf16w` (ISA v1.6 BF16 weights + the compiler's BF16-weight matmul),
@@ -31,7 +31,8 @@ Qwen3-MoE vs a recorded Hugging Face reference; skips without the checkpoint),
 `test_int8w` (ISA v1.8 INT8 weight GEMM + per-channel scale), `test_int8_weights_model` (whole model on INT8 weights, relocation byte-identical),
 `test_int4w` (ISA v1.9 INT4 group-scaled GEMM), `test_int4_weights_model` (whole model on INT4, relocation byte-identical),
 `test_moe_int8` (INT8 experts, host-segmented and on-device routed; `test_moe_model` also runs INT8 and INT4 cases),
-`test_moe_quant` (BF16 and INT4 experts in both routing modes).
+`test_moe_quant` (BF16 and INT4 experts in both routing modes),
+`test_staging_reuse` (layers 2+ share layer 1's staging: footprint, byte-identical relocation, bit-identical numerics).
 There is no automated test against Hugging Face: that comparison needs PyTorch, which
 is not a project dependency; its result is recorded in `TODO.md` 5.5.)
 
