@@ -268,12 +268,19 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                 x_batch[r, :] = embed_tokens[prompt_ids[c * M + r]].astype(np.float32)
             comp._const_regions[x_addr] = x_batch.tobytes()
 
-            final_addr = tvm_backend._emit_model_kvcache_batched_fp32(
-                comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
-                x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
-                scratch_b=scratch_b, n_real=n_real, rope_theta=rope_theta,
-                tile_idx=c, attn_scale=attn_scale,
-            )
+            if use_graph:
+                # prefill through the graph path too (per-row norms and the multi-tile causal
+                # attention are registered externs; adds and SwiGLU are pattern-claimed)
+                final_addr = decoder_graph.emit_prefill_graph(
+                    comp, graph_cfg, actual_n_layers, x_addr, layer_weights, scratch_a,
+                    scratch_b, n_real, c, rope_theta, attn_scale)
+            else:
+                final_addr = tvm_backend._emit_model_kvcache_batched_fp32(
+                    comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
+                    x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
+                    scratch_b=scratch_b, n_real=n_real, rope_theta=rope_theta,
+                    tile_idx=c, attn_scale=attn_scale,
+                )
             if session is None:
                 session = _SimSession(
                     sim, hal, cur_path,
@@ -319,7 +326,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                 attn_scale=attn_scale,
                 # --graph: compile each decode layer through the Relax/BYOC graph path
                 # (decoder_graph.py) instead of the hand-driven emitter; the stream is
-                # byte-identical (test_byoc_decoder.py). Prefill stays hand-driven.
+                # byte-identical (test_byoc_decoder.py); prefill is graph-driven too.
                 layer_emitter=(decoder_graph.make_layer_emitter(
                     graph_cfg, layer_weights, pos, rope_theta, attn_scale) if use_graph else None),
             )

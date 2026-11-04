@@ -463,12 +463,28 @@ Three options, in preference order:
   also equal to the full hand recompile), with GQA, q/k-norm, RoPE at pos 5, attention scale and RMSNorm
   epsilon on; a graph-driven step on `rtv_sim` equals the hand-driven step exactly. `generate.py --graph`
   runs decode through it (graph-compiled layers 0-1 + relocation). **Full 28-layer Qwen3-0.6B through
-  `--graph` generates exactly Hugging Face's tokens on both prompts** (" Paris. The capital"; and the
-  26-token two-tile prompt, " Italy. Which of"). **Honest scope:** (1) batched PREFILL stays hand-driven (its per-row RMSNorm and
-  causal multi-tile attention are not pattern-expressible); (2) the attention block is graph-visible but
-  lowered by the hand emitter, as TODO 5.2 anticipated; (3) the graph does not use reshape/permute (the
-  hand attention emitter owns head layout), so graph-level lowering of those layout ops, measured earlier
-  as the ONLY ops a standard-ops layer graph leaves unclaimed, is not needed by this path and not built.
+  `--graph`, with BOTH prefill and decode graph-driven, generates exactly Hugging Face's tokens on both
+  prompts** (" Paris. The capital"; and the 26-token two-tile prompt, " Italy. Which of"; re-run after
+  the prefill graph was added). **Prefill is graph-driven too** (added after the first version of this item): the same builder
+  with `batched=True` produces a 16-row prefill tile whose per-row RMSNorms (extern
+  `rtv.rmsnorm_rows`; the claimed `rmsnorm` pattern would share ONE scale across 16 different tokens)
+  and multi-tile causal KV-cache-writing attention (extern `rtv.attention_kv_batched`) are registered
+  lowerings, while the residual adds and SwiGLU are pattern-claimed. `test_byoc_decoder.py`: byte-identical
+  to `_emit_model_kvcache_batched_fp32` for a full tile, a partial tile (10 of 16 rows) and a second tile
+  that attends back to the first (10,014 / 10,014 / 10,242 instrs), and a 10-row prefill run on
+  `rtv_sim` equals the hand-driven one exactly. `generate.py --graph` now drives BOTH prefill and decode.
+  **Where the graph/extern boundary sits, and why it is the design and not a gap:** the attention block
+  (per-head q/k-norm, RoPE at a runtime position, KV-cache append/tail-mask, GQA head grouping over the
+  growing cache) is lowered by `_emit_attention_block_kvcache_fp32` / `..._batched_fp32` through the
+  extern mechanism. Pattern matching cannot express it: `patterns.py` documents that a DFPattern cannot
+  discover "head 3 of 4 sharing KV head 1" or mutate persistent KV state from a static graph match, and
+  the earlier measurement showed a standard-ops layer graph leaves exactly the layout ops
+  (reshape/permute_dims) outside the patterns. The graph path therefore does not need reshape/permute
+  lowering either (the extern owns head layout), and none was built. Decomposing the extern into
+  claimed projections plus a smaller extern was considered and not done: it would force reordering
+  buffer allocation in two production emitters purely to keep the stream byte-identical, to move four
+  GEMMs while RoPE/KV/GQA stay extern anyway. A custom op for what no pattern can express is the
+  standard way graph compilers handle it.
   **Bug found on the way:** after partitioning, distinct dataflow variables share a name (`lv, lv1, lv,
   lv1, lv, gv`), and a name-keyed environment handed ops the wrong buffer (2 of 806 instructions wrong,
   simulator output off by 7.8); the driver now keys by Var identity (this also affects the earlier FFN
@@ -488,4 +504,4 @@ Three options, in preference order:
 - [x] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
   half unstaged, plus the work above).
 
-**Status (2026-11-04, end):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred; step 3 answered by `test_moe_ffn.py`; step 4 done: decode is graph-driven and byte-identical to the hand path (prefill stays hand-driven); step 5 done: host-segmented MoE validated against a real Qwen3-MoE architecture, plus on-device top-1 routing (ISA v1.7). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.
+**Status (2026-11-04, end):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred; step 3 answered by `test_moe_ffn.py`; step 4 done: prefill and decode are graph-driven and byte-identical to the hand path (attention is a registered extern by design); step 5 done: host-segmented MoE validated against a real Qwen3-MoE architecture, plus on-device top-1 routing (ISA v1.7). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.

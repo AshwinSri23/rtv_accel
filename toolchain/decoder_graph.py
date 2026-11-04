@@ -51,11 +51,17 @@ def layer_param_names(i, qk_norm):
     return names + [f"L{i}_{n}" for n in ("g2", "wg", "wu", "wd")]
 
 
-def build_decode_graph(cfg, n_layers, qk_norm=True):
-    """Relax module `main(x, <per-layer params>...) -> (1, hidden)` for n_layers layers.
-    cfg needs hidden, inter, n_heads, n_kv_heads, head_dim, eps."""
+def build_decode_graph(cfg, n_layers, qk_norm=True, batched=False):
+    """Relax module `main(x, <per-layer params>...) -> (rows, hidden)` for n_layers layers.
+    cfg needs hidden, inter, n_heads, n_kv_heads, head_dim, eps.
+
+    batched=False: single-token decode, x is (1, hidden), norms are the claimed `rms_norm`
+    pattern. batched=True: a 16-row PREFILL tile; the norms become the extern
+    `rtv.rmsnorm_rows` (a genuine per-row scale -- the claimed `rmsnorm` pattern shares one
+    scale across the whole tile, which is wrong for 16 different tokens) and the attention is
+    `rtv.attention_kv_batched` (causal, multi-tile, writes the KV-cache)."""
     key = (cfg["hidden"], cfg["inter"], cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"],
-           float(cfg["eps"]), n_layers, qk_norm)
+           float(cfg["eps"]), n_layers, qk_norm, batched)
     if key in _CACHE:
         return _CACHE[key]
     H, I = cfg["hidden"], cfg["inter"]
@@ -64,7 +70,8 @@ def build_decode_graph(cfg, n_layers, qk_norm=True):
     shapes = {"g1": (H,), "wq": (H, q_dim), "wk": (H, kv_dim), "wv": (H, kv_dim),
               "wo": (q_dim, H), "qn": (cfg["head_dim"],), "kn": (cfg["head_dim"],),
               "g2": (H,), "wg": (H, I), "wu": (H, I), "wd": (I, H)}
-    x = relax.Var("x", _t(1, H))
+    R_ = 16 if batched else 1
+    x = relax.Var("x", _t(R_, H))
     params, per_layer = [x], []
     for i in range(n_layers):
         d = {}
@@ -73,19 +80,25 @@ def build_decode_graph(cfg, n_layers, qk_norm=True):
         per_layer.append(d)
         params += list(d.values())
 
+    def norm(v, gamma):
+        if batched:
+            return relax.Call(relax.ExternFunc("rtv.rmsnorm_rows"), [v, gamma], None, [_t(R_, H)])
+        return rop.nn.rms_norm(v, gamma, axes=[-1], epsilon=eps)
+
     bb = relax.BlockBuilder()
     with bb.function("main", params):
         with bb.dataflow():
             cur = x
             for i, d in enumerate(per_layer):
-                n1 = bb.emit(rop.nn.rms_norm(cur, d["g1"], axes=[-1], epsilon=eps))
+                n1 = bb.emit(norm(cur, d["g1"]))
                 ext_args = [n1, d["wq"], d["wk"], d["wv"], d["wo"]]
                 if qk_norm:
                     ext_args += [d["qn"], d["kn"]]
-                attn = bb.emit(relax.Call(relax.ExternFunc(f"rtv.attention_kv:{i}"), ext_args,
-                                          None, [_t(1, H)]))
+                attn = bb.emit(relax.Call(relax.ExternFunc(
+                    f"rtv.attention_kv_batched:{i}" if batched else f"rtv.attention_kv:{i}"),
+                    ext_args, None, [_t(R_, H)]))
                 r1 = bb.emit(rop.add(cur, attn))
-                n2 = bb.emit(rop.nn.rms_norm(r1, d["g2"], axes=[-1], epsilon=eps))
+                n2 = bb.emit(norm(r1, d["g2"]))
                 gate = bb.emit(rop.matmul(n2, d["wg"]))
                 up = bb.emit(rop.matmul(n2, d["wu"]))
                 act = bb.emit(rop.nn.silu(gate))
@@ -115,6 +128,41 @@ def attention_lowering(cfg, layer_weights, pos, rope_theta, attn_scale):
             pos=pos, k_cache_tiles=lw["k_cache"], v_cache_tiles=lw["v_cache"],
             rope_theta=rope_theta, q_norm_addr=qn, k_norm_addr=kn, attn_scale=attn_scale)
     return {"rtv.attention_kv": lower}
+
+
+def prefill_lowering(cfg, layer_weights, n_real, tile_idx, rope_theta, attn_scale):
+    """Extern lowerings for the batched (prefill) graph: per-row RMSNorm and the causal,
+    multi-tile, KV-cache-writing attention block."""
+    def rows_norm(compiler, suffix, args, out_addr):
+        tvm_backend._emit_rmsnorm_rows_fp32(compiler, cfg["hidden"], compiler.tile_dim,
+                                            args[0], args[1], out_addr)
+
+    def attn(compiler, suffix, args, out_addr):
+        lw = layer_weights[int(suffix)]
+        n1, wq, wk, wv, wo = args[:5]
+        qn, kn = (args[5], args[6]) if len(args) == 7 else (None, None)
+        tvm_backend._emit_attention_block_kvcache_batched_fp32(
+            compiler, cfg["hidden"], cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"],
+            x_addr=n1, wq_addr=wq, wk_addr=wk, wv_addr=wv, wo_addr=wo, out_addr=out_addr,
+            n_real=n_real, k_cache_tiles=lw["k_cache"], v_cache_tiles=lw["v_cache"],
+            rope_theta=rope_theta, q_norm_addr=qn, k_norm_addr=kn, tile_idx=tile_idx,
+            attn_scale=attn_scale)
+    return {"rtv.rmsnorm_rows": rows_norm, "rtv.attention_kv_batched": attn}
+
+
+def emit_prefill_graph(compiler, cfg, n_layers, x_addr, layer_weights, scratch_a, scratch_b,
+                       n_real, tile_idx=0, rope_theta=1e6, attn_scale=None):
+    """Graph-driven equivalent of tvm_backend._emit_model_kvcache_batched_fp32 (one 16-row
+    prefill tile): same ping-pong buffers, same return value."""
+    qk_norm = layer_weights[0].get("q_norm") is not None
+    mod = build_decode_graph(cfg, n_layers, qk_norm, batched=True)
+    bufs = [scratch_b, scratch_a]
+    fixed = {BINDINGS_PER_LAYER * i + BINDINGS_PER_LAYER - 1: bufs[i % 2] for i in range(n_layers)}
+    out, _ = byoc_graph.emit_graph(
+        compiler, mod, _inputs(layer_weights, range(n_layers), x_addr, qk_norm),
+        extern=prefill_lowering(cfg, layer_weights, n_real, tile_idx, rope_theta, attn_scale),
+        fixed_outputs=fixed, batch_alloc=True)
+    return out
 
 
 def _inputs(layer_weights, layer_ids, x_addr, qk_norm):
