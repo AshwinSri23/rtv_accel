@@ -40,6 +40,7 @@ looser goalposts.
 Run with the TVM venv:  .venv-tvm/bin/python toolchain/rtv_tvm/e2e_migrated.py
 """
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -62,6 +63,20 @@ SIM = os.path.join(ROOT, "build", "rtv_sim")
 HAL = os.path.join(ROOT, "toolchain", "hal_config.json")
 
 tvm_backend.register()
+
+
+def _seed(name):
+    """A per-case seed derived from the case name, stable across processes.
+
+    This used to be `abs(hash(name)) & 0xFFFF`. str.__hash__ is salted per
+    interpreter by PYTHONHASHSEED, so every invocation of this file drew a
+    DIFFERENT tensor for the same case: the tolerance checks below were
+    passing on fresh random data each run, so a failure found by unlucky
+    inputs could not be reproduced, and a green CI run said nothing about
+    the next one. sha256 gives the same intent (distinct seed per case)
+    with a value that does not move.
+    """
+    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "big") & 0xFFFF
 
 
 def _run_sim(instruction_stream, dram, addr, nbytes):
@@ -132,7 +147,7 @@ def run_fp32_linear_case(name, m, n, k):
     the point of the FP32 path -- checked as relative error against the
     magnitude of the TERMS actually summed, not against the result (which
     can cancel near zero by construction)."""
-    rng = np.random.default_rng(abs(hash(name)) & 0xFFFF)
+    rng = np.random.default_rng(_seed(name))
     a = (rng.normal(size=(m, k)) * np.logspace(-4, 4, k)[None, :]).astype(np.float32)
     b = (rng.normal(size=(k, n)) * np.logspace(4, -4, n)[None, :]).astype(np.float32)
     expected = (a.astype(np.float64) @ b.astype(np.float64)).astype(np.float32)
@@ -212,7 +227,7 @@ def run_fp32_mlp_case(name, hidden, inter):
     third GEMM, all in float, checked as max absolute error relative to the
     output's own magnitude."""
     h, i = hidden, inter
-    rng = np.random.default_rng(abs(hash(name)) & 0xFFFF)
+    rng = np.random.default_rng(_seed(name))
     x = rng.normal(size=(TILE, h)).astype(np.float32)
     wg = (rng.normal(size=(h, i)) * 0.1).astype(np.float32)
     wu = (rng.normal(size=(h, i)) * 0.1).astype(np.float32)
@@ -274,7 +289,7 @@ def run_fp32_attention_case(name, hidden, n_heads, n_kv_heads, head_dim):
     """
     TILE = 16
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
-    rng = np.random.default_rng(abs(hash(name)) & 0xFFFF)
+    rng = np.random.default_rng(_seed(name))
     x = rng.normal(size=(TILE, hidden)).astype(np.float32) * 0.5
     wq = (rng.normal(size=(hidden, q_dim)) * 0.2).astype(np.float32)
     wk = (rng.normal(size=(hidden, kv_dim)) * 0.2).astype(np.float32)
@@ -367,7 +382,7 @@ def run_fp32_full_layer_case(name, hidden, inter, n_heads, n_kv_heads, head_dim,
     """
     TILE = 16
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
-    rng = np.random.default_rng(abs(hash(name)) & 0xFFFF)
+    rng = np.random.default_rng(_seed(name))
 
     def w(shape, s=0.2):
         return (rng.normal(size=shape) * s).astype(np.float32)
