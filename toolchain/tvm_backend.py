@@ -565,9 +565,11 @@ def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
     (build_kvcache_model_dram_image(..., bf16_weights=True))."""
     ptr = getattr(compiler, "indirect_weights_scalar", None)
     if ptr is not None:
-        if getattr(compiler, "bf16_weights", False):
+        if getattr(compiler, "bf16_weights", False) or getattr(compiler, "int8_weights", False):
             raise NotImplementedError("indirect (on-device routed) weights are FP32-only")
         _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
+    elif getattr(compiler, "int8_weights", False):
+        _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
     elif getattr(compiler, "bf16_weights", False):
         _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
     else:
@@ -653,6 +655,77 @@ def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
         if kn == kt - 1:
             emit(opcode=Opcode.STORE_TILE, dram_addr=c_addr + jn * T * 4, sram_addr=c_slot,
                  dim_m=T, dim_n=T * 4, stride=N * 4, dtype=int(DType.FP32))
+
+
+def quantize_int8_per_channel(w):
+    """FP32 weight [K, N] (in x out) -> (int8 [K, N], fp32 scale [N]).
+    Symmetric, one scale per OUTPUT channel (column): scale = max|w[:, n]| / 127.
+    Dequantised weight = q * scale. Per-channel was chosen by quant_study.py:
+    +1.0% perplexity on Qwen3-0.6B, and group scales bought nothing at 8 bits."""
+    w = np.asarray(w, dtype=np.float32)
+    scale = np.maximum(np.abs(w).max(axis=0) / 127.0, 1e-12).astype(np.float32)
+    q = np.clip(np.rint(w / scale), -128, 127).astype(np.int8)
+    return q, scale
+
+
+def int8_weight_blob(w):
+    """The DRAM image of one INT8 weight matrix: K*N int8 bytes, then N FP32
+    scales (4-byte aligned because K*N is a multiple of 256)."""
+    q, scale = quantize_int8_per_channel(w)
+    return np.concatenate([q.reshape(-1).view(np.uint8), scale.view(np.uint8)])
+
+
+def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=None,
+                            depth=3):
+    """C(M,N) = A(M,K) fp32 @ dequant(B(K,N) int8) -> fp32. B is stored as
+    int8_weight_blob(): K*N bytes then N FP32 per-column scales at
+    b_addr + K*N. The GEMM (ISA v1.8 INT8W) multiplies by the raw integers;
+    the scale is applied afterwards as an ordinary elementwise multiply
+    (scale row broadcast to 16 rows by DMA), so nothing about the scale lives
+    in the instruction. Same loop shape as _emit_matmul_bf16w_fp32."""
+    T = compiler.tile_dim
+    if M > T or N % T or K % T:
+        raise NotImplementedError(
+            f"_emit_matmul_int8w_fp32 needs M <= {T} and N, K multiples of {T}; "
+            f"got M={M} N={N} K={K}")
+    depth = max(2, min(depth, codegen.MAX_PIPE_DEPTH))
+    a_pitch = (a_stride if a_stride is not None else K) * 4
+    kt, nt = K // T, N // T
+    a_slots = [SRAMMap.input_slot(i, 4) for i in range(depth)]
+    b_slots = [SRAMMap.weight_slot(i, 4) for i in range(depth)]
+    c_slot = SRAMMap.output_slot(0)
+    steps = [(jn, kn) for jn in range(nt) for kn in range(kt)]
+    out = compiler.instruction_stream
+
+    def emit(**kw):
+        out.extend(to_bytes(encode(**kw)))
+
+    def load(i):
+        jn, kn = steps[i]
+        emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + i % depth,
+             dram_addr=a_addr + kn * T * 4, sram_addr=a_slots[i % depth],
+             dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
+        emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
+             dram_addr=b_addr + kn * T * N + jn * T, sram_addr=b_slots[i % depth],
+             dim_m=T, dim_n=T, stride=N, dtype=int(DType.FP32))
+
+    for i in range(min(depth - 1, len(steps))):
+        load(i)
+    for i, (jn, kn) in enumerate(steps):
+        if i + depth - 1 < len(steps):
+            load(i + depth - 1)
+        emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_A_BASE + i % depth)
+        emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_B_BASE + i % depth)
+        emit(opcode=Opcode.COMPUTE_GEMM, dep_id=1, sram_addr=a_slots[i % depth],
+             stride=b_slots[i % depth], dim_m=T, dim_n=T, dim_k=T,
+             accumulate=(kn > 0), c_slot=0, dtype=int(DType.INT8W))
+        if kn == kt - 1:
+            emit(opcode=Opcode.STORE_TILE, dram_addr=c_addr + jn * T * 4, sram_addr=c_slot,
+                 dim_m=T, dim_n=T * 4, stride=N * 4, dtype=int(DType.FP32))
+    # Dequantise: C *= scale (per output column), in place.
+    scale_tile = compiler.alloc_staging(T * N * 4)
+    _emit_broadcast_row0_fp32(compiler, b_addr + K * N, scale_tile, N)
+    _emit_mul_fp32(compiler, c_addr, scale_tile, c_addr, N)
 
 
 def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,
@@ -3060,7 +3133,7 @@ def _emit_model_kvcache_batched_fp32(compiler, n_layers, hidden, inter, n_heads,
 
 
 def _layer_role_addrs(lw, x_addr, out_addr, hidden, inter, n_heads, n_kv_heads,
-                      head_dim, weight_bytes=4):
+                      head_dim, weight_bytes=4, scale_tail=False):
     """Every named DRAM region belonging to one layer's own weights,
     KV-cache tiles, and boundary (input/output) buffers, as
     {role: (addr, nbytes)} -- role is a string stable across every
@@ -3100,13 +3173,13 @@ def _layer_role_addrs(lw, x_addr, out_addr, hidden, inter, n_heads, n_kv_heads,
         "gamma1": (lw["gamma1"], M * hidden * w),
         "gamma2": (lw["gamma2"], M * hidden * w),
         # weight_bytes is 2 when the weights are stored as BF16.
-        "wq": (lw["wq"], hidden * q_dim * weight_bytes),
-        "wk": (lw["wk"], hidden * kv_dim * weight_bytes),
-        "wv": (lw["wv"], hidden * kv_dim * weight_bytes),
-        "wo": (lw["wo"], q_dim * hidden * weight_bytes),
-        "wgate": (lw["wgate"], hidden * inter * weight_bytes),
-        "wup": (lw["wup"], hidden * inter * weight_bytes),
-        "wdown": (lw["wdown"], inter * hidden * weight_bytes),
+        "wq": (lw["wq"], hidden * q_dim * weight_bytes + (q_dim * 4 if scale_tail else 0)),
+        "wk": (lw["wk"], hidden * kv_dim * weight_bytes + (kv_dim * 4 if scale_tail else 0)),
+        "wv": (lw["wv"], hidden * kv_dim * weight_bytes + (kv_dim * 4 if scale_tail else 0)),
+        "wo": (lw["wo"], q_dim * hidden * weight_bytes + (hidden * 4 if scale_tail else 0)),
+        "wgate": (lw["wgate"], hidden * inter * weight_bytes + (inter * 4 if scale_tail else 0)),
+        "wup": (lw["wup"], hidden * inter * weight_bytes + (inter * 4 if scale_tail else 0)),
+        "wdown": (lw["wdown"], inter * hidden * weight_bytes + (hidden * 4 if scale_tail else 0)),
     }
     for name in ("q_norm", "k_norm"):
         addr = lw.get(name)
@@ -3291,9 +3364,10 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
     S = compiler._staging_cursor - staging_before
     template = bytes(compiler.instruction_stream[instr_start:instr_end])
 
-    wb = 2 if getattr(compiler, "bf16_weights", False) else 4
+    i8 = getattr(compiler, "int8_weights", False)
+    wb = 1 if i8 else (2 if getattr(compiler, "bf16_weights", False) else 4)
     roles_1 = _layer_role_addrs(layer_weights[1], x1, out1, hidden, inter,
-                               n_heads, n_kv_heads, head_dim, weight_bytes=wb)
+                               n_heads, n_kv_heads, head_dim, weight_bytes=wb, scale_tail=i8)
     shared_ranges = list(compiler._const_cache.values())
 
     cur_in = out1
@@ -3301,7 +3375,7 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
         lwi = layer_weights[i]
         xi, outi = _io_addrs(i)
         roles_i = _layer_role_addrs(lwi, xi, outi, hidden, inter,
-                                    n_heads, n_kv_heads, head_dim, weight_bytes=wb)
+                                    n_heads, n_kv_heads, head_dim, weight_bytes=wb, scale_tail=i8)
         relocated = _relocate_instructions(template, roles_1, roles_i,
                                            staging_delta=(i - 1) * S,
                                            shared_ranges=shared_ranges)
@@ -3316,7 +3390,8 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
 
 
 def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_dim,
-                                   max_seq_len, layer_weights_np, bf16_weights=False):
+                                   max_seq_len, layer_weights_np, bf16_weights=False,
+                                   int8_weights=False):
     """Like build_model_dram_image, but ALSO pre-allocates a per-layer,
     per-KV-head, zero-initialized KV-cache sized for max_seq_len tokens
     -- the layout _emit_model_kvcache_fp32 needs for a real multi-step
@@ -3377,7 +3452,10 @@ def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_
             arr = np.asarray(lw[name], dtype=np.float32)
             # bf16_weights: store the seven weight matrices as BF16 (uint16 bit
             # patterns, half the bytes); norms, embeddings and the cache stay FP32.
-            entry[name] = place(to_bf16_bits(arr) if bf16_weights else arr)
+            if int8_weights:
+                entry[name] = place(int8_weight_blob(arr))     # int8 bytes + FP32 scales
+            else:
+                entry[name] = place(to_bf16_bits(arr) if bf16_weights else arr)
         for name in ("q_norm", "k_norm"):
             if name in lw and lw[name] is not None:
                 bcast = np.tile(np.asarray(lw[name], dtype=np.float32), (M, 1))

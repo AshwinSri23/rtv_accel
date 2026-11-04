@@ -117,6 +117,19 @@ Both fixed, `rtv_sim` rebuilt, full 19/19 `ctest` re-verified (no regressions), 
 
 ---
 
+## Phase 2b: Weight-only quantization (added 2026-11-04)
+
+The FP32 pivot made *activation* INT8 moot; weight-only INT8 is a different problem (FP32 activations, so no
+outlier or calibration issue) and is done. Details and numbers: `QUANTIZATION.md`.
+
+- [x] Accuracy study (`toolchain/quant_study.py`): per-channel INT8 +1.0% perplexity; group scales bought nothing at 8 bits; INT4 +13-23% without calibration.
+- [x] ISA v1.8 `DType.INT8W` (COMPUTE_GEMM only), simulator + decoder + tests.
+- [x] Compiler: `compiler.int8_weights`, `quantize_int8_per_channel`, `_emit_matmul_int8w_fp32`, DRAM image builder, relocation role sizes.
+- [x] `generate.py --int8-weights`; `hf_compare.py --ref-int8`. Full 28-layer chip == HF-with-the-same-INT8-weights on both prompts (the second through `--graph`, two-tile prefill).
+- [ ] INT4 / group-wise: needs calibrated rounding (GPTQ/AWQ-style); not started.
+- [ ] INT8 with MoE experts and the on-device routed (`indirect`) loads: currently FP32-only there (raises NotImplementedError).
+- [ ] Remove the dequant round trip (scale applied in SRAM before the store) to recover the ~3% cycle cost.
+
 ## Phase 2: INT8 Inference Accuracy & Numerical Calibration
 
 **Dropped 2026-09-08 — moot.** This entire phase is INT8 calibration work; the project now targets native FP32 precision with no quantization. Left below for history rather than deleted.

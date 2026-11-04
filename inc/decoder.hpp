@@ -119,6 +119,13 @@ public:
         // accumulator are FP32. Halves weight DMA traffic and weight SRAM
         // use. Any other opcode with this dtype is an error.
         BF16W = 4,
+        // ISA v1.8 (wire value 5): like BF16W but B is INT8 (1 byte per
+        // element, sign-extended and converted to FP32 on read). The raw
+        // integer is used as-is: the per-output-channel dequantisation scale
+        // is applied by the compiler after the GEMM (an ordinary elementwise
+        // multiply), so no scale state lives in the instruction. COMPUTE_GEMM
+        // only.
+        INT8W = 5,
     };
 
     // Bytes per element for a given width.

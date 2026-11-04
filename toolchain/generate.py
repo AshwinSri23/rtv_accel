@@ -172,7 +172,7 @@ _SESSION_HEADROOM = 256 * 1024 * 1024
 
 
 def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
-            verbose=False, bf16_weights=False, use_graph=False):
+            verbose=False, bf16_weights=False, use_graph=False, int8_weights=False):
     """Run the actual decode loop; returns (all_token_ids, decoded_text)."""
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
@@ -199,12 +199,13 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
 
     comp0 = NPUCompiler(hal)
     comp0.bf16_weights = bf16_weights
+    comp0.int8_weights = int8_weights
     comp0.dtype = DType.FP32
     dram, x_addr, layer_weights, scratch_a, scratch_b, max_tiles = \
         tvm_backend.build_kvcache_model_dram_image(
             comp0, hidden, actual_n_layers, n_kv_heads, head_dim,
             max_seq_len=total_steps, layer_weights_np=layers,
-            bf16_weights=bf16_weights,
+            bf16_weights=bf16_weights, int8_weights=int8_weights,
         )
     base_dram_cursor = comp0._dram_cursor
     if use_graph:
@@ -259,6 +260,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             n_real = min(M, P - c * M)
             comp = NPUCompiler(hal)
             comp.bf16_weights = bf16_weights
+            comp.int8_weights = int8_weights
             comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
@@ -310,6 +312,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
 
             comp = NPUCompiler(hal)
             comp.bf16_weights = bf16_weights
+            comp.int8_weights = int8_weights
             comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
@@ -366,6 +369,9 @@ def main():
     ap.add_argument("--bf16-weights", action="store_true",
                     help="store the 7 per-layer weight matrices as BF16 (ISA v1.6 BF16W): "
                          "half the weight bytes in DRAM, FP32 accumulate")
+    ap.add_argument("--int8-weights", action="store_true",
+                    help="store the 7 per-layer weight matrices as INT8 with per-output-channel "
+                         "FP32 scales (ISA v1.8 INT8W): a quarter of the weight bytes in DRAM")
     args = ap.parse_args()
 
     if not os.path.exists(args.sim):
@@ -384,7 +390,8 @@ def main():
     print(f"prompt  : {args.prompt!r}", file=sys.stderr)
     ids, text = generate(model_dir, args.prompt, args.steps, n_layers=args.n_layers,
                          sim=args.sim, hal=args.hal, verbose=args.verbose,
-                         bf16_weights=args.bf16_weights, use_graph=args.graph)
+                         bf16_weights=args.bf16_weights, use_graph=args.graph,
+                         int8_weights=args.int8_weights)
     print(f"ids     : {ids}")
     print(f"text    : {text}")
     return 0

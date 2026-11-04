@@ -82,6 +82,16 @@ input. The cost is that a DRAM address is no longer a pure literal for these loa
 one SRAM word), so static address analysis must treat `INDIRECT_ADDR` transfers as "base plus runtime
 offset". Host-segmented routing (`test_moe_ffn.py`, `moe_model.py`) needs neither instruction.
 
+### **Instruction Bit-Layout — v1.8 (INT8 weights)**
+
+One addition, backward compatible: `dtype` value 5, `INT8W`, valid on `COMPUTE_GEMM` only (the simulator
+rejects it elsewhere, like `BF16W`). A is FP32, B is INT8 read as raw signed integers (1 byte per element),
+C and the accumulator are FP32. The per-output-channel dequantisation scale is **not** in the instruction:
+the compiler stores N FP32 scales after the K*N weight bytes and applies them with an ordinary elementwise
+multiply after the GEMM (`tvm_backend._emit_matmul_int8w_fp32`). This keeps every instruction
+self-describing, with no scale state, so relocation and patching are unaffected. Weight DMA traffic and
+weight SRAM per tile are a quarter of FP32. Scheme and its accuracy cost: `QUANTIZATION.md`.
+
 **Dependency tags.** `dep_id` is a 4-bit tag recorded per `LOAD_TILE` and
 cleared by `WAIT_SYNC`. A compiler may rotate tags across loads that are in
 flight at once; the simulator tracks completion per tag. `codegen.py`'s K-loop

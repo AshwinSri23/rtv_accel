@@ -40,6 +40,10 @@ def main():
     ap.add_argument("--chip-python", default=os.path.join(ROOT, ".venv-tvm", "bin", "python"))
     ap.add_argument("--model", default=None)
     ap.add_argument("--chip-args", default="", help="extra args for generate.py, e.g. --bf16-weights")
+    ap.add_argument("--ref-int8", action="store_true",
+                    help="fake-quantize the HF reference's 7 per-layer weight matrices per output "
+                         "channel to INT8 (the chip's --int8-weights scheme), so the comparison "
+                         "isolates chip bugs from quantization error")
     a = ap.parse_args()
 
     try:
@@ -55,6 +59,13 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32).eval()
+    if a.ref_int8:
+        import re as _re
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if _re.search(r"layers\.\d+\.(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)\.weight", n):
+                    sc = (p.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)   # [out,1] = per output channel
+                    p.copy_(torch.clamp(torch.round(p / sc), -128, 127) * sc)
     ids = tok(a.prompt, return_tensors="pt").input_ids
     with torch.no_grad():
         hf_ids = model.generate(ids, max_new_tokens=a.steps, do_sample=False)[0].tolist()

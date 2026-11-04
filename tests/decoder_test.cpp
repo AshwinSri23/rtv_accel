@@ -277,13 +277,16 @@ static void test_v16_dram_hi_round_trip() {
     CHECK_EQ(out.c_slot,  0x5u);
     CHECK_EQ(out.dim_k,   0x21u);
     CHECK_EQ(Decoder::decode(make_raw(0x1, 0x0, 0x001000, 0x0000, 16, 16, 0, 16, 0)).dram_hi, 0u);
-    // BF16W dtype (value 4, needs dim_m wire bit 15) round-trips; 5..7 are rejected.
+    // BF16W dtype (value 4, needs dim_m wire bit 15) and INT8W (5) round-trip; 6..7 are rejected.
     Decoder::DecodedInstruction g{};
     g.opcode = Decoder::Opcode::COMPUTE_GEMM;
     g.dim_m = 16; g.dim_n = 16; g.dim_k = 16;
     g.dtype = Decoder::DType::BF16W;
     CHECK(instr_eq(g, Decoder::decode(Decoder::encode(g))));
     CHECK_EQ((int)Decoder::decode(Decoder::encode(g)).dtype, 4);
+    g.dtype = Decoder::DType::INT8W;
+    CHECK(instr_eq(g, Decoder::decode(Decoder::encode(g))));
+    CHECK_EQ((int)Decoder::decode(Decoder::encode(g)).dtype, 5);
     g.dtype = static_cast<Decoder::DType>(6);
     bool threw = false;
     try { Decoder::decode(Decoder::encode(g)); } catch (const std::invalid_argument&) { threw = true; }

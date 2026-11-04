@@ -73,9 +73,10 @@ class DType(IntEnum):
     INT16 = 1
     INT32 = 2
     FP32  = 3   # no quantisation: the baseline that separates lowering bugs from quantisation loss
+    INT8W = 5   # v1.8, COMPUTE_GEMM only: FP32 A x INT8 B -> FP32 (raw integer; scale applied by compiler)
     BF16W = 4   # v1.6, COMPUTE_GEMM only: FP32 A x BF16 B -> FP32 (B is 2 bytes/elem)
 
-DType.BYTES = {0: 1, 1: 2, 2: 4, 3: 4, 4: 2, DType.INT8: 1, DType.INT16: 2, DType.INT32: 4, DType.FP32: 4, DType.BF16W: 2}
+DType.BYTES = {0: 1, 1: 2, 2: 4, 3: 4, 4: 2, DType.INT8: 1, DType.INT16: 2, DType.INT32: 4, DType.FP32: 4, DType.BF16W: 2, DType.INT8W: 1}
 
 
 
@@ -154,8 +155,8 @@ def encode(
     if activation  & ~0x7F:        raise ValueError(f"activation {activation:#x} exceeds 7 bits (bit 7 is accumulate)")
     if scale_shift & ~0x1F:        raise ValueError(f"scale_shift {scale_shift} exceeds 5 bits (0-31)")
     if c_slot      & ~0xF:         raise ValueError(f"c_slot {c_slot} exceeds 4 bits (0-15)")
-    if dtype       & ~0x7:         raise ValueError(f"dtype {dtype} exceeds 3 bits (0-4 valid)")
-    if dtype > 4:                  raise ValueError(f"dtype {dtype} is not a defined dtype (0-4)")
+    if dtype       & ~0x7:         raise ValueError(f"dtype {dtype} exceeds 3 bits (0-5 valid)")
+    if dtype > 5:                  raise ValueError(f"dtype {dtype} is not a defined dtype (0-5)")
 
     wire_dim_m = (((dtype & 0x7) << 13) | ((scale_shift & 0x1F) << 8)
                   | (dim_m & 0xFF))

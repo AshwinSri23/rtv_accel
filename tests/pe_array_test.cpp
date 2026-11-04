@@ -509,6 +509,25 @@ static void test_bf16w_gemm() {
     CHECK(std::fabs(c2[0] - 2.0f * c[0]) < 1e-5f);
 }
 
+// ISA v1.8 INT8W: FP32 A x INT8 B -> FP32, raw integer (no scale in the GEMM).
+static void test_int8w_gemm() {
+    MemoryController mem;
+    PEArray pe;
+    const uint16_t A = 0x0000, B8 = 0x0400, C = 0x0800;
+    float* a = reinterpret_cast<float*>(mem.sram_ptr(A));
+    int8_t* b = reinterpret_cast<int8_t*>(mem.sram_ptr(B8));
+    a[0] = 1.5f; a[1] = -2.0f; a[2] = 0.25f; a[3] = 1e3f;
+    b[0] = 127; b[1] = -128; b[2] = 3; b[3] = -1;
+    pe.compute_gemm(mem, A, B8, C, 2, 2, 2, Decoder::ActivationMode::NONE, false, 0, Decoder::DType::INT8W);
+    const float* c = reinterpret_cast<const float*>(mem.sram_ptr(C));
+    CHECK(c[0] == 1.5f * 127 + -2.0f * 3);
+    CHECK(c[1] == 1.5f * -128 + -2.0f * -1);
+    CHECK(c[2] == 0.25f * 127 + 1e3f * 3);
+    CHECK(c[3] == 0.25f * -128 + 1e3f * -1);
+    pe.compute_gemm(mem, A, B8, C, 2, 2, 2, Decoder::ActivationMode::NONE, true, 0, Decoder::DType::INT8W);
+    CHECK(c[0] == 2 * (1.5f * 127 + -2.0f * 3));
+}
+
 // FP32: the no-quantisation path. Exists so a lowering bug can be told apart
 // from a quantisation limit -- if this path is correct, every address, tile
 // and accumulation in the compiler is proven independently of any scale.
@@ -593,6 +612,7 @@ int main() {
         {"Int16ResidualOps",      test_int16_residual_ops},
         {"Fp32Ops",               test_fp32_ops},
         {"Bf16wGemm",             test_bf16w_gemm},
+        {"Int8wGemm",             test_int8w_gemm},
         {"GemmOobThrows",         test_gemm_oob_throws},
     };
 

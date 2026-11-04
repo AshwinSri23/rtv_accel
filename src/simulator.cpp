@@ -197,6 +197,8 @@ int main(int argc, char* argv[])
     auto reject_bf16w = [](const Decoder::DecodedInstruction& d) {
         if (d.dtype == Decoder::DType::BF16W)
             throw std::runtime_error("dtype BF16W is only valid on COMPUTE_GEMM");
+        if (d.dtype == Decoder::DType::INT8W)
+            throw std::runtime_error("dtype INT8W is only valid on COMPUTE_GEMM");
     };
     // LOAD/STORE address: 32 low bits from dram_addr, bits 35:32 from dram_hi.
     auto dram_addr36 = [&](const Decoder::DecodedInstruction& d) -> uint64_t {
