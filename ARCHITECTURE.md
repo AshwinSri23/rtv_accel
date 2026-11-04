@@ -218,17 +218,21 @@ not accidental complexity.
 The project originally targeted INT8 (8-bit integer) arithmetic with
 manually-tracked numeric scale factors, before pivoting to plain FP32
 (32-bit float, the same precision the original model itself uses) —
-simpler, and floats don't need any of that scale bookkeeping. A cluster
-of files in `toolchain/` are leftovers from that earlier INT8 effort and
-are **not used by the current pipeline** (nothing imports them except
-each other): `scale_sim.py`, `quant_sim.py`, `quant_eval.py`,
-`ref_model.py`, `layer_probe.py`, `device_probe.py` (explicitly marked
-`RETIRED` in its own file header), and `swizzle.py`. There's also a
-now-deleted hand-written Python compiler, `npu_compiler.py`, that this
-whole TVM-based compiler replaced — see `TODO.md`'s Phase 1 for that
-story. None of this needs to be understood to work on the current
-pipeline; it's mentioned here only so it doesn't cause confusion when you
-see it in the file listing.
+simpler, and floats don't need any of that scale bookkeeping.
+
+A cluster of INT8-era files survived that pivot as dead code — nothing
+imported them except each other — and have now been **deleted**:
+`scale_sim.py`, `quant_sim.py`, `quant_eval.py`, `ref_model.py`,
+`layer_probe.py`, `device_probe.py` and `swizzle.py` in `toolchain/`,
+plus `find_ops.py` at the repository root (a scratch script that
+inspected SmolLM2, a model this project never targeted). Together they
+were ~1,870 lines, about 10% of the repository. The hand-written Python
+compiler `npu_compiler.py` (~3,400 lines) was deleted earlier, when the
+TVM path replaced it — see `TODO.md`'s Phase 1 for that story.
+
+None of this is needed to work on the current pipeline. It's recorded
+here only so the names remain findable: all of it is recoverable from
+git history if the INT8 work is ever revisited.
 
 ## Where to go next
 
