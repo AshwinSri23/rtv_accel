@@ -26,8 +26,10 @@ Attention-only INT8 is nearly free (+0.36%); the MLP carries most of the loss.
 
 - Per matrix W[K, N]: `q = round(W / s)`, `s[n] = max|W[:, n]| / 127`, stored as K*N int8 bytes then N FP32 scales.
 - `COMPUTE_GEMM` with `DType.INT8W`: FP32 A x raw INT8 B -> FP32 (simulator `pe_array.cpp`). No scale in the instruction.
-- Compiler (`_emit_matmul_int8w_fp32`): the usual prefetched K-loop, then `C *= scale` as an elementwise multiply (the
-  scale row is broadcast to 16 rows by DMA). Scale is constant along K, so applying it once after accumulation is exact.
+- Compiler (`_emit_matmul_int8w_fp32`): the usual prefetched K-loop. The scale row is broadcast to 16 rows by DMA once
+  per matmul; then, per output tile, a 16x16 scale tile is prefetched into a spare SRAM output slot under the last K
+  step and multiplied into C in place (`EXEC_ALU ELEMWISE_MUL`) before the store. Scale is constant along K, so
+  applying it once after accumulation is exact, and doing it in SRAM avoids a DRAM round trip of C.
 - Relocation: the role byte-ranges include the scale tail, so relocated layers stay byte-identical to a full recompile.
 
 ## 3. Measured
@@ -36,9 +38,9 @@ Attention-only INT8 is nearly free (+0.36%); the MLP carries most of the loss.
 - Chip vs Hugging Face with the **same** INT8 weights fake-quantized (`hf_compare.py --ref-int8`): identical tokens for
   "The capital of France is" and for the 26-token two-tile prompt (the latter through `--graph`).
   Chip vs *unquantized* HF is not expected to be identical (see perplexity above).
-- Cycles, one 16x1024 @ 1024x3072 matmul (double-buffered model): FP32 3,228,672, BF16 3,181,272, **INT8 3,328,448**.
-  INT8 is about 3% *slower* than FP32 in the simulator: the model is compute-bound, so the 4x smaller weights buy
-  footprint, not speed, and the dequant multiply (DRAM round trip) costs a little. On bandwidth-bound hardware the
+- Cycles, one 16x1024 @ 1024x3072 matmul (double-buffered model): FP32 3,228,672, BF16 3,181,272, **INT8 3,247,032**
+  (3,328,448 before the dequant moved into SRAM). INT8 is about 0.6% *slower* than FP32 in the simulator: the model
+  is compute-bound, so the 4x smaller weights buy footprint, not speed. On bandwidth-bound hardware the
   smaller weights would help; the simulator cannot show that.
 
 ## 3b. MoE experts
@@ -54,5 +56,4 @@ differ by 3e-3, so the INT8 path is genuinely exercised). Not measured: accuracy
 
 ## 4. Not done
 
-INT4 / group-wise (needs calibration); BF16 with on-device routed loads; applying the scale in SRAM
-before the store to remove the round trip. Tracked in `TODO.md` Phase 2b.
+INT4 / group-wise (needs calibration); BF16 with on-device routed loads. Tracked in `TODO.md` Phase 2b.

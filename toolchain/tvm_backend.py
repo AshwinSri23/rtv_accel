@@ -719,23 +719,36 @@ def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
              dram_addr=b_addr + kn * T * N + jn * T, sram_addr=b_slots[i % depth],
              dim_m=T, dim_n=T, stride=N, dtype=int(DType.FP32), **ind)
 
+    # Per-column scales, replicated to 16 rows by DMA once per matmul, are streamed one
+    # 16x16 tile per output tile into a spare output slot and multiplied into C in SRAM.
+    scale_dram = compiler.alloc_staging(T * N * 4)
+    _emit_broadcast_row0_fp32(compiler, b_addr + K * N, scale_dram, N, indirect_ptr=indirect_b)
+    scale_slot = SRAMMap.output_slot(1)
+    SCALE_TAG = 5
+
     for i in range(min(depth - 1, len(steps))):
         load(i)
     for i, (jn, kn) in enumerate(steps):
         if i + depth - 1 < len(steps):
             load(i + depth - 1)
+        if kn == kt - 1:               # prefetch this output tile's scale under the last K step
+            emit(opcode=Opcode.LOAD_TILE, dep_id=SCALE_TAG, dram_addr=scale_dram + jn * T * 4,
+                 sram_addr=scale_slot, dim_m=T, dim_n=T * 4, stride=N * 4, dtype=int(DType.FP32))
         emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_A_BASE + i % depth)
         emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_B_BASE + i % depth)
         emit(opcode=Opcode.COMPUTE_GEMM, dep_id=1, sram_addr=a_slots[i % depth],
              stride=b_slots[i % depth], dim_m=T, dim_n=T, dim_k=T,
              accumulate=(kn > 0), c_slot=0, dtype=int(DType.INT8W))
         if kn == kt - 1:
+            # Dequantise while C is still in SRAM: C *= scale tile (EXEC_ALU ELEMWISE_MUL,
+            # in place), then STORE. Saves the DRAM round trip of C that a separate
+            # elementwise pass would cost.
+            emit(opcode=Opcode.WAIT_SYNC, dep_id=SCALE_TAG)
+            emit(opcode=Opcode.EXEC_ALU, dep_id=1, sram_addr=c_slot, stride=scale_slot,
+                 dim_m=T, dim_n=T, activation=int(ActivationMode.ELEMWISE_MUL),
+                 dtype=int(DType.FP32))
             emit(opcode=Opcode.STORE_TILE, dram_addr=c_addr + jn * T * 4, sram_addr=c_slot,
                  dim_m=T, dim_n=T * 4, stride=N * 4, dtype=int(DType.FP32))
-    # Dequantise: C *= scale (per output column), in place.
-    scale_tile = compiler.alloc_staging(T * N * 4)
-    _emit_broadcast_row0_fp32(compiler, b_addr + K * N, scale_tile, N, indirect_ptr=indirect_b)
-    _emit_mul_fp32(compiler, c_addr, scale_tile, c_addr, N)
 
 
 def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,

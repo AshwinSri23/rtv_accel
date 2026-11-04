@@ -75,6 +75,7 @@ def case_compiler_matmul(M, N, K):
     comp = NPUCompiler(HAL)
     comp.dtype = CDType.FP32
     comp.instruction_stream = bytearray()
+    comp._dram_cursor = 0x180000        # staging well clear of the test's A/B/C regions
     a_addr, b_addr, c_addr = 0x1000, 0x40000, 0x100000
     tvm_backend._emit_matmul_int8w_fp32(comp, M, N, K, a_addr, b_addr, c_addr)
     dram = bytearray(max(0x200000, comp.dram_bytes_needed + 0x1000))
