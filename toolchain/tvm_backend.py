@@ -374,6 +374,23 @@ def _emit_rmsnorm_row_fp32(compiler, hidden, x_addr, gamma_addr, out_addr,
     # sqrt(scale_num / sum) when scale_num is nonzero (else plain 1/sqrt(sum));
     # passing scale_num=hidden turns that into sqrt(N/sum) == 1/sqrt(mean),
     # which is what folds the missing /N into this step.
+    eps = getattr(compiler, "rms_eps", None)
+    if eps:
+        # RMSNorm is x * rsqrt(mean(x^2) + eps). RMS_SCALE computes
+        # x * sqrt(N / sum), so eps is folded in by adding N*eps to the sum:
+        # one extra tile whose only nonzero element is sqrt(N*eps) contributes
+        # exactly N*eps to the sum of squares.
+        def _build_eps_tile():
+            t = np.zeros((M, M), dtype=np.float32)
+            t[0, 0] = np.sqrt(np.float64(hidden) * np.float64(eps))
+            return t
+        eps_tile = _get_or_build_const(compiler, ("rms_eps_tile", hidden, float(eps)),
+                                       M * M * 4, _build_eps_tile)
+        sq_eps, _, _ = _rmsnorm_prim_fp32(M, M, None, None)
+        codegen.emit(compiler,
+                     schedule.schedule_reduce(sq_eps, "sumsq", intrin.register_sumsq_fp32()),
+                     {"A": eps_tile, "S": scratch_addr},
+                     dtype=DType.FP32, kind="reduce", reduce_accumulate=True)
     codegen.emit(compiler,
                  schedule.schedule_tile_scalar(rms, "rms",
                                                intrin.register_rms_scale_fp32()),
@@ -1113,6 +1130,14 @@ def _emit_rmsnorm_rows_fp32(compiler, hidden, n_rows, x_addr, gamma_addr, out_ad
     row_slot = SRAMMap.input_slot(0, w)
     gamma_slot = SRAMMap.input_slot(1, w)
     sumsq_scalar = SRAMMap.SCALAR_SCRATCH_BASE
+    eps = getattr(compiler, "rms_eps", None)
+    if eps:
+        def _build_eps_row():
+            t = np.zeros((1, M), dtype=np.float32)
+            t[0, 0] = np.sqrt(np.float64(hidden) * np.float64(eps))
+            return t
+        eps_row = _get_or_build_const(compiler, ("rms_eps_row", hidden, float(eps)),
+                                      M * 4, _build_eps_row)
 
     for r in range(n_rows):
         row_base = x_addr + r * x_pitch
@@ -1126,6 +1151,13 @@ def _emit_rmsnorm_rows_fp32(compiler, hidden, n_rows, x_addr, gamma_addr, out_ad
                                  dram_addr=row_base + ct * M * w, sram_addr=row_slot,
                                  dim_m=1, dim_n=M * w, stride=x_pitch,
                                  dtype=int(DType.FP32)))
+            cg._reduce(ActivationMode.REDUCE_SUMSQ, scalar_addr=sumsq_scalar)
+        if eps:
+            # fold epsilon into the sum: one more accumulated row whose only
+            # nonzero element is sqrt(N*eps) (see _emit_rmsnorm_row_fp32)
+            cg._emit_word(encode(opcode=Opcode.LOAD_TILE, dep_id=codegen.DEP.get("A", 3),
+                                 dram_addr=eps_row, sram_addr=row_slot,
+                                 dim_m=1, dim_n=M * w, stride=M * w, dtype=int(DType.FP32)))
             cg._reduce(ActivationMode.REDUCE_SUMSQ, scalar_addr=sumsq_scalar)
 
         cg2 = codegen.Codegen(compiler, {}, dtype=DType.FP32, kind="elemwise")

@@ -556,11 +556,15 @@ class Codegen:
 
 
 def emit(compiler, sch, dram, dtype=DType.INT8, kind="gemm", scale_num=0,
-         lut_dram=None, temperature=0):
+         lut_dram=None, temperature=0, reduce_accumulate=False):
     """Emit instructions for a scheduled PrimFunc into `compiler`."""
     cg = Codegen(compiler, dram, dtype, kind)
     cg.scale_num = scale_num
     cg.lut_dram = lut_dram
     cg.temperature = temperature
+    if reduce_accumulate:
+        # The first REDUCE_SUMSQ ADDS onto the scalar already in SRAM instead of
+        # overwriting it (used to fold RMSNorm's epsilon into the sum of squares).
+        cg._reduce_count[ActivationMode.REDUCE_SUMSQ] = 1
     cg.visit(sch.mod["main"].body, {})
     return compiler.instruction_stream

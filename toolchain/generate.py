@@ -255,6 +255,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             n_real = min(M, P - c * M)
             comp = NPUCompiler(hal)
             comp.bf16_weights = bf16_weights
+            comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
             comp._dram_cursor = base_dram_cursor
@@ -298,6 +299,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
 
             comp = NPUCompiler(hal)
             comp.bf16_weights = bf16_weights
+            comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
             comp._dram_cursor = base_dram_cursor

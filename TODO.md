@@ -451,8 +451,22 @@ Three options, in preference order:
 - [x] **`reset_staging` / per-layer liveness (5.4 step 2): measured, deferred** (2026-11-04). One real 28-layer decode step needs 70.7 MB of staging (2.52 MB/layer) on top of a 1,772.8 MB image: ~4% of the footprint. Reusing it per layer would save ~66 MB but touches relocation's address tables, which the byte-identical tests depend on. Not worth the risk for this model; revisit for arbitrary graphs with large activations.
 - [x] **HF comparison automated as a script** (`toolchain/hf_compare.py`, 2026-11-04): runs HF greedy and `generate.py` on a prompt and compares token ids (exit 0 identical / 1 differ / 77 skipped without torch). Deliberately not in `ctest` (PyTorch is not a project dependency, minutes per prompt). Verified identical for FP32 and `--chip-args=--bf16-weights`.
 - [ ] **Promote the BYOC graph path to production (5.4 step 4)** — not attempted. It needs a Relax Qwen3 graph from a frontend (TVM's PyTorch import, i.e. torch in the TVM venv), a lowering for every claimed op, a boundary decision for attention (patterns.py cannot match per-head loops), and the byte-identical-stream acceptance test against the hand-driven path. Multi-week; the prerequisite pieces now exist (persistent session, tile-based prefill, BF16, HF oracle).
+- [x] **Real-architecture MoE model validated against Hugging Face** (2026-11-04).
+  `toolchain/moe_model.py` runs a Qwen3-MoE checkpoint on the chip (host-segmented routing,
+  two device programs per layer, one persistent session); `test_moe_model.py` runs
+  `hf-internal-testing/tiny-random-Qwen3MoeForCausalLM` (2 layers, 4 experts, top-2,
+  norm_topk_prob, q/k-norm, GQA) and compares to a recorded HF reference: the 6 generated
+  tokens are identical and the top-5 logits at every step agree to **4.95e-5** (the model's
+  logits are nearly tied, so this is tight). **Two findings on the way:** (1) transformers
+  5.12 expects the router as `mlp.gate.weight` but this checkpoint stores
+  `mlp.router.weight`, so HF silently leaves the router RANDOMLY initialised ("MISSING" in its
+  load report); my first reference was therefore wrong and showed phantom 0.007 logit gaps;
+  the reference now copies the checkpoint's router in explicitly. (2) The chip's RMSNorm had no
+  epsilon; fixed (`compiler.rms_eps`: an extra tile whose sum of squares is N*eps is accumulated
+  into the reduction), enabled in `generate.py` and `moe_model.py`; effect is below 1e-3 on this
+  model and the 28-layer Qwen3 comparisons stay token-identical (both prompts re-run).
 - [ ] **On-device MoE routing** (argmax-with-index + indirect LOAD) — an ISA design alternative, not a pending task; host-segmented routing is the chosen path.
 - [x] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
   half unstaged, plus the work above).
 
-**Status (2026-11-04):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred (below); step 3 answered by `test_moe_ffn.py`; step 4 (promote the BYOC graph path to production) NOT started and not attempted; step 5 prototyped (host-segmented MoE, no real checkpoint). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.
+**Status (2026-11-04, later):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred (below); step 3 answered by `test_moe_ffn.py`; step 4 (promote the BYOC graph path to production) NOT started and not attempted; step 5 prototyped (host-segmented MoE, no real checkpoint). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.
