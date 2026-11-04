@@ -172,7 +172,7 @@ _SESSION_HEADROOM = 256 * 1024 * 1024
 
 
 def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
-            verbose=False):
+            verbose=False, bf16_weights=False):
     """Run the actual decode loop; returns (all_token_ids, decoded_text)."""
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
@@ -198,11 +198,13 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
     total_steps = P - 1 + n_new_tokens
 
     comp0 = NPUCompiler(hal)
+    comp0.bf16_weights = bf16_weights
     comp0.dtype = DType.FP32
     dram, x_addr, layer_weights, scratch_a, scratch_b, max_tiles = \
         tvm_backend.build_kvcache_model_dram_image(
             comp0, hidden, actual_n_layers, n_kv_heads, head_dim,
             max_seq_len=total_steps, layer_weights_np=layers,
+            bf16_weights=bf16_weights,
         )
     base_dram_cursor = comp0._dram_cursor
 
@@ -252,6 +254,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
         for c in range(n_tiles):
             n_real = min(M, P - c * M)
             comp = NPUCompiler(hal)
+            comp.bf16_weights = bf16_weights
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
             comp._dram_cursor = base_dram_cursor
@@ -294,6 +297,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             token_id = prompt_ids[pos] if pos < P else next_input_id
 
             comp = NPUCompiler(hal)
+            comp.bf16_weights = bf16_weights
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
             comp._dram_cursor = base_dram_cursor
@@ -339,6 +343,9 @@ def main():
     ap.add_argument("--sim", default=os.path.join(ROOT, "build", "rtv_sim"))
     ap.add_argument("--hal", default=os.path.join(_HERE, "hal_config.json"))
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--bf16-weights", action="store_true",
+                    help="store the 7 per-layer weight matrices as BF16 (ISA v1.6 BF16W): "
+                         "half the weight bytes in DRAM, FP32 accumulate")
     args = ap.parse_args()
 
     if not os.path.exists(args.sim):
@@ -356,7 +363,8 @@ def main():
     print(f"model   : {model_dir}", file=sys.stderr)
     print(f"prompt  : {args.prompt!r}", file=sys.stderr)
     ids, text = generate(model_dir, args.prompt, args.steps, n_layers=args.n_layers,
-                         sim=args.sim, hal=args.hal, verbose=args.verbose)
+                         sim=args.sim, hal=args.hal, verbose=args.verbose,
+                         bf16_weights=args.bf16_weights)
     print(f"ids     : {ids}")
     print(f"text    : {text}")
     return 0

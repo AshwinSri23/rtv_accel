@@ -338,6 +338,17 @@ Three options, in preference order:
   as a default speedup. **Still not done:** wiring it into the attention/FFN emitters
   (they go through TVM-scheduled FP32 buffers), the DRAM image builder and the
   checkpoint loader converting weights to BF16.
+  **Update 2026-11-04 — BF16 weights are now wired through the whole model.**
+  `compiler.bf16_weights` makes every weight matmul (Q/K/V/O and SwiGLU gate/up/down)
+  use `_emit_weight_matmul_fp32` -> the BF16W GEMM; `build_kvcache_model_dram_image(...,
+  bf16_weights=True)` stores those seven matrices as BF16; relocation's role sizes follow;
+  `generate.py --bf16-weights`. `test_bf16_weights_model.py`: prefill+decode match a numpy
+  reference with the same BF16-rounded weights (max diff 6.6e-5), relocation is
+  byte-identical over 5 layers, weight bytes exactly halved. **Full 28-layer chip with BF16
+  weights generates exactly Hugging Face's FP32 tokens** (" Paris. The capital"). Weight
+  footprint for Qwen3-0.6B: ~63 MB/layer FP32 -> ~31 MB BF16 (~0.9 GB saved over 28 layers;
+  computed from the shapes, image size not re-measured). Not converted: norms, embeddings,
+  lm_head (host-side) and the KV-cache stay FP32.
 - [x] **Async `STORE_TILE`: decided not to do.** Measured on one real layer step: 2,912
   stores x ~184 cycles = ~0.54M of ~17.6M double-buffered cycles (~3%), so the
   ceiling on the win is small, and it would add a hazard class (a load racing a
@@ -382,7 +393,10 @@ Three options, in preference order:
   that differ only in LOAD/STORE addresses (identical instruction skeleton), so schedule
   relocation's address patching applies to expert layers. Not built: RMSNorm/residual
   around the expert FFN, a shared expert, and a real MoE checkpoint (a 4 GB-class model
-  at FP32 does not fit; needs the BF16 wiring first). On-device routing (argmax-with-index
+  at FP32 does not fit; BF16 wiring now exists, but no suitable MoE safetensors checkpoint is
+  cached locally (the cached MoE models are OpenVINO int4). **Update:** `_emit_moe_block_fp32` +
+  `test_moe_block.py` add the RMSNorm before the router, an always-on shared expert and the
+  residual: 5 tokens, 5 distinct expert sets, max rel err 3.2e-7 vs numpy. On-device routing (argmax-with-index
   + indirect LOAD) remains the unbuilt alternative. Original decision text: Host-segmented (no ISA change: a program
   boundary and host round trip at every MoE layer, gate logits come out
   mid-program) vs on-device (argmax-with-index `REDUCE` mode + SRAM-indirect
@@ -434,7 +448,11 @@ Three options, in preference order:
   315] = " Italy. Which of", token-for-token identical to HF, including step 2 where HF's own
   top-2 logit margin is only 0.060. Compared token ids and top-1s, not logits: logits were
   not compared numerically, so small FP32 deviations that don't flip a token would not show.
-- [ ] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
+- [x] **`reset_staging` / per-layer liveness (5.4 step 2): measured, deferred** (2026-11-04). One real 28-layer decode step needs 70.7 MB of staging (2.52 MB/layer) on top of a 1,772.8 MB image: ~4% of the footprint. Reusing it per layer would save ~66 MB but touches relocation's address tables, which the byte-identical tests depend on. Not worth the risk for this model; revisit for arbitrary graphs with large activations.
+- [x] **HF comparison automated as a script** (`toolchain/hf_compare.py`, 2026-11-04): runs HF greedy and `generate.py` on a prompt and compares token ids (exit 0 identical / 1 differ / 77 skipped without torch). Deliberately not in `ctest` (PyTorch is not a project dependency, minutes per prompt). Verified identical for FP32 and `--chip-args=--bf16-weights`.
+- [ ] **Promote the BYOC graph path to production (5.4 step 4)** — not attempted. It needs a Relax Qwen3 graph from a frontend (TVM's PyTorch import, i.e. torch in the TVM venv), a lowering for every claimed op, a boundary decision for attention (patterns.py cannot match per-head loops), and the byte-identical-stream acceptance test against the hand-driven path. Multi-week; the prerequisite pieces now exist (persistent session, tile-based prefill, BF16, HF oracle).
+- [ ] **On-device MoE routing** (argmax-with-index + indirect LOAD) — an ISA design alternative, not a pending task; host-segmented routing is the chosen path.
+- [x] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
   half unstaged, plus the work above).
 
-**Status (2026-11-04):** 5.4 steps 1 (re-diagnosed and addressed) done; steps 2–5 not started. See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.
+**Status (2026-11-04):** 5.4: step 1 done (re-diagnosed); step 2 measured and deferred (below); step 3 answered by `test_moe_ffn.py`; step 4 (promote the BYOC graph path to production) NOT started and not attempted; step 5 prototyped (host-segmented MoE, no real checkpoint). See 5.5 for everything done and open since. L3 (TVM auto-scheduling) remains an undefined, independent item.

@@ -464,6 +464,42 @@ def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, 
     _emit_copy_slice_fp32(compiler, acc, out_addr, hidden, width=hidden)
 
 
+def _emit_moe_block_fp32(compiler, hidden, inter, x_addr, normed_addr, experts,
+                         route_weights, out_addr, shared_expert=None):
+    """A pre-norm MoE FFN block for one token with routing already decided:
+
+        out = x + SharedExpert(n) + sum_j route_weights[j] * Expert_{experts[j]}(n)
+
+    `normed_addr` is n = RMSNorm(x) (computed by the caller's earlier device
+    segment, which also fed the router), `x_addr` the residual input, `experts` /
+    `route_weights` the host-selected top-k (see _emit_moe_ffn_fp32), and
+    `shared_expert` an optional always-on expert {"w_gate","w_up","w_down"} with
+    weight 1 (DeepSeek/Qwen-MoE style).
+    """
+    M = compiler.tile_dim
+    y = compiler.alloc_staging(M * hidden * 4)
+    _emit_moe_ffn_fp32(compiler, hidden, inter, normed_addr, experts, route_weights, y)
+    if shared_expert is not None:
+        ys = compiler.alloc_staging(M * hidden * 4)
+        _emit_swiglu_ffn_fp32(compiler, hidden, inter, normed_addr, shared_expert["w_gate"],
+                              shared_expert["w_up"], shared_expert["w_down"], ys)
+        y2 = compiler.alloc_staging(M * hidden * 4)
+        _emit_residual_add_fp32(compiler, y, ys, y2, hidden)
+        y = y2
+    _emit_residual_add_fp32(compiler, x_addr, y, out_addr, hidden)
+
+
+def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
+    """C = A @ W where W is a model WEIGHT matrix. FP32 normally; BF16 weights
+    (half the DRAM and weight traffic, FP32 accumulate) when
+    `compiler.bf16_weights` is set, in which case W must have been stored as BF16
+    (build_kvcache_model_dram_image(..., bf16_weights=True))."""
+    if getattr(compiler, "bf16_weights", False):
+        _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
+    else:
+        _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr)
+
+
 def _emit_scale_fp32(compiler, in_addr, width, scale):
     """Return the address of `in * scale` for a (16, width) FP32 tile (a fresh
     buffer; `in` is untouched). `scale` is an exact FP32 constant, applied as an
@@ -565,8 +601,8 @@ def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,
     up_stage = compiler.alloc_staging(stage_bytes)
     act_stage = compiler.alloc_staging(stage_bytes)
 
-    _emit_matmul_fp32(compiler, M, inter, hidden, x_addr, w_gate_addr, gate_stage)
-    _emit_matmul_fp32(compiler, M, inter, hidden, x_addr, w_up_addr, up_stage)
+    _emit_weight_matmul_fp32(compiler, M, inter, hidden, x_addr, w_gate_addr, gate_stage)
+    _emit_weight_matmul_fp32(compiler, M, inter, hidden, x_addr, w_up_addr, up_stage)
 
     @T.prim_func(s_tir=True)
     def silu(a: T.handle, c: T.handle) -> None:
@@ -597,7 +633,7 @@ def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,
                  {"A": gate_stage, "B": up_stage, "C": act_stage},
                  dtype=DType.FP32, kind="elemwise")
 
-    _emit_matmul_fp32(compiler, M, hidden, inter, act_stage, w_down_addr, out_addr)
+    _emit_weight_matmul_fp32(compiler, M, hidden, inter, act_stage, w_down_addr, out_addr)
 
 
 def _emit_matmul_tile_resident_fp32(compiler, K, a_addr, b_addr, c_slot,
@@ -2289,9 +2325,9 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     ctx_stage = compiler.alloc_staging(M * q_dim * w)
     attn_wide = compiler.alloc_staging(M * hidden * w)
 
-    _emit_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
-    _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
-    _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_proj_stage)
+    _emit_weight_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
+    _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
+    _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_proj_stage)
 
     # Qwen3's per-head q_norm/k_norm: one shared (head_dim,) RMSNorm gain,
     # applied independently to each head's own head_dim-wide slice, IN
@@ -2382,7 +2418,7 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     # own convention); mask back down to "row 0 real, rest zero" before
     # handing this block's result to the caller, same as
     # _emit_attention_block_fp32.
-    _emit_matmul_fp32(compiler, M, hidden, q_dim, ctx_stage, wo_addr, attn_wide)
+    _emit_weight_matmul_fp32(compiler, M, hidden, q_dim, ctx_stage, wo_addr, attn_wide)
     _emit_mask_to_row0_fp32(compiler, attn_wide, out_addr, hidden)
 
 
@@ -2674,9 +2710,9 @@ def _emit_attention_block_kvcache_batched_fp32(compiler, hidden, n_heads, n_kv_h
     ctx_stage = compiler.alloc_staging(M * q_dim * w)
     attn_wide = compiler.alloc_staging(M * hidden * w)
 
-    _emit_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
-    _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
-    _emit_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_stage)
+    _emit_weight_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
+    _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
+    _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_stage)
 
     if q_norm_addr is not None:
         for qh in range(n_heads):
@@ -2741,7 +2777,7 @@ def _emit_attention_block_kvcache_batched_fp32(compiler, hidden, n_heads, n_kv_h
             mask_addr=mask_addr, q_stride=q_dim, out_stride=q_dim,
         )
 
-    _emit_matmul_fp32(compiler, M, hidden, q_dim, ctx_stage, wo_addr, attn_wide)
+    _emit_weight_matmul_fp32(compiler, M, hidden, q_dim, ctx_stage, wo_addr, attn_wide)
     _emit_mask_to_n_real_rows_fp32(compiler, attn_wide, out_addr, hidden, n_real)
 
 
@@ -2935,7 +2971,7 @@ def _emit_model_kvcache_batched_fp32(compiler, n_layers, hidden, inter, n_heads,
 
 
 def _layer_role_addrs(lw, x_addr, out_addr, hidden, inter, n_heads, n_kv_heads,
-                      head_dim):
+                      head_dim, weight_bytes=4):
     """Every named DRAM region belonging to one layer's own weights,
     KV-cache tiles, and boundary (input/output) buffers, as
     {role: (addr, nbytes)} -- role is a string stable across every
@@ -2974,13 +3010,14 @@ def _layer_role_addrs(lw, x_addr, out_addr, hidden, inter, n_heads, n_kv_heads,
         "out_addr": (out_addr, M * hidden * w),
         "gamma1": (lw["gamma1"], M * hidden * w),
         "gamma2": (lw["gamma2"], M * hidden * w),
-        "wq": (lw["wq"], hidden * q_dim * w),
-        "wk": (lw["wk"], hidden * kv_dim * w),
-        "wv": (lw["wv"], hidden * kv_dim * w),
-        "wo": (lw["wo"], q_dim * hidden * w),
-        "wgate": (lw["wgate"], hidden * inter * w),
-        "wup": (lw["wup"], hidden * inter * w),
-        "wdown": (lw["wdown"], inter * hidden * w),
+        # weight_bytes is 2 when the weights are stored as BF16.
+        "wq": (lw["wq"], hidden * q_dim * weight_bytes),
+        "wk": (lw["wk"], hidden * kv_dim * weight_bytes),
+        "wv": (lw["wv"], hidden * kv_dim * weight_bytes),
+        "wo": (lw["wo"], q_dim * hidden * weight_bytes),
+        "wgate": (lw["wgate"], hidden * inter * weight_bytes),
+        "wup": (lw["wup"], hidden * inter * weight_bytes),
+        "wdown": (lw["wdown"], inter * hidden * weight_bytes),
     }
     for name in ("q_norm", "k_norm"):
         addr = lw.get(name)
@@ -3160,8 +3197,9 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
     S = compiler._staging_cursor - staging_before
     template = bytes(compiler.instruction_stream[instr_start:instr_end])
 
+    wb = 2 if getattr(compiler, "bf16_weights", False) else 4
     roles_1 = _layer_role_addrs(layer_weights[1], x1, out1, hidden, inter,
-                               n_heads, n_kv_heads, head_dim)
+                               n_heads, n_kv_heads, head_dim, weight_bytes=wb)
     shared_ranges = list(compiler._const_cache.values())
 
     cur_in = out1
@@ -3169,7 +3207,7 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
         lwi = layer_weights[i]
         xi, outi = _io_addrs(i)
         roles_i = _layer_role_addrs(lwi, xi, outi, hidden, inter,
-                                    n_heads, n_kv_heads, head_dim)
+                                    n_heads, n_kv_heads, head_dim, weight_bytes=wb)
         relocated = _relocate_instructions(template, roles_1, roles_i,
                                            staging_delta=(i - 1) * S,
                                            shared_ranges=shared_ranges)
@@ -3184,7 +3222,7 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
 
 
 def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_dim,
-                                   max_seq_len, layer_weights_np):
+                                   max_seq_len, layer_weights_np, bf16_weights=False):
     """Like build_model_dram_image, but ALSO pre-allocates a per-layer,
     per-KV-head, zero-initialized KV-cache sized for max_seq_len tokens
     -- the layout _emit_model_kvcache_fp32 needs for a real multi-step
@@ -3242,7 +3280,10 @@ def build_kvcache_model_dram_image(compiler, hidden, n_layers, n_kv_heads, head_
             bcast = np.tile(np.asarray(lw[name], dtype=np.float32), (M, 1))
             entry[name] = place(bcast)
         for name in ("wq", "wk", "wv", "wo", "wgate", "wup", "wdown"):
-            entry[name] = place(np.asarray(lw[name], dtype=np.float32))
+            arr = np.asarray(lw[name], dtype=np.float32)
+            # bf16_weights: store the seven weight matrices as BF16 (uint16 bit
+            # patterns, half the bytes); norms, embeddings and the cache stay FP32.
+            entry[name] = place(to_bf16_bits(arr) if bf16_weights else arr)
         for name in ("q_norm", "k_norm"):
             if name in lw and lw[name] is not None:
                 bcast = np.tile(np.asarray(lw[name], dtype=np.float32), (M, 1))
