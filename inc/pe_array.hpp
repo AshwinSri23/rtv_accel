@@ -44,7 +44,8 @@ public:
                       Decoder::ActivationMode activation = Decoder::ActivationMode::NONE,
                       bool accumulate = false,
                       uint8_t scale_shift = 7,
-                      Decoder::DType dtype = Decoder::DType::INT8);
+                      Decoder::DType dtype = Decoder::DType::INT8,
+                      uint16_t aux_sram = 0);   // INT4W: SRAM address of the N-float scale row
 
     // ── EXEC_ALU ─────────────────────────────────────────────────────────────
     //

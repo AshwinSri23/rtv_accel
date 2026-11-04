@@ -1,4 +1,4 @@
-# Weight-only quantization (INT8W, ISA v1.8)
+# Weight-only quantization (INT8W ISA v1.8, INT4W ISA v1.9)
 
 Scope: the 7 per-layer weight matrices (Q/K/V/O, SwiGLU gate/up/down). Activations, norms, embeddings, lm_head and
 the KV-cache stay FP32; accumulation is FP32. Because activations are FP32 there is no activation-outlier problem
@@ -32,6 +32,34 @@ Attention-only INT8 is nearly free (+0.36%); the MLP carries most of the loss.
   applying it once after accumulation is exact, and doing it in SRAM avoids a DRAM round trip of C.
 - Relocation: the role byte-ranges include the scale tail, so relocated layers stay byte-identical to a full recompile.
 
+## 2b. INT4 (ISA v1.9)
+
+Plain round-to-nearest INT4 is unusable (+13 to +36% perplexity), so the INT4 path uses **GPTQ**: each weight column is
+rounded in turn and its rounding error is pushed onto the not-yet-rounded columns through the inverse Hessian of the
+layer's calibration inputs (`quant_study.py gptq`, Hessians from 32x512 WikiText-2 *train* tokens; evaluated on the
+*test* split):
+
+| scheme (symmetric unless noted) | bits/weight | RTN ppl | GPTQ ppl | GPTQ vs FP32 (29.39) |
+|---|---|---|---|---|
+| INT4 g128 | 4.25 | 40.11 | 34.09 | +16% |
+| INT4 g64 | 4.5 | n/a | 32.97 | +12% |
+| **INT4 g32** | **5.0** | 34.88 | **30.77** | **+4.7%** |
+| INT4 g64 asymmetric | 4.56 | n/a | 31.01 | +5.5% |
+| INT4 g32 asymmetric | 5.1 | 33.25 | 30.83 | +4.9% |
+
+Decision: **symmetric INT4, group 32** (no zero point; asymmetric buys nothing at g32). Group scales vary along K, so they
+cannot be applied after accumulation the way INT8's per-channel scale is: `COMPUTE_GEMM` with `DType.INT4W` takes the
+SRAM address of the 16-float scale row in its `dram_addr` field and computes `C += A . (q * scale)`; one scale row is
+loaded per K-group per output tile and shared by `group/16` K-tile GEMMs. B is packed two nibbles per byte and loaded
+with ordinary byte-granular LOADs (16 rows x 8 bytes). Offline: `quant_gptq.py` writes the codes and scales
+(`generate.py --int4-weights file.npz`). Not committed: the 495 MB export.
+
+Measured: weights **275 MB** for the 28 layers (FP32 1761.6; INT8 441.8), 6.4x smaller. Chip vs Hugging Face with the same
+dequantised INT4 weights (`hf_compare.py --ref-int4`): identical tokens on both prompts (the 26-token one through
+`--graph`). INT4 output differs from FP32 ("...Rome is the capital of Italy. The capital" vs "...Italy. Which of"),
+as expected at +4.7% perplexity. Cycles (same 16x1024 @ 1024x3072 matmul, double-buffered): **3,181,252**, equal to BF16
+and 1.5% under FP32; it issues 20% more instructions (scale-row loads) but moves the fewest bytes.
+
 ## 3. Measured
 
 - Weight bytes, full Qwen3-0.6B (28 layers): FP32 1761.6 MB, BF16 880.8 MB, **INT8 441.8 MB** (3.99x).
@@ -56,4 +84,4 @@ differ by 3e-3, so the INT8 path is genuinely exercised). Not measured: accuracy
 
 ## 4. Not done
 
-INT4 / group-wise (needs calibration); BF16 with on-device routed loads. Tracked in `TODO.md` Phase 2b.
+INT4 for MoE experts and INT4/BF16 on the on-device routed path; INT4 perplexity measured on the chip itself (it is measured in PyTorch, and the chip is checked for token identity); AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.

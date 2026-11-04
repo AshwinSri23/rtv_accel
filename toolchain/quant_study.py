@@ -44,6 +44,57 @@ def quantize(w, scheme):
     return (q * scale).reshape(n, k)
 
 
+def gptq(w, H, bits, group, asym=False, damp=0.01, block=128):
+    """GPTQ (Frantar et al.): quantize w[out, in] column by column, pushing each column's
+    rounding error onto the not-yet-quantized columns through the inverse Hessian
+    H = 2 X^T X / n of the layer's calibration inputs. Scales are per (row, group of
+    `group` input columns), fixed from the (error-updated) weights when the group starts."""
+    import torch
+    W = w.clone().double()
+    n, k = W.shape
+    H = H.clone().double()
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    W[:, dead] = 0
+    H += damp * torch.mean(torch.diag(H)) * torch.eye(k, dtype=H.dtype)
+    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
+    Q = torch.zeros_like(W)
+    codes = torch.zeros(n, k, dtype=torch.int8)
+    scales = []
+    qmax = 2 ** (bits - 1) - 1 if not asym else 2 ** bits - 1
+    sc = zp = None
+    for i1 in range(0, k, block):
+        i2 = min(i1 + block, k)
+        W1, Q1, Err1 = W[:, i1:i2].clone(), torch.zeros(n, i2 - i1, dtype=W.dtype), torch.zeros(n, i2 - i1, dtype=W.dtype)
+        Hi = Hinv[i1:i2, i1:i2]
+        for j in range(i2 - i1):
+            c = i1 + j
+            if c % group == 0:                       # new group: fix its scale from current weights
+                g = torch.cat([W1[:, j:], W[:, i2:]], 1)[:, :group] if j + group > i2 - i1 else W1[:, j:j + group]
+                if asym:
+                    lo, hi = g.amin(1, keepdim=True), g.amax(1, keepdim=True)
+                    sc = ((hi - lo) / qmax).clamp_min(1e-12)
+                    zp = torch.round(-lo / sc)
+                else:
+                    sc = (g.abs().amax(1, keepdim=True) / qmax).clamp_min(1e-12)
+                scales.append(sc.float())
+            col = W1[:, j:j + 1]
+            if asym:
+                q = (torch.clamp(torch.round(col / sc) + zp, 0, qmax) - zp) * sc
+            else:
+                ci = torch.clamp(torch.round(col / sc), -qmax - 1, qmax)
+                codes[:, c:c + 1] = ci.to(torch.int8)
+                q = ci * sc
+            Q1[:, j:j + 1] = q
+            err = (col - q) / Hi[j, j]
+            W1[:, j:] -= err @ Hi[j:j + 1, j:]
+            Err1[:, j:j + 1] = err
+        Q[:, i1:i2] = Q1
+        W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+    gptq.last = (codes, torch.cat(scales, 1) if scales else None)   # [n,k] int codes, [n,k/group] scales (symmetric only)
+    return Q.float()
+
+
 def main():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -52,6 +103,9 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--steps", type=int, default=16)
     ap.add_argument("--ppl-tokens", type=int, default=2048)
+    ap.add_argument("--gptq", action="store_true",
+                    help="use GPTQ calibrated rounding for int schemes (needs the wikitext train split)")
+    ap.add_argument("--calib-seqs", type=int, default=32, help="calibration sequences of 512 tokens")
     ap.add_argument("--only", default="", help="regex of weight names to quantize (default: all layer linears)")
     a = ap.parse_args()
     model_dir = a.model or sorted(glob.glob(os.path.expanduser(
@@ -72,6 +126,31 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"(no wikitext: {e})")
     ids_ppl = tok(text, return_tensors="pt").input_ids[:, :a.ppl_tokens] if text else None
+
+    hess = {}
+    if a.gptq:
+        import pandas as pd
+        f = glob.glob(os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-2-raw-v1/train-*.parquet"))[0]
+        cal = tok("\n\n".join(pd.read_parquet(f)["text"].tolist()[:20000]), return_tensors="pt").input_ids
+        mods = dict(model.named_modules())
+        counts = {}
+
+        def mk(name):
+            def hook(_m, inp):
+                x = inp[0].reshape(-1, inp[0].shape[-1]).double()
+                h = hess.setdefault(name, torch.zeros(x.shape[1], x.shape[1], dtype=torch.float64))
+                h += 2 * x.T @ x
+                counts[name] = counts.get(name, 0) + x.shape[0]
+            return hook
+        hs = [mods[n[:-len(".weight")]].register_forward_pre_hook(mk(n)) for n in targets]
+        with torch.no_grad():
+            for i in range(a.calib_seqs):
+                model(cal[:, i * 512:(i + 1) * 512])
+        for h in hs:
+            h.remove()
+        for n in hess:
+            hess[n] /= counts[n]
+        print(f"(collected Hessians for {len(hess)} matrices from {a.calib_seqs}x512 calibration tokens)", flush=True)
 
     def greedy(p):
         ids = tok(p, return_tensors="pt").input_ids
@@ -98,7 +177,11 @@ def main():
         params = dict(model.named_parameters())
         with torch.no_grad():
             for n in targets:
-                params[n].copy_(quantize(orig[n], s))
+                m_ = re.fullmatch(r"int(8|4)g(\d+)(a?)", s)
+                if a.gptq and m_:
+                    params[n].copy_(gptq(orig[n], hess[n], int(m_.group(1)), int(m_.group(2)), bool(m_.group(3))))
+                else:
+                    params[n].copy_(quantize(orig[n], s))
         outs = [greedy(p) for p in prompts]
         if ref is None:
             ref = outs

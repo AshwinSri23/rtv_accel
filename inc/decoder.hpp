@@ -126,6 +126,10 @@ public:
         // multiply), so no scale state lives in the instruction. COMPUTE_GEMM
         // only.
         INT8W = 5,
+        // ISA v1.9 (wire value 6): weight-only INT4, COMPUTE_GEMM only. B is two signed
+        // nibbles per byte; the N FP32 per-column scales for the instruction's K rows are read
+        // from the SRAM address in the (otherwise unused) dram_addr field. C = A . (q * scale).
+        INT4W = 6,
     };
 
     // Bytes per element for a given width.

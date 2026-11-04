@@ -92,6 +92,17 @@ multiply after the GEMM (`tvm_backend._emit_matmul_int8w_fp32`). This keeps ever
 self-describing, with no scale state, so relocation and patching are unaffected. Weight DMA traffic and
 weight SRAM per tile are a quarter of FP32. Scheme and its accuracy cost: `QUANTIZATION.md`.
 
+### **Instruction Bit-Layout — v1.9 (INT4 weights)**
+
+One addition, backward compatible: `dtype` value 6, `INT4W`, valid on `COMPUTE_GEMM` only (rejected elsewhere).
+A is FP32; B is packed two signed 4-bit values per byte, row-major (element `(k, j)` is the low nibble of byte
+`(k*N + j)/2` for even `j`, the high nibble for odd `j`); C and the accumulator are FP32. Unlike INT8W, the
+scale cannot be applied after the accumulation, because INT4 uses one scale per (K-group, output column) and the
+scale changes along K. So the instruction carries the **SRAM address of the N-float scale row** for its K rows
+in the otherwise unused `dram_addr` field, and the hardware computes `C += A . (q * scale[j])`. A group spans
+`group/16` consecutive K-tile GEMMs, which all point at the same scale row. Compiler:
+`tvm_backend._emit_matmul_int4w_fp32`; accuracy and scheme: `QUANTIZATION.md`.
+
 **Dependency tags.** `dep_id` is a 4-bit tag recorded per `LOAD_TILE` and
 cleared by `WAIT_SYNC`. A compiler may rotate tags across loads that are in
 flight at once; the simulator tracks completion per tag. `codegen.py`'s K-loop

@@ -172,7 +172,8 @@ _SESSION_HEADROOM = 256 * 1024 * 1024
 
 
 def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
-            verbose=False, bf16_weights=False, use_graph=False, int8_weights=False):
+            verbose=False, bf16_weights=False, use_graph=False, int8_weights=False,
+             int4_group=0, int4_quant=None):
     """Run the actual decode loop; returns (all_token_ids, decoded_text)."""
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
@@ -200,12 +201,14 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
     comp0 = NPUCompiler(hal)
     comp0.bf16_weights = bf16_weights
     comp0.int8_weights = int8_weights
+    comp0.int4_group = int4_group
     comp0.dtype = DType.FP32
     dram, x_addr, layer_weights, scratch_a, scratch_b, max_tiles = \
         tvm_backend.build_kvcache_model_dram_image(
             comp0, hidden, actual_n_layers, n_kv_heads, head_dim,
             max_seq_len=total_steps, layer_weights_np=layers,
             bf16_weights=bf16_weights, int8_weights=int8_weights,
+            int4_group=int4_group, int4_quant=int4_quant,
         )
     base_dram_cursor = comp0._dram_cursor
     if use_graph:
@@ -261,6 +264,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             comp = NPUCompiler(hal)
             comp.bf16_weights = bf16_weights
             comp.int8_weights = int8_weights
+            comp.int4_group = int4_group
             comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
@@ -313,6 +317,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             comp = NPUCompiler(hal)
             comp.bf16_weights = bf16_weights
             comp.int8_weights = int8_weights
+            comp.int4_group = int4_group
             comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
             comp.dtype = DType.FP32
             comp.instruction_stream = bytearray()
@@ -372,7 +377,23 @@ def main():
     ap.add_argument("--int8-weights", action="store_true",
                     help="store the 7 per-layer weight matrices as INT8 with per-output-channel "
                          "FP32 scales (ISA v1.8 INT8W): a quarter of the weight bytes in DRAM")
+    ap.add_argument("--int4-weights", metavar="NPZ", default=None,
+                    help="INT4 group-scaled weights (ISA v1.9 INT4W) from quant_gptq.py; the group size "
+                         "comes from the file")
+    ap.add_argument("--int4-rtn-group", type=int, default=0, metavar="G",
+                    help="INT4 with plain round-to-nearest, group size G (no calibration; for testing)")
     args = ap.parse_args()
+    int4_kw = {}
+    if args.int4_weights:
+        z = np.load(args.int4_weights)
+        quant = {}
+        for key in z.files:
+            if key.endswith(".q"):
+                li, name = key.split(".")[:2]
+                quant[(int(li), name)] = (z[key], z[key[:-2] + ".s"])
+        int4_kw = dict(int4_group=int(z["group"]), int4_quant=quant)
+    elif args.int4_rtn_group:
+        int4_kw = dict(int4_group=args.int4_rtn_group)
 
     if not os.path.exists(args.sim):
         print(f"error: simulator not found at {args.sim} (build it first)", file=sys.stderr)
@@ -391,7 +412,7 @@ def main():
     ids, text = generate(model_dir, args.prompt, args.steps, n_layers=args.n_layers,
                          sim=args.sim, hal=args.hal, verbose=args.verbose,
                          bf16_weights=args.bf16_weights, use_graph=args.graph,
-                         int8_weights=args.int8_weights)
+                         int8_weights=args.int8_weights, **int4_kw)
     print(f"ids     : {ids}")
     print(f"text    : {text}")
     return 0

@@ -528,6 +528,31 @@ static void test_int8w_gemm() {
     CHECK(c[0] == 2 * (1.5f * 127 + -2.0f * 3));
 }
 
+// ISA v1.9 INT4W: packed signed nibbles, per-column scale row in SRAM.
+static void test_int4w_gemm() {
+    MemoryController mem;
+    PEArray pe;
+    const uint16_t A = 0x0000, B4 = 0x0400, S = 0x0500, C = 0x0800;
+    float* a = reinterpret_cast<float*>(mem.sram_ptr(A));
+    uint8_t* b = mem.sram_ptr(B4);
+    float* sc = reinterpret_cast<float*>(mem.sram_ptr(S));
+    a[0] = 1.5f; a[1] = -2.0f; a[2] = 0.25f; a[3] = 4.0f;      // A is 2x2
+    // B is 2x2 of int4: (0,0)=7 (0,1)=-8 (1,0)=-1 (1,1)=3, packed even j low nibble
+    b[0] = static_cast<uint8_t>((7 & 0xF) | ((-8 & 0xF) << 4));
+    b[1] = static_cast<uint8_t>((-1 & 0xF) | ((3 & 0xF) << 4));
+    sc[0] = 0.5f; sc[1] = 0.125f;
+    pe.compute_gemm(mem, A, B4, C, 2, 2, 2, Decoder::ActivationMode::NONE, false, 0,
+                    Decoder::DType::INT4W, S);
+    const float* c = reinterpret_cast<const float*>(mem.sram_ptr(C));
+    CHECK(c[0] == 1.5f * (7 * 0.5f) + -2.0f * (-1 * 0.5f));
+    CHECK(c[1] == 1.5f * (-8 * 0.125f) + -2.0f * (3 * 0.125f));
+    CHECK(c[2] == 0.25f * (7 * 0.5f) + 4.0f * (-1 * 0.5f));
+    CHECK(c[3] == 0.25f * (-8 * 0.125f) + 4.0f * (3 * 0.125f));
+    pe.compute_gemm(mem, A, B4, C, 2, 2, 2, Decoder::ActivationMode::NONE, true, 0,
+                    Decoder::DType::INT4W, S);
+    CHECK(c[0] == 2 * (1.5f * (7 * 0.5f) + -2.0f * (-1 * 0.5f)));
+}
+
 // FP32: the no-quantisation path. Exists so a lowering bug can be told apart
 // from a quantisation limit -- if this path is correct, every address, tile
 // and accumulation in the compiler is proven independently of any scale.
@@ -613,6 +638,7 @@ int main() {
         {"Fp32Ops",               test_fp32_ops},
         {"Bf16wGemm",             test_bf16w_gemm},
         {"Int8wGemm",             test_int8w_gemm},
+        {"Int4wGemm",             test_int4w_gemm},
         {"GemmOobThrows",         test_gemm_oob_throws},
     };
 

@@ -44,8 +44,45 @@ void PEArray::compute_gemm(MemoryController& mem,
                            Decoder::ActivationMode activation,
                            bool accumulate,
                            uint8_t scale_shift,
-                           Decoder::DType dtype)
+                           Decoder::DType dtype,
+                           uint16_t aux_sram)
 {
+    if (dtype == Decoder::DType::INT4W) {
+        // Weight-only INT4 with per-(group, output column) scales. B is packed two signed
+        // 4-bit values per byte, row-major: element (k, j) is the low nibble of byte
+        // (k*N + j)/2 when j is even, the high nibble when odd. The N FP32 scales for THIS
+        // call's K rows (one K-group, or part of one) sit at aux_sram; the dequantised weight
+        // is q * scale[j]. Group scales vary along K, so they cannot be applied after the
+        // accumulation the way INT8's per-channel scale is.
+        if (N % 2) throw std::invalid_argument("INT4W needs an even N");
+        const uint32_t na = static_cast<uint32_t>(M) * K;
+        const uint32_t nb = (static_cast<uint32_t>(K) * N) / 2;
+        const uint32_t nc = static_cast<uint32_t>(M) * N;
+        check_sram(a_sram, na * 4, "compute_gemm A (fp32)");
+        check_sram(b_sram, nb, "compute_gemm B (int4 packed)");
+        check_sram(aux_sram, static_cast<uint32_t>(N) * 4, "compute_gemm INT4W scale row");
+        check_sram(c_sram, nc * 4, "compute_gemm C (fp32)");
+        const float*   Af = reinterpret_cast<const float*>(mem.sram_ptr(a_sram));
+        const uint8_t* Bp = reinterpret_cast<const uint8_t*>(mem.sram_ptr(b_sram));
+        const float*   Sf = reinterpret_cast<const float*>(mem.sram_ptr(aux_sram));
+        float*         Cf = reinterpret_cast<float*>(mem.sram_ptr(c_sram));
+        if (!accumulate)
+            std::memset(Cf, 0, static_cast<std::size_t>(nc) * sizeof(float));
+        for (uint16_t i = 0; i < M; ++i)
+            for (uint16_t k = 0; k < K; ++k) {
+                const float a = Af[i * K + k];
+                if (a == 0.0f) continue;
+                for (uint16_t j = 0; j < N; ++j) {
+                    const uint32_t idx = static_cast<uint32_t>(k) * N + j;
+                    const uint8_t byte = Bp[idx >> 1];
+                    int q = (idx & 1) ? (byte >> 4) : (byte & 0xF);
+                    if (q >= 8) q -= 16;                       // sign-extend the nibble
+                    Cf[i * N + j] += a * (static_cast<float>(q) * Sf[j]);
+                }
+            }
+        return;
+    }
+
     if (dtype == Decoder::DType::BF16W) {
         // Mixed precision: FP32 activations (A) x BF16 weights (B) -> FP32.
         // BF16 is the top 16 bits of an FP32, so widening is exact.

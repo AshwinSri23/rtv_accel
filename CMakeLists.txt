@@ -133,6 +133,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_dram36              # ISA v1.6: 36-bit LOAD/STORE addressing via dim_k[15:12]
         test_bf16w               # ISA v1.6: FP32 x BF16-weight GEMM (DType.BF16W)
         test_int8w               # ISA v1.8: FP32 x INT8-weight GEMM + per-channel scale (DType.INT8W)
+        test_int4w               # ISA v1.9: FP32 x packed-INT4 GEMM with group scales (DType.INT4W)
         test_persistent_session  # rtv_sim --serve: DRAM resident across programs
         test_moe_ffn             # host-segmented MoE routing on a persistent session
         test_moe_block           # MoE FFN block: RMSNorm + router + shared expert + residual
@@ -144,6 +145,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_prefill_multitile   # prefill of prompts longer than one 16-row tile
         test_bf16_weights_model  # whole model with BF16 weights: numerics, relocation, footprint
         test_int8_weights_model  # whole model with INT8 weights: numerics, relocation, footprint
+        test_int4_weights_model  # whole model with INT4 group-scaled weights: numerics, relocation, footprint
         test_schedule_relocation # compile layers 0-1 for real, relocate the rest -- byte-identical + real sim check
         test_prefill_batching    # a real batch of causal prompt tokens processed in one call, seeding the KV-cache
     )

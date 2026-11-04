@@ -199,6 +199,8 @@ int main(int argc, char* argv[])
             throw std::runtime_error("dtype BF16W is only valid on COMPUTE_GEMM");
         if (d.dtype == Decoder::DType::INT8W)
             throw std::runtime_error("dtype INT8W is only valid on COMPUTE_GEMM");
+        if (d.dtype == Decoder::DType::INT4W)
+            throw std::runtime_error("dtype INT4W is only valid on COMPUTE_GEMM");
     };
     // LOAD/STORE address: 32 low bits from dram_addr, bits 35:32 from dram_hi.
     auto dram_addr36 = [&](const Decoder::DecodedInstruction& d) -> uint64_t {
@@ -311,7 +313,8 @@ int main(int argc, char* argv[])
                         d.activation,
                         d.accumulate,
                         scale_shift,
-                        d.dtype);
+                        d.dtype,
+                        static_cast<uint16_t>(d.dram_addr));   // INT4W scale-row SRAM address
 
         const uint64_t cost = static_cast<uint64_t>(d.dim_m) * d.dim_n;
         sim_clock    += cost;

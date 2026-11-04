@@ -85,10 +85,10 @@ Decoder::DecodedInstruction Decoder::decode(const RawInstruction& raw) {
     d.dim_m       = static_cast<uint8_t>(wire_dim_m & 0xFF);
     d.scale_shift = static_cast<uint8_t>((wire_dim_m >> 8) & 0x1F);
     // bits 14:13 -- 0 decodes as INT8, so a v1/v1.5 word is unchanged.
-    // v1.6: bit 15 extends the dtype field to 3 bits (4 = BF16W, 5 = INT8W). 6-7 are invalid.
+    // v1.6: bit 15 extends the dtype field to 3 bits (4 = BF16W, 5 = INT8W, 6 = INT4W). 7 is invalid.
     {
         const uint8_t dt = static_cast<uint8_t>((wire_dim_m >> 13) & 0x7);
-        if (dt > static_cast<uint8_t>(DType::INT8W))
+        if (dt > static_cast<uint8_t>(DType::INT4W))
             throw std::invalid_argument("decode: invalid dtype " + std::to_string(dt));
         d.dtype = static_cast<DType>(dt);
     }

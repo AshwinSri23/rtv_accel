@@ -44,6 +44,9 @@ def main():
                     help="fake-quantize the HF reference's 7 per-layer weight matrices per output "
                          "channel to INT8 (the chip's --int8-weights scheme), so the comparison "
                          "isolates chip bugs from quantization error")
+    ap.add_argument("--ref-int4", metavar="NPZ", default=None,
+                    help="overwrite the HF reference's 7 per-layer weight matrices with the dequantised "
+                         "INT4 weights from a quant_gptq.py file (the chip's --int4-weights)")
     a = ap.parse_args()
 
     try:
@@ -66,6 +69,20 @@ def main():
                 if _re.search(r"layers\.\d+\.(self_attn\.[qkvo]_proj|mlp\.(gate|up|down)_proj)\.weight", n):
                     sc = (p.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)   # [out,1] = per output channel
                     p.copy_(torch.clamp(torch.round(p / sc), -128, 127) * sc)
+    if a.ref_int4:
+        import numpy as _np
+        z = _np.load(a.ref_int4)
+        g = int(z["group"])
+        names = {"wq": "self_attn.q_proj", "wk": "self_attn.k_proj", "wv": "self_attn.v_proj",
+                 "wo": "self_attn.o_proj", "wgate": "mlp.gate_proj", "wup": "mlp.up_proj",
+                 "wdown": "mlp.down_proj"}
+        params = dict(model.named_parameters())
+        with torch.no_grad():
+            for key in z.files:
+                if key.endswith(".q"):
+                    li, chip = key.split(".")[:2]
+                    deq = z[key].astype(_np.float32) * _np.repeat(z[key[:-2] + ".s"], g, axis=0)  # [K, N]
+                    params[f"model.layers.{li}.{names[chip]}.weight"].copy_(torch.from_numpy(deq.T.copy()))
     ids = tok(a.prompt, return_tensors="pt").input_ids
     with torch.no_grad():
         hf_ids = model.generate(ids, max_new_tokens=a.steps, do_sample=False)[0].tolist()
