@@ -173,8 +173,12 @@ _SESSION_HEADROOM = 256 * 1024 * 1024
 
 def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             verbose=False, bf16_weights=False, use_graph=False, int8_weights=False,
-             int4_group=0, int4_quant=None):
-    """Run the actual decode loop; returns (all_token_ids, decoded_text)."""
+             int4_group=0, int4_quant=None, prompt_ids=None, prefill_hook=None):
+    """Run the actual decode loop; returns (all_token_ids, decoded_text).
+
+    prompt_ids: use these token ids instead of tokenizing `prompt`. prefill_hook(tile, rows):
+    called after every prefill tile with that tile's final hidden rows (n_real, hidden) --
+    chip_ppl.py scores every prompt position with it."""
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
 
@@ -185,7 +189,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
     rope_theta, eps = cfg["rope_theta"], cfg["rms_norm_eps"]
     actual_n_layers = len(layers)
 
-    prompt_ids = tok.encode(prompt).ids
+    prompt_ids = list(prompt_ids) if prompt_ids is not None else tok.encode(prompt).ids
     if not prompt_ids:
         raise ValueError("empty prompt tokenizes to zero tokens")
     P = len(prompt_ids)
@@ -294,6 +298,8 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             (out_raw,) = session.run_step(
                 comp, extra_dumps=[(final_addr, M * hidden * 4, "out")])
             batch_out = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)
+            if prefill_hook is not None:
+                prefill_hook(c, batch_out[:n_real].copy())
 
         if total_steps >= n_batch:
             # The last tile's last real row is exactly what a decode step at

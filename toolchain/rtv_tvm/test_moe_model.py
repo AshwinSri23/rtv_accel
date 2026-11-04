@@ -6,7 +6,7 @@ Runs hf-internal-testing/tiny-random-Qwen3MoeForCausalLM (a real
 Qwen3MoeForCausalLM: 2 layers, 4 experts, top-2, norm_topk_prob, q_norm/k_norm,
 GQA) through toolchain/moe_model.py (host-segmented routing on a persistent
 rtv_sim session) and compares with the recorded Hugging Face reference in
-fixtures/moe_tiny_hf_reference.json (and moe_tiny_int8_hf_reference.json for --int8-weights): the generated token ids AND the top-5 logits at
+fixtures/moe_tiny_hf_reference.json (and moe_tiny_int8_/int4_hf_reference.json for --int8-weights / --int4-rtn-group 16): the generated token ids AND the top-5 logits at
 every step (the model's logits are nearly tied, so this is a tight check).
 
 Skips (exit 0) when the checkpoint is not in the local Hugging Face cache:
@@ -34,7 +34,8 @@ def main():
         return 0
     results = []
     for tag, fname, kw in (("", "moe_tiny_hf_reference.json", {}),
-                           ("int8_", "moe_tiny_int8_hf_reference.json", {"int8_weights": True})):
+                           ("int8_", "moe_tiny_int8_hf_reference.json", {"int8_weights": True}),
+                           ("int4_", "moe_tiny_int4_hf_reference.json", {"int4_group": 16})):
         ref = json.load(open(os.path.join(_HERE, "fixtures", fname)))
         prompt = ref["prompt"]
         n_new = len(ref["steps"])

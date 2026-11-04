@@ -127,8 +127,8 @@ outlier or calibration issue) and is done. Details and numbers: `QUANTIZATION.md
 - [x] Compiler: `compiler.int8_weights`, `quantize_int8_per_channel`, `_emit_matmul_int8w_fp32`, DRAM image builder, relocation role sizes.
 - [x] `generate.py --int8-weights`; `hf_compare.py --ref-int8`. Full 28-layer chip == HF-with-the-same-INT8-weights on both prompts (the second through `--graph`, two-tile prefill).
 - [x] INT4 group-scaled weights with GPTQ calibration: `quant_study.py --gptq` (symmetric g32: +4.7% perplexity; plain rounding was +19%), `quant_gptq.py` export, ISA v1.9 `DType.INT4W`, `_emit_matmul_int4w_fp32`, `generate.py --int4-weights`, `hf_compare.py --ref-int4`. Full 28-layer chip == HF with the same INT4 weights on both prompts (second through `--graph`). Weights 275 MB (6.4x smaller than FP32).
-- [ ] INT4 for MoE experts and BF16/INT4 with on-device (indirect) routing: INT4 raises NotImplementedError on the indirect path; host-segmented MoE should work through the same dispatch but is untested.
-- [ ] Perplexity of the INT4 model is measured in PyTorch only (`quant_study.py`); the chip is validated by token identity against HF with identical weights.
+- [x] INT4 and BF16 for MoE experts in both routing modes (indirect path now supports them): `test_moe_quant`, `test_moe_model` INT4 case vs `make_moe_int4_fixture.py` reference.
+- [x] INT4 perplexity on the chip: `chip_ppl.py`, 64 tokens, chip 45.5234 vs PyTorch 45.5214 (max per-token |dNLL| 1.1e-4). Longer runs are slow (~7 min per 64 tokens) and were not done.
 - [x] INT8 MoE experts, both routing modes (`test_moe_int8`: host-segmented top-2 and on-device top-1, where the INDIRECT_ADDR loads fetch the INT8 weights AND their scale row); whole tiny Qwen3-MoE on INT8 attention + experts matches an INT8-fake-quantized Hugging Face reference (`test_moe_model`, `moe_model.py --int8-weights`, fixture from `make_moe_int8_fixture.py`). Expert 3.98x smaller. BF16 + on-device routing is still not built.
 - [x] Dequant scale applied in SRAM before the store (no DRAM round trip of C): INT8 matmul cost vs FP32 down from +3.1% to +0.6% cycles.
 

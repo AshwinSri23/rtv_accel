@@ -82,6 +82,22 @@ stream picking all 4 experts on-device; expert 9.44 MB -> 2.37 MB) and `test_moe
 attention + experts vs an INT8-fake-quantized Hugging Face reference, logits within 2e-7; the INT8 and FP32 references
 differ by 3e-3, so the INT8 path is genuinely exercised). Not measured: accuracy of INT8 on a *real* trained MoE.
 
+BF16 and INT4 experts work the same way, in both routing modes. The indirect (on-device routed) path now covers
+`_emit_matmul_bf16w_fp32` and `_emit_matmul_int4w_fp32` through `indirect_b=`; for INT4 the offset applies to the packed
+weight loads and to every scale-row load, so an expert's blob (packed nibbles, then scale rows) sits at the routing
+stride. Tests: `test_moe_quant` (4 cases, errors ~1e-7 vs numpy on dequantised weights; one stream picks all 4 experts)
+and `test_moe_model`'s INT4 case (tiny Qwen3-MoE, INT4 g16 round-to-nearest attention + experts vs
+`make_moe_int4_fixture.py`'s Hugging Face reference, top-5 logits within 3.6e-7, tokens differ from FP32 and INT8).
+
+## 3c. Perplexity on the chip
+
+`chip_ppl.py` scores WikiText-2 test tokens through the chip's graph-driven prefill (every 16-row tile's final hidden
+rows via `generate(..., prefill_hook=)`, then the trailing norm and lm_head on the host) and through Hugging Face with the
+same dequantised weights. INT4 g32 GPTQ, first 64 tokens: chip ppl 45.5234, PyTorch 45.5214, max per-token |dNLL|
+1.1e-4. So the chip computes the model the study measured. The absolute number is for 63 tokens and is not comparable to
+the 2048-token study figures (29.39 FP32 / 30.77 INT4); a 64-token run takes ~7 minutes on the simulator, so the full
+2048 tokens was not run.
+
 ## 4. Not done
 
-INT4 for MoE experts and INT4/BF16 on the on-device routed path; INT4 perplexity measured on the chip itself (it is measured in PyTorch, and the chip is checked for token identity); AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.
+INT4 on a real trained MoE (only the tiny random one is tested); chip perplexity beyond 64 tokens (slow); AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.

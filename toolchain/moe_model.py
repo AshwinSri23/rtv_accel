@@ -91,7 +91,7 @@ def load_moe_checkpoint(model_dir):
 
 
 def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=None,
-                 int8_weights=False):
+                 int8_weights=False, int4_group=0):
     """Greedy-generate n_new tokens. Returns (all_ids, per_step) where per_step[i] is the
     (top5_ids, top5_logits) at the position that produced generated token i."""
     cfg, layers, embed, lm_head, final_norm = load_moe_checkpoint(model_dir)
@@ -122,14 +122,19 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
     comp0.dtype = DType.FP32
     dram, x_addr, lws, _sa, _sb, _ = tvm_backend.build_kvcache_model_dram_image(
         comp0, hidden, n_layers, n_kv, head_dim, max_seq_len=total,
-        layer_weights_np=builder_layers, int8_weights=int8_weights)
+        layer_weights_np=builder_layers, int8_weights=int8_weights,
+        int4_group=int4_group)
     cursor = [(comp0._dram_cursor + 0xFFF) & ~0xFFF]
     extra = []
 
     def place(arr, quant=False):
         # quant: store an expert matrix as INT8 bytes + FP32 per-channel scales (ISA v1.8)
-        arr = tvm_backend.int8_weight_blob(arr) if (quant and int8_weights) else \
-            np.ascontiguousarray(arr, dtype=np.float32)
+        if quant and int4_group:
+            arr = tvm_backend.int4_weight_blob(*tvm_backend.quantize_int4_group(arr, int4_group))
+        elif quant and int8_weights:
+            arr = tvm_backend.int8_weight_blob(arr)
+        else:
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
         a = cursor[0]
         cursor[0] += (arr.nbytes + 0xFFF) & ~0xFFF
         extra.append((a, arr))
@@ -158,6 +163,7 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
         c._dram_cursor = staging_base
         c.rms_eps = eps
         c.int8_weights = int8_weights
+        c.int4_group = int4_group
         return c
 
     def norm(c, src, gamma, dst):
@@ -251,9 +257,13 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--int8-weights", action="store_true",
                     help="attention and expert weights as INT8 + per-channel scales (ISA v1.8)")
+    ap.add_argument("--int4-rtn-group", type=int, default=0,
+                    help="attention and expert weights as round-to-nearest INT4, scale per K-group "
+                         "of this size (ISA v1.9); a multiple of 16")
     a = ap.parse_args()
     ids, steps = generate_moe(a.model, [int(x) for x in a.prompt_ids.split(",")], a.steps,
-                              a.sim, a.hal, a.verbose, int8_weights=a.int8_weights)
+                              a.sim, a.hal, a.verbose, int8_weights=a.int8_weights,
+                              int4_group=a.int4_rtn_group)
     print("ids     :", ids)
     for i, (ti, tl) in enumerate(steps):
         print(f"  step {i}: top5 {ti}  logits {[round(v, 4) for v in tl]}")

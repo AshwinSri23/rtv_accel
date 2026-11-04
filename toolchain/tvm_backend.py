@@ -566,10 +566,11 @@ def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
     ptr = getattr(compiler, "indirect_weights_scalar", None)
     if ptr is not None:
         if getattr(compiler, "bf16_weights", False):
-            raise NotImplementedError("indirect (on-device routed) BF16 weights are not built")
-        if getattr(compiler, "int4_group", 0):
-            raise NotImplementedError("indirect (on-device routed) INT4 weights are not built")
-        if getattr(compiler, "int8_weights", False):
+            _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
+        elif getattr(compiler, "int4_group", 0):
+            _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr,
+                                    compiler.int4_group, indirect_b=ptr)
+        elif getattr(compiler, "int8_weights", False):
             _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
         else:
             _emit_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)
@@ -608,8 +609,17 @@ def from_bf16_bits(h):
     return (np.asarray(h, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
 
 
+def _indirect_fields(indirect_b):
+    """INDIRECT_ADDR encoding fields (ISA v1.7) for a LOAD_TILE whose DRAM address is offset by
+    the uint32 at SRAM address `indirect_b`; {} when not routed."""
+    if indirect_b is None:
+        return {}
+    return dict(activation=int(ActivationMode.INDIRECT_ADDR), dim_k=indirect_b & 0xFF,
+                c_slot=(indirect_b >> 8) & 0xF, dram_hi=(indirect_b >> 12) & 0xF)
+
+
 def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=None,
-                            depth=3):
+                            depth=3, indirect_b=None):
     """C(M,N) = A(M,K) fp32 @ B(K,N) bf16 -> fp32, with the weight matrix B
     stored as BF16 in DRAM (2 bytes/element: half the weight DMA traffic and
     half the weight SRAM per tile). Uses ISA v1.6's DType.BF16W COMPUTE_GEMM.
@@ -622,7 +632,9 @@ def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
 
     M must be <= compiler.tile_dim; N and K multiples of tile_dim. a_stride is
     A's row pitch in elements (default K); B and C are tightly packed.
+    indirect_b: SRAM address of a uint32 byte offset added to every B load (on-device MoE routing).
     """
+    ind = _indirect_fields(indirect_b)
     T = compiler.tile_dim
     if M > T or N % T or K % T:
         raise NotImplementedError(
@@ -647,7 +659,7 @@ def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
              dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
              dram_addr=b_addr + (kn * T * N + jn * T) * 2, sram_addr=b_slots[i % depth],
-             dim_m=T, dim_n=T * 2, stride=N * 2, dtype=int(DType.FP32))
+             dim_m=T, dim_n=T * 2, stride=N * 2, dtype=int(DType.FP32), **ind)
 
     for i in range(min(depth - 1, len(steps))):
         load(i)
@@ -788,7 +800,7 @@ def int4_dequant(q, scales, group):
 
 
 def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32, a_stride=None,
-                            depth=3):
+                            depth=3, indirect_b=None):
     """C(M,N) = A(M,K) fp32 @ dequant(B(K,N) int4) -> fp32 (ISA v1.9 INT4W).
 
     B is int4_weight_blob(): packed nibbles then (K/group, N) scale rows at
@@ -797,7 +809,11 @@ def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32,
     row for its K tile (dram_addr field), and the hardware multiplies q by it. One scale
     row is loaded per group per output tile (shared by group/16 consecutive K tiles).
     Same prefetch loop shape as the BF16/INT8 emitters; scale rows rotate over 4 SRAM slots
-    and tags 4-7 (A: 8-11, B: 12-15 are the operand tags)."""
+    and tags 4-7 (A: 8-11, B: 12-15 are the operand tags).
+
+    indirect_b: SRAM address of a uint32 byte offset added to the packed-weight loads AND the
+    scale-row loads (on-device MoE routing; the whole blob sits at the routing stride)."""
+    ind = _indirect_fields(indirect_b)
     T = compiler.tile_dim
     if M > T or N % T or K % T or group % T or K % group:
         raise NotImplementedError(
@@ -828,13 +844,13 @@ def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32,
              dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
              dram_addr=b_addr + kn * T * (N // 2) + jn * (T // 2), sram_addr=b_slots[i % depth],
-             dim_m=T, dim_n=T // 2, stride=N // 2, dtype=int(DType.FP32))
+             dim_m=T, dim_n=T // 2, stride=N // 2, dtype=int(DType.FP32), **ind)
         if kn % kpg == 0:             # first K tile of a group: bring in its scale row
             g = gidx(jn, kn)
             emit(opcode=Opcode.LOAD_TILE, dep_id=4 + g % 4,
                  dram_addr=scale_base + ((kn // kpg) * N + jn * T) * 4,
                  sram_addr=scale_slots[g % 4], dim_m=1, dim_n=T * 4, stride=T * 4,
-                 dtype=int(DType.FP32))
+                 dtype=int(DType.FP32), **ind)
 
     for i in range(min(depth - 1, len(steps))):
         load(i)
