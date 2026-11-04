@@ -227,67 +227,69 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
     # than M tokens still starts with one such batch for its first M
     # tokens; the remaining prompt tokens fall through to the ordinary
     # one-at-a-time loop below, unchanged.
-    n_batch = min(P, M)
+    # The whole prompt is prefilled in tiles of M=16: tile c holds prompt
+    # positions 16c..16c+15 and attends to every earlier tile's cached K/V
+    # (tile_idx=c), so any prompt length goes through the batched path.
+    n_tiles = -(-P // M)
+    n_batch = P
+    # Real attention scores are q.k / sqrt(head_dim). The chip's softmax has no
+    # such step, so it is applied to Q (mathematically identical). Without it
+    # the output is not Qwen3's: found by comparing against Hugging Face.
+    attn_scale = float(head_dim) ** -0.5
 
     all_ids = list(prompt_ids)
     next_input_id = None
     with tempfile.TemporaryDirectory(prefix="rtv_generate_state_") as wd:
-        # ONE state file, overwritten in place every step -- not a fresh
-        # step_N.img per step. Safe because rtv_sim fully reads --dram-image
-        # into its own in-memory buffer (and closes the file) BEFORE it
-        # writes any --dump output, so the same path can be both input and
-        # output. This matters at real scale: Qwen3-0.6B's DRAM image is
-        # ~1.7+ GB, and a fresh copy per step exhausted a 16 GB tmpfs /tmp
-        # by step 5 of a real run (confirmed directly hitting this) --
-        # accumulating one such file per generated token doesn't stay
-        # small just because test_decode_loop.py's tiny random-weight
-        # configs never grew large enough to reveal it.
+        # The DRAM image (weights + KV-cache) is written once and loaded into
+        # ONE persistent rtv_sim session (see _SimSession): it stays resident
+        # for every prefill tile and decode step.
         cur_path = os.path.join(wd, "state.img")
         open(cur_path, "wb").write(bytes(dram))
         session = None
+        batch_out = None
+        n_real = 0
 
-        comp = NPUCompiler(hal)
-        comp.dtype = DType.FP32
-        comp.instruction_stream = bytearray()
-        comp._dram_cursor = base_dram_cursor
-        x_batch = np.zeros((M, hidden), dtype=np.float32)
-        for r in range(n_batch):
-            x_batch[r, :] = embed_tokens[prompt_ids[r]].astype(np.float32)
-        comp._const_regions[x_addr] = x_batch.tobytes()
+        for c in range(n_tiles):
+            n_real = min(M, P - c * M)
+            comp = NPUCompiler(hal)
+            comp.dtype = DType.FP32
+            comp.instruction_stream = bytearray()
+            comp._dram_cursor = base_dram_cursor
+            x_batch = np.zeros((M, hidden), dtype=np.float32)
+            for r in range(n_real):
+                x_batch[r, :] = embed_tokens[prompt_ids[c * M + r]].astype(np.float32)
+            comp._const_regions[x_addr] = x_batch.tobytes()
 
-        final_addr = tvm_backend._emit_model_kvcache_batched_fp32(
-            comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
-            x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
-            scratch_b=scratch_b, n_real=n_batch, rope_theta=rope_theta,
-        )
-        session = _SimSession(
-            sim, hal, cur_path,
-            max(comp.dram_bytes_needed, len(dram)) + _SESSION_HEADROOM, wd)
-        (out_raw,) = session.run_step(
-            comp, extra_dumps=[(final_addr, M * hidden * 4, "out")])
-        batch_out = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)
+            final_addr = tvm_backend._emit_model_kvcache_batched_fp32(
+                comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
+                x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
+                scratch_b=scratch_b, n_real=n_real, rope_theta=rope_theta,
+                tile_idx=c, attn_scale=attn_scale,
+            )
+            if session is None:
+                session = _SimSession(
+                    sim, hal, cur_path,
+                    max(comp.dram_bytes_needed, len(dram)) + _SESSION_HEADROOM, wd)
+            (out_raw,) = session.run_step(
+                comp, extra_dumps=[(final_addr, M * hidden * 4, "out")])
+            batch_out = np.frombuffer(out_raw, dtype=np.float32).reshape(M, hidden)
 
-        if n_batch == P and total_steps >= n_batch:
-            # The whole prompt fit in the one batch -- its own last real
-            # row's output is exactly what a decode step at pos=P-1 would
-            # have produced, so sample the first new token from it now
+        if total_steps >= n_batch:
+            # The last tile's last real row is exactly what a decode step at
+            # pos=P-1 would produce, so sample the first new token from it now
             # instead of running that position again one-at-a-time.
-            next_input_id = _sample(batch_out[n_batch - 1])
+            next_input_id = _sample(batch_out[n_real - 1])
             all_ids.append(next_input_id)
             if verbose:
                 piece = tok.decode([next_input_id])
                 print(f"  step {n_batch - 1}: token {next_input_id}  {piece!r}",
                      file=sys.stderr)
 
-        # Continue one token at a time -- remaining prompt tokens (if the
-        # prompt was longer than one batch) and every generated token --
-        # via the schedule-RELOCATED path: layers 0-1 compile for real
-        # once, every later layer is a cheap address patch instead of a
-        # fresh TVM schedule/codegen pass (~7x faster per step at
-        # Qwen3-0.6B's real 28-layer scale -- see TODO.md's entry for
-        # _emit_model_kvcache_fp32_relocated). Produces the identical
-        # instruction stream _emit_model_kvcache_fp32 would, just faster
-        # to compile.
+        # Continue one token at a time -- every generated token -- via the
+        # schedule-RELOCATED path: layers 0-1 compile for real once, every
+        # later layer is a cheap address patch instead of a fresh TVM
+        # schedule/codegen pass (~7x faster per step at Qwen3-0.6B's real
+        # 28-layer scale; see _emit_model_kvcache_fp32_relocated).
         for pos in range(n_batch, total_steps):
             token_id = prompt_ids[pos] if pos < P else next_input_id
 
@@ -304,6 +306,7 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
                 comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
                 x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
                 scratch_b=scratch_b, pos=pos, rope_theta=rope_theta,
+                attn_scale=attn_scale,
             )
 
             (out_raw,) = session.run_step(

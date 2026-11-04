@@ -16,11 +16,14 @@ layer only registers itself when `.venv-tvm/` exists (`cmake` prints
 `TVM path tests skipped: .venv-tvm not present` otherwise) — a checkout
 without that venv still configures and builds cleanly, it just doesn't
 get compiler coverage. As of 2026-11-04: 3 C++ tests + 22 TVM-path
-tests = 25 total, all passing. (Newer than the numbered tour below:
+tests = 27 total, all passing. (Newer than the numbered tour below:
 `test_schedule_relocation`, `test_prefill_batching`, `test_const_memoization`,
 `test_swiglu_resident`, `test_dram36` (ISA v1.6 36-bit addresses),
-`test_bf16w` (ISA v1.6 BF16 weights), `test_persistent_session`
-(`rtv_sim --serve`).)
+`test_bf16w` (ISA v1.6 BF16 weights + the compiler's BF16-weight matmul),
+`test_persistent_session` (`rtv_sim --serve`), `test_moe_ffn` (host-segmented MoE
+routing), `test_prefill_multitile` (prompts past one tile, incl. attention scale).
+There is no automated test against Hugging Face: that comparison needs PyTorch, which
+is not a project dependency; its result is recorded in `TODO.md` 5.5.)
 
 Any individual TVM-path file is also directly runnable without `ctest`,
 which is faster when iterating on one thing:

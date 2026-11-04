@@ -102,7 +102,8 @@ def _make_model(hidden, inter, n_heads, n_kv_heads, head_dim, n_layers, seed):
     return layers_np, rng
 
 
-def _reference_all_steps(layers_np, token_rows, n_heads, n_kv_heads, head_dim):
+def _reference_all_steps(layers_np, token_rows, n_heads, n_kv_heads, head_dim,
+                         attn_scale=None):
     """Genuine incremental numpy reference over the WHOLE sequence, one
     token at a time, causal, real growing KV-cache -- same shape as
     test_decode_loop.py's own reference. This is the ground truth both
@@ -131,6 +132,8 @@ def _reference_all_steps(layers_np, token_rows, n_heads, n_kv_heads, head_dim):
                 K = np.stack(k_cache_ref[li][kv_h])
                 V = np.stack(v_cache_ref[li][kv_h])
                 sc = q[qh] @ K.T
+                if attn_scale is not None:
+                    sc = sc * attn_scale     # real attention: q.k / sqrt(head_dim)
                 e = np.exp(sc - sc.max())
                 p = e / e.sum()
                 ctx[qh] = p @ V

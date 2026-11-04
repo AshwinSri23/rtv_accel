@@ -429,6 +429,122 @@ def _emit_matmul_fp32(compiler, M, N, K, a_addr, b_addr, c_addr,
                  dtype=DType.FP32, kind="gemm")
 
 
+def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, out_addr):
+    """Mixture-of-experts FFN for ONE token whose routing is already decided:
+    out = sum_j route_weights[j] * SwiGLU_{experts[j]}(x).
+
+    `experts` is a list of dicts of DRAM addresses
+    {"w_gate", "w_up", "w_down"} for the SELECTED experts only, and
+    `route_weights` the matching floats. The ISA has no data-dependent
+    addressing, so which experts run is resolved on the HOST between two
+    device programs (router logits -> host softmax/top-k -> this program, see
+    test_moe_ffn.py); this function just bakes the chosen experts' addresses in
+    as literals. x is the usual (16, hidden) "row 0 real" tile.
+    """
+    M = compiler.tile_dim
+    if len(experts) != len(route_weights) or not experts:
+        raise ValueError("need one route weight per selected expert (and at least one)")
+    acc = None
+    for j, (ex, w) in enumerate(zip(experts, route_weights)):
+        y = compiler.alloc_staging(M * hidden * 4)
+        _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, ex["w_gate"],
+                              ex["w_up"], ex["w_down"], y)
+        # The route weight is a runtime value (it depends on the router), so it
+        # enters as a constant tile in this program's own DRAM constants.
+        wt = compiler.alloc_staging(M * hidden * 4)
+        compiler._const_regions[wt] = np.full((M, hidden), w, dtype=np.float32).tobytes()
+        scaled = compiler.alloc_staging(M * hidden * 4)
+        _emit_mul_fp32(compiler, y, wt, scaled, hidden)
+        if acc is None:
+            acc = scaled
+        else:
+            nxt = compiler.alloc_staging(M * hidden * 4)
+            _emit_residual_add_fp32(compiler, acc, scaled, nxt, hidden)
+            acc = nxt
+    _emit_copy_slice_fp32(compiler, acc, out_addr, hidden, width=hidden)
+
+
+def _emit_scale_fp32(compiler, in_addr, width, scale):
+    """Return the address of `in * scale` for a (16, width) FP32 tile (a fresh
+    buffer; `in` is untouched). `scale` is an exact FP32 constant, applied as an
+    elementwise multiply by a constant tile. Used for attention's 1/sqrt(head_dim):
+    scaling Q is mathematically identical to scaling the scores."""
+    M = compiler.tile_dim
+    tile = _get_or_build_const(compiler, ("scale_tile", width, float(scale)), M * width * 4,
+                               lambda: np.full((M, width), scale, dtype=np.float32))
+    out = compiler.alloc_staging(M * width * 4)
+    _emit_mul_fp32(compiler, in_addr, tile, out, width)
+    return out
+
+
+def to_bf16_bits(x):
+    """FP32 array -> BF16 bit patterns (uint16), round-to-nearest-even.
+    NaN/inf are not special-cased (weights are finite)."""
+    b = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    return ((b + 0x7FFF + ((b >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+def from_bf16_bits(h):
+    """Inverse of to_bf16_bits (exact: BF16 is the top half of an FP32)."""
+    return (np.asarray(h, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=None,
+                            depth=3):
+    """C(M,N) = A(M,K) fp32 @ B(K,N) bf16 -> fp32, with the weight matrix B
+    stored as BF16 in DRAM (2 bytes/element: half the weight DMA traffic and
+    half the weight SRAM per tile). Uses ISA v1.6's DType.BF16W COMPUTE_GEMM.
+
+    Hand-driven rather than scheduled through TVM (TVM buffers here are all
+    float32; a BF16 buffer dtype through intrin/schedule/codegen is the bigger
+    refactor). Same shape of loop as codegen's _gemm_k_loop: for each 16-wide
+    output column tile, accumulate over K tiles, with `depth`-deep prefetch
+    over rotating dep tags (A: 8.., B: 12..) and then one STORE per output tile.
+
+    M must be <= compiler.tile_dim; N and K multiples of tile_dim. a_stride is
+    A's row pitch in elements (default K); B and C are tightly packed.
+    """
+    T = compiler.tile_dim
+    if M > T or N % T or K % T:
+        raise NotImplementedError(
+            f"_emit_matmul_bf16w_fp32 needs M <= {T} and N, K multiples of {T}; "
+            f"got M={M} N={N} K={K}")
+    depth = max(2, min(depth, codegen.MAX_PIPE_DEPTH))
+    a_pitch = (a_stride if a_stride is not None else K) * 4
+    kt, nt = K // T, N // T
+    a_slots = [SRAMMap.input_slot(i, 4) for i in range(depth)]
+    b_slots = [SRAMMap.weight_slot(i, 4) for i in range(depth)]
+    c_slot = SRAMMap.output_slot(0)
+    steps = [(jn, kn) for jn in range(nt) for kn in range(kt)]
+    out = compiler.instruction_stream
+
+    def emit(**kw):
+        out.extend(to_bytes(encode(**kw)))
+
+    def load(i):
+        jn, kn = steps[i]
+        emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + i % depth,
+             dram_addr=a_addr + kn * T * 4, sram_addr=a_slots[i % depth],
+             dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
+        emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
+             dram_addr=b_addr + (kn * T * N + jn * T) * 2, sram_addr=b_slots[i % depth],
+             dim_m=T, dim_n=T * 2, stride=N * 2, dtype=int(DType.FP32))
+
+    for i in range(min(depth - 1, len(steps))):
+        load(i)
+    for i, (jn, kn) in enumerate(steps):
+        if i + depth - 1 < len(steps):
+            load(i + depth - 1)
+        emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_A_BASE + i % depth)
+        emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_B_BASE + i % depth)
+        emit(opcode=Opcode.COMPUTE_GEMM, dep_id=1, sram_addr=a_slots[i % depth],
+             stride=b_slots[i % depth], dim_m=T, dim_n=T, dim_k=T,
+             accumulate=(kn > 0), c_slot=0, dtype=int(DType.BF16W))
+        if kn == kt - 1:
+            emit(opcode=Opcode.STORE_TILE, dram_addr=c_addr + jn * T * 4, sram_addr=c_slot,
+                 dim_m=T, dim_n=T * 4, stride=N * 4, dtype=int(DType.FP32))
+
+
 def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,
                           w_up_addr, w_down_addr, out_addr):
     """SwiGLU FFN entirely via TVM schedule+codegen -- npu_compiler.py's
@@ -864,17 +980,16 @@ def _emit_softmax_rows_fp32(compiler, tile_addr, n_rows, width):
     keeps each row's REDUCE accumulate-state independent (row 2's max
     must not accumulate onto row 1's).
 
-    Scoped to width == compiler.tile_dim (one column tile, e.g.
-    seq_k == tile_dim) -- exactly what Fp32AttentionCase needs; a real
-    seq_k > tile_dim batched softmax would additionally need each row's
-    reduction to loop column-tiles with REDUCE's accumulate flag, which
-    this doesn't attempt.
+    width may be any multiple of compiler.tile_dim up to 1024: a row is ONE
+    LOAD_TILE of `width` floats, and REDUCE/SCALAR_ALU already operate over a
+    whole dim_m x dim_n region, so a multi-tile row needs no accumulate loop,
+    just dim_n = width. (1024 floats = the four wide input SRAM slots.)
     """
     M = compiler.tile_dim
-    if width != M:
+    if width % M != 0 or width > 1024:
         raise NotImplementedError(
-            f"_emit_softmax_rows_fp32 needs width == compiler.tile_dim "
-            f"({M}); got {width}"
+            f"_emit_softmax_rows_fp32 needs width a multiple of "
+            f"compiler.tile_dim ({M}) and <= 1024; got {width}"
         )
     w = DType.BYTES[DType.FP32]
     row_slot = SRAMMap.input_slot(0, w)
@@ -885,17 +1000,18 @@ def _emit_softmax_rows_fp32(compiler, tile_addr, n_rows, width):
         row_addr = tile_addr + r * width * w
         cg = codegen.Codegen(compiler, {}, dtype=DType.FP32, kind="elemwise")
         cg.dim_m = 1
+        cg.dim_n = width
         cg.slot["A"] = row_slot
         cg._emit_word(encode(opcode=Opcode.LOAD_TILE, dep_id=codegen.DEP.get("A", 3),
                              dram_addr=row_addr, sram_addr=row_slot,
-                             dim_m=1, dim_n=M * w, stride=width * w,
+                             dim_m=1, dim_n=width * w, stride=width * w,
                              dtype=int(DType.FP32)))
         cg._reduce(ActivationMode.REDUCE_MAX, scalar_addr=max_scalar)
         cg._tile_scalar(ActivationMode.EXP_SUB, scalar_addr=max_scalar)
         cg._reduce(ActivationMode.NONE, scalar_addr=sum_scalar)
         cg._tile_scalar(ActivationMode.SCALAR_DIV, scalar_addr=sum_scalar)
         cg._emit_word(encode(opcode=Opcode.STORE_TILE, dram_addr=row_addr,
-                             sram_addr=row_slot, dim_m=1, dim_n=M * w,
+                             sram_addr=row_slot, dim_m=1, dim_n=width * w,
                              stride=width * w, dtype=int(DType.FP32)))
 
 
@@ -1024,9 +1140,9 @@ def _emit_attention_core_batched_fp32(compiler, seq_k, head_dim, q_addr, k_addr,
     same as everywhere else GEMM-tiled.
     """
     M = compiler.tile_dim
-    if seq_k != M:
+    if seq_k % M != 0:
         raise NotImplementedError(
-            f"_emit_attention_core_batched_fp32 needs seq_k == "
+            f"_emit_attention_core_batched_fp32 needs seq_k a multiple of "
             f"compiler.tile_dim ({M}); got seq_k={seq_k}"
         )
     if head_dim % M != 0:
@@ -1103,8 +1219,10 @@ def _emit_gqa_attention_fp32(compiler, n_heads, n_kv_heads, seq_k, head_dim,
     unchanged: one real query row per head (replicated across the 16-row
     tile, not a genuine multi-row batch -- that needs codegen.py's dim_m=1
     generalization, same blocker as RMSNorm's per-row dispatch), and no
-    1/sqrt(head_dim) scaling (assumed applied upstream if a real graph
-    needs it).
+    1/sqrt(head_dim) scaling: the cores have no scale step, so a real model must
+    pass `attn_scale` to the attention BLOCKS (kvcache decode / batched prefill),
+    which scale Q by an exact constant. (An older note here said it was "assumed applied
+    upstream"; it never was, and the Hugging Face comparison caught that).
     """
     if n_heads % n_kv_heads != 0:
         raise ValueError(f"n_heads={n_heads} must be a multiple of "
@@ -1457,7 +1575,7 @@ def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len):
                                M * seq_k * 4, _build)
 
 
-def _emit_causal_mask_fp32(compiler, n_real):
+def _emit_causal_mask_fp32(compiler, n_real, tile_idx=0):
     """Build (and register as a compile-time constant) an additive
     (16, 16) causal mask for a genuine batch of n_real real, distinct
     tokens sharing one tile: mask[i, j] = 0.0 when row i may attend to
@@ -1487,15 +1605,22 @@ def _emit_causal_mask_fp32(compiler, n_real):
     M = compiler.tile_dim
     if not (0 < n_real <= M):
         raise ValueError(f"n_real must be in (0, {M}]; got {n_real}")
+    if tile_idx < 0:
+        raise ValueError(f"tile_idx must be >= 0; got {tile_idx}")
+    width = M * (tile_idx + 1)
 
+    # tile_idx > 0 (a prompt longer than one tile): the mask spans every key
+    # tile so far. All columns of earlier, full tiles are visible to every
+    # row; only this tile's own columns are causal (and cut off at n_real).
     def _build():
         row = np.arange(M).reshape(M, 1)
-        col = np.arange(M).reshape(1, M)
-        allowed = (col <= row) & (col < n_real)
-        mask = np.where(allowed, 0.0, -1e30).astype(np.float32)
-        return mask
+        col = np.arange(width).reshape(1, width)
+        own = col - M * tile_idx
+        allowed = (col < M * tile_idx) | ((own <= row) & (own < n_real))
+        return np.where(allowed, 0.0, -1e30).astype(np.float32)
 
-    return _get_or_build_const(compiler, ("causal_mask", n_real), M * M * 4, _build)
+    key = ("causal_mask", n_real) if tile_idx == 0 else ("causal_mask", n_real, tile_idx)
+    return _get_or_build_const(compiler, key, M * width * 4, _build)
 
 
 def _emit_transpose_fp32(compiler, in_addr, out_addr, in_stride=None, out_stride=None):
@@ -2090,7 +2215,8 @@ def _emit_attention_block_batched_fp32(compiler, hidden, n_heads, n_kv_heads, he
 def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, head_dim,
                                        x_addr, wq_addr, wk_addr, wv_addr, wo_addr,
                                        out_addr, pos, k_cache_tiles, v_cache_tiles,
-                                       rope_theta=1e6, q_norm_addr=None, k_norm_addr=None):
+                                       rope_theta=1e6, q_norm_addr=None, k_norm_addr=None,
+                                       attn_scale=None):
     """The actual decode-step attention operation: project Q/K/V for the
     CURRENT real token, apply RoPE at its absolute position, append the
     new K/V into a genuine growing multi-tile KV-cache, then attend over
@@ -2209,6 +2335,8 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
 
     # Q needs to be all-16-replicated for the attention core's own
     # softmax convention (see _emit_attention_block_fp32's docstring).
+    if attn_scale is not None:       # real attention scores are q.k / sqrt(head_dim)
+        q_stage = _emit_scale_fp32(compiler, q_stage, q_dim, attn_scale)
     _emit_broadcast_row0_fp32(compiler, q_stage, q_bcast, q_dim)
 
     mask_addr = _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len)
@@ -2462,7 +2590,8 @@ def _emit_attention_block_kvcache_batched_fp32(compiler, hidden, n_heads, n_kv_h
                                                head_dim, x_addr, wq_addr, wk_addr,
                                                wv_addr, wo_addr, out_addr, n_real,
                                                k_cache_tiles, v_cache_tiles, rope_theta=1e6,
-                                               q_norm_addr=None, k_norm_addr=None):
+                                               q_norm_addr=None, k_norm_addr=None,
+                                               tile_idx=0, attn_scale=None):
     """The actual PREFILL operation: project Q/K/V for a genuine batch of
     up to compiler.tile_dim (16) real, distinct tokens (x's rows
     n_real..15 are zero-padding), apply RoPE per-row at each token's true
@@ -2515,12 +2644,13 @@ def _emit_attention_block_kvcache_batched_fp32(compiler, hidden, n_heads, n_kv_h
     zero" for whatever comes after this function -- see its own
     docstring.
 
-    Scoped to n_real <= compiler.tile_dim: causally attending across
-    MULTIPLE batched tiles (a prompt longer than one tile) needs this
-    tile's real rows to also see prior tiles' real K/V, which isn't
-    implemented -- raises rather than silently producing a batch that's
-    only self-consistent within its own tile. A separate, later piece
-    of work, not attempted here.
+    n_real <= compiler.tile_dim per call. A prompt longer than one tile is
+    prefilled as several calls, one per tile, with `tile_idx` = 0, 1, ...: tile
+    t's rows are positions 16t..16t+15, K/V go into cache tile t, and attention
+    runs over cache tiles 0..t (earlier tiles fully visible, this tile causal),
+    so each tile sees everything before it. Earlier tiles must already be in the
+    cache, i.e. be prefilled first, and all must have been full (n_real == 16)
+    except the last.
     """
     if n_real > compiler.tile_dim:
         raise NotImplementedError(
@@ -2563,7 +2693,7 @@ def _emit_attention_block_kvcache_batched_fp32(compiler, hidden, n_heads, n_kv_h
     # real row's attention, and never read out of this batch's own
     # output either) -- using their row index as a placeholder position
     # avoids needing a separate "don't care" convention.
-    positions = list(range(M))
+    positions = [M * tile_idx + r for r in range(M)]
     for qh in range(n_heads):
         off = qh * head_dim * w
         _emit_rope_batched_fp32(compiler, head_dim, positions, q_stage + off, q_stage + off,
@@ -2573,29 +2703,40 @@ def _emit_attention_block_kvcache_batched_fp32(compiler, hidden, n_heads, n_kv_h
         _emit_rope_batched_fp32(compiler, head_dim, positions, k_proj_stage + off,
                                 k_proj_stage + off, theta=rope_theta, in_stride=kv_dim)
 
-    mask_addr = _emit_causal_mask_fp32(compiler, n_real)
+    if attn_scale is not None:
+        q_stage = _emit_scale_fp32(compiler, q_stage, q_dim, attn_scale)
+    if tile_idx >= len(k_cache_tiles[0]):
+        raise ValueError(f"tile_idx {tile_idx} past the KV-cache's "
+                         f"{len(k_cache_tiles[0])} tiles")
+    seq_k = M * (tile_idx + 1)
+    mask_addr = _emit_causal_mask_fp32(compiler, n_real, tile_idx)
 
-    k_t_stage = compiler.alloc_staging(n_kv_heads * head_dim * M * w)
+    # Write this tile's K/V into cache tile `tile_idx`, then transpose EVERY
+    # active K cache tile (0..tile_idx) into one contiguous (head_dim, seq_k)
+    # block per KV head, exactly as the one-token decode path does.
+    k_t_wide_per_kv = []
     for kv_h in range(n_kv_heads):
         off = kv_h * head_dim * w
-        _emit_transpose_wide_fp32(compiler, head_dim, in_addr=k_proj_stage + off,
-                                  out_addr=k_t_stage + kv_h * head_dim * M * w,
-                                  in_stride=kv_dim)
         _emit_copy_slice_fp32(compiler, in_addr=k_proj_stage + off,
-                              out_addr=k_cache_tiles[kv_h][0], in_stride=kv_dim,
+                              out_addr=k_cache_tiles[kv_h][tile_idx], in_stride=kv_dim,
                               width=head_dim)
         _emit_copy_slice_fp32(compiler, in_addr=v_stage + off,
-                              out_addr=v_cache_tiles[kv_h][0], in_stride=kv_dim,
+                              out_addr=v_cache_tiles[kv_h][tile_idx], in_stride=kv_dim,
                               width=head_dim)
+        k_t_wide = compiler.alloc_staging(head_dim * seq_k * w)
+        for ti in range(tile_idx + 1):
+            _emit_transpose_wide_fp32(compiler, head_dim, in_addr=k_cache_tiles[kv_h][ti],
+                                      out_addr=k_t_wide + ti * M * w, out_stride=seq_k)
+        k_t_wide_per_kv.append(k_t_wide)
 
     rep = n_heads // n_kv_heads
     for qh in range(n_heads):
         kv_h = qh // rep
         _emit_attention_core_batched_fp32(
-            compiler, seq_k=M, head_dim=head_dim,
+            compiler, seq_k=seq_k, head_dim=head_dim,
             q_addr=q_stage + qh * head_dim * w,
-            k_addr=k_t_stage + kv_h * head_dim * M * w,
-            v_addr=v_cache_tiles[kv_h][0],   # this batch's own just-written, contiguous V
+            k_addr=k_t_wide_per_kv[kv_h],
+            v_addr=v_cache_tiles[kv_h][0],   # base of the CONTIGUOUS V block, tiles 0..tile_idx
             out_addr=ctx_stage + qh * head_dim * w,
             mask_addr=mask_addr, q_stride=q_dim, out_stride=q_dim,
         )
@@ -2609,7 +2750,7 @@ def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_
                                          wq_addr, wk_addr, wv_addr, wo_addr,
                                          wgate_addr, wup_addr, wdown_addr, out_addr,
                                          pos, k_cache_tiles, v_cache_tiles, rope_theta=1e6,
-                                         q_norm_addr=None, k_norm_addr=None):
+                                         q_norm_addr=None, k_norm_addr=None, attn_scale=None):
     """_emit_transformer_layer_fp32, but attending against a genuine
     growing KV-cache (_emit_attention_block_kvcache_fp32) instead of
     self-attending over one real token replicated 16x. This is the
@@ -2645,6 +2786,7 @@ def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_
         x_addr=norm1, wq_addr=wq_addr, wk_addr=wk_addr, wv_addr=wv_addr, wo_addr=wo_addr,
         out_addr=attn_out, pos=pos, k_cache_tiles=k_cache_tiles, v_cache_tiles=v_cache_tiles,
         rope_theta=rope_theta, q_norm_addr=q_norm_addr, k_norm_addr=k_norm_addr,
+        attn_scale=attn_scale,
     )
 
     _emit_residual_add_fp32(compiler, x_addr, attn_out, resid1, hidden)
@@ -2663,7 +2805,7 @@ def _emit_transformer_layer_kvcache_fp32(compiler, hidden, inter, n_heads, n_kv_
 
 def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_heads,
                              head_dim, x_addr, layer_weights, scratch_a, scratch_b,
-                             pos, rope_theta=1e6):
+                             pos, rope_theta=1e6, attn_scale=None):
     """_emit_model_fp32, chaining _emit_transformer_layer_kvcache_fp32
     instead -- same ping-pong buffering, same layer_weights contract
     PLUS two more keys per layer: "k_cache"/"v_cache" (that layer's own
@@ -2695,6 +2837,7 @@ def _emit_model_kvcache_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_he
             out_addr=cur_out, pos=pos, k_cache_tiles=lw["k_cache"],
             v_cache_tiles=lw["v_cache"], rope_theta=rope_theta,
             q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
+            attn_scale=attn_scale,
         )
         cur_in = cur_out
     return cur_in
@@ -2706,7 +2849,8 @@ def _emit_transformer_layer_kvcache_batched_fp32(compiler, hidden, inter, n_head
                                                   wo_addr, wgate_addr, wup_addr, wdown_addr,
                                                   out_addr, n_real, k_cache_tiles,
                                                   v_cache_tiles, rope_theta=1e6,
-                                                  q_norm_addr=None, k_norm_addr=None):
+                                                  q_norm_addr=None, k_norm_addr=None,
+                                                  tile_idx=0, attn_scale=None):
     """_emit_transformer_layer_kvcache_fp32, but for a genuine PREFILL
     batch of n_real real, distinct tokens (x's rows n_real..15 zero)
     instead of one real token replicated 16x -- the actual per-layer
@@ -2738,7 +2882,8 @@ def _emit_transformer_layer_kvcache_batched_fp32(compiler, hidden, inter, n_head
         x_addr=norm1, wq_addr=wq_addr, wk_addr=wk_addr, wv_addr=wv_addr, wo_addr=wo_addr,
         out_addr=attn_out, n_real=n_real, k_cache_tiles=k_cache_tiles,
         v_cache_tiles=v_cache_tiles, rope_theta=rope_theta,
-        q_norm_addr=q_norm_addr, k_norm_addr=k_norm_addr,
+        q_norm_addr=q_norm_addr, k_norm_addr=k_norm_addr, tile_idx=tile_idx,
+        attn_scale=attn_scale,
     )
 
     _emit_residual_add_fp32(compiler, x_addr, attn_out, resid1, hidden)
@@ -2754,7 +2899,7 @@ def _emit_transformer_layer_kvcache_batched_fp32(compiler, hidden, inter, n_head
 
 def _emit_model_kvcache_batched_fp32(compiler, n_layers, hidden, inter, n_heads, n_kv_heads,
                                      head_dim, x_addr, layer_weights, scratch_a, scratch_b,
-                                     n_real, rope_theta=1e6):
+                                     n_real, rope_theta=1e6, tile_idx=0, attn_scale=None):
     """_emit_model_kvcache_fp32, but for a genuine PREFILL batch of
     n_real real tokens instead of one real token replicated 16x -- the
     actual whole-model PREFILL operation, called ONCE (not once per
@@ -2782,7 +2927,8 @@ def _emit_model_kvcache_batched_fp32(compiler, n_layers, hidden, inter, n_heads,
             wgate_addr=lw["wgate"], wup_addr=lw["wup"], wdown_addr=lw["wdown"],
             out_addr=cur_out, n_real=n_real, k_cache_tiles=lw["k_cache"],
             v_cache_tiles=lw["v_cache"], rope_theta=rope_theta,
-            q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
+            q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"), tile_idx=tile_idx,
+            attn_scale=attn_scale,
         )
         cur_in = cur_out
     return cur_in
@@ -2931,7 +3077,8 @@ def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delt
 
 def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_heads,
                                        n_kv_heads, head_dim, x_addr, layer_weights,
-                                       scratch_a, scratch_b, pos, rope_theta=1e6):
+                                       scratch_a, scratch_b, pos, rope_theta=1e6,
+                                       attn_scale=None):
     """_emit_model_kvcache_fp32, but compiling only the first TWO layers
     for real through TVM's schedule+codegen and RELOCATING that result
     for every layer after that instead of recompiling. Every layer at a
@@ -2993,6 +3140,7 @@ def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_head
             out_addr=outi, pos=pos, k_cache_tiles=lw["k_cache"],
             v_cache_tiles=lw["v_cache"], rope_theta=rope_theta,
             q_norm_addr=lw.get("q_norm"), k_norm_addr=lw.get("k_norm"),
+            attn_scale=attn_scale,
         )
         return xi, outi
 

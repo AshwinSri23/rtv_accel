@@ -328,9 +328,16 @@ Three options, in preference order:
   exact widening), rejected by the simulator on every other opcode. Tests:
   `pe_array_test` (matches FP32 GEMM bit-for-bit for bf16-representable weights,
   accumulate), `decoder_test`, `test_bf16w.py` (end to end, 1 and 4 K-tiles).
-  **Not done:** compiler plumbing (a BF16 weight buffer dtype through
-  `intrin.py`/`schedule.py`/`codegen.py`, `build_*_dram_image` and the checkpoint
-  loader converting weights). Until then nothing emits BF16W.
+  **Compiler side (2026-11-04):** `tvm_backend._emit_matmul_bf16w_fp32` (hand-driven,
+  3-deep prefetch, M<=16, N/K multiples of 16) plus `to_bf16_bits`/`from_bf16_bits`;
+  `test_bf16w.py` checks it against numpy with BF16-rounded weights at 3 shapes
+  (incl. 1 real row) and confirms B bytes are exactly half. **Measured outcome:** at
+  the default 16 B/cycle model a 16x512x256 matmul is 137k cycles vs 145k for FP32
+  (~5%), because it is compute-bound (256 cycles/tile vs ~128 of DMA); BF16 pays off
+  as 2x weight *footprint* (the 4 GB limit, DRAM size) and in DMA-bound regimes, not
+  as a default speedup. **Still not done:** wiring it into the attention/FFN emitters
+  (they go through TVM-scheduled FP32 buffers), the DRAM image builder and the
+  checkpoint loader converting weights to BF16.
 - [x] **Async `STORE_TILE`: decided not to do.** Measured on one real layer step: 2,912
   stores x ~184 cycles = ~0.54M of ~17.6M double-buffered cycles (~3%), so the
   ceiling on the win is small, and it would add a hazard class (a load racing a
@@ -365,14 +372,27 @@ Three options, in preference order:
   WRITE, per-RUN timing reset, ERR recovery). Required for host-segmented MoE
   routing. Not measured: wall-clock gain at 28 layers (compile still dominates
   small runs; 1-layer runs were 21.4 s vs 20.6 s).
-- [ ] **MoE routing decision.** Host-segmented (no ISA change: a program
+- [x] **MoE routing: host-segmented chosen and prototyped** (2026-11-04).
+  `tvm_backend._emit_moe_ffn_fp32` + `test_moe_ffn.py`: per token, device program 1 =
+  router logits; host = softmax/top-k/renormalise; device program 2 = the chosen
+  experts' SwiGLU, scaled by the route weights and summed, with expert addresses baked
+  in. All experts stay resident in one `rtv_sim --serve` session. 6 tokens routed to 6
+  distinct expert sets, max relative error 3.4e-7 vs a numpy MoE (all experts computed,
+  masked to top-k). **Also answers 5.4 step 3:** two different routings give programs
+  that differ only in LOAD/STORE addresses (identical instruction skeleton), so schedule
+  relocation's address patching applies to expert layers. Not built: RMSNorm/residual
+  around the expert FFN, a shared expert, and a real MoE checkpoint (a 4 GB-class model
+  at FP32 does not fit; needs the BF16 wiring first). On-device routing (argmax-with-index
+  + indirect LOAD) remains the unbuilt alternative. Original decision text: Host-segmented (no ISA change: a program
   boundary and host round trip at every MoE layer, gate logits come out
   mid-program) vs on-device (argmax-with-index `REDUCE` mode + SRAM-indirect
   `LOAD_TILE` address; no branches, top-k unrolled at fixed k). Recommended:
   start host-segmented. Correct 5.1(a) accordingly.
-- [ ] **Repetition-only loop opcode** (strides/bounds, compiler names slots and
-  tags). Deferred; revisit if stream size (329k instrs/layer, ~150 MB over 28
-  layers) becomes the binding constraint.
+- [x] **Repetition-only loop opcode: deliberately not built** (decision 2026-11-03: the compiler
+  keeps scheduling; revisit only if stream size binds). It does not bind: a layer step is
+  ~321k instructions = ~5 MB (~144 MB over 28 layers), which the simulator handles; wall-clock
+  is dominated by TVM compile time (relocation already cuts it ~7x), not stream size. Reopen
+  if a target needs the program resident in a small instruction memory.
 - [x] **Gemmini details verified from `gemmini.h`** (2026-11-04): LOOP_WS is one RoCC
   instruction (funct 8) with 16-bit I/J/K bounds and two scratchpad base addresses,
   plus CISC config instructions (funct 11-15); no BF16 in the header. See
@@ -386,17 +406,34 @@ Three options, in preference order:
   as retired though they are in use; `test_kv_cache.py` docstring and
   `_emit_kv_cache_append_fp32` repeat the wrong "whole tile only" claim; "L3"
   is undefined; Phase 5.4 step 3 (relocation vs differing experts) is untested.
-- [ ] **Prefill beyond one tile** (>16 tokens currently raises
-  `NotImplementedError` in the batched path). Analysis 2026-11-04: this is a speed gap,
-  not a correctness one: `generate.py` already feeds tokens past 16 through the
-  one-at-a-time decode path (verified with a 19-token prompt). Doing it for real needs
-  `_emit_softmax_rows_fp32` to span several key tiles (it is limited to `seq_k ==
-  tile_dim`) plus causal attention across cached tiles; not started.
-- [ ] **End-to-end validation** (blocked: no `torch` in any environment here; `transformers`
-  5.12.1 is installed system-wide but needs it. Installing PyTorch is a ~2 GB environment
-  change, so not done without sign-off) of a full 28-layer run against the real
-  HF/PyTorch Qwen3 (currently only 1–2 layer checks against a numpy reference
-  built from the same weights; `generate.py` is not in CI).
+- [x] **Prefill beyond one tile** (done 2026-11-04). `_emit_model_kvcache_batched_fp32(...,
+  tile_idx=c)` prefills prompt tile c (positions 16c..16c+15): RoPE at the true positions,
+  K/V into cache tile c, attention over cache tiles 0..c with a mask that shows earlier tiles
+  in full and this tile causally (`_emit_causal_mask_fp32(n_real, tile_idx)`).
+  `_emit_softmax_rows_fp32` now spans any multiple of 16 key columns up to 1024 (a row is one
+  LOAD and REDUCE/SCALAR_ALU already work over a full dim_n; `Codegen` gained a `dim_n`
+  attribute) and `_emit_attention_core_batched_fp32` accepts any such `seq_k`. `generate.py`
+  prefills the whole prompt in tiles. `test_prefill_multitile.py`: 20-, 32- and 40-token
+  prompts (+ decode afterwards) match a pure one-token-at-a-time numpy reference to
+  1e-4..5e-4 for every token. Prompts are capped at 1024 key columns by the SRAM row slot.
+- [x] **End-to-end validation against Hugging Face Qwen3-0.6B** (done 2026-11-04, PyTorch
+  2.15 CPU in a throwaway venv under the scratchpad, not in the project environment).
+  **It found a real bug:** the first full 28-layer comparison DIVERGED from HF at the first
+  generated token (chip " a" vs HF " Paris"). Cause: nothing in the production path applied
+  attention's 1/sqrt(head_dim) score scale (the docs said it was "assumed applied upstream";
+  it never was), which no 1-2 layer numpy test could notice because its reference omitted it
+  too. Fix: opt-in `attn_scale` threaded through the attention blocks, layers, models and the
+  relocated model (Q is multiplied by an exact FP32 constant tile, identical to scaling the
+  scores); `generate.py` passes `head_dim ** -0.5`. **After the fix the chip generates
+  exactly HF's tokens for "The capital of France is": [... 12095 13 576 6722] = " Paris. The
+  capital"**, through batched prefill, relocated decode and the persistent session, at the
+  real 28 layers. `test_prefill_multitile.py` now has scaled cases with a scaled numpy
+  reference. Older tests keep `attn_scale=None` (unscaled) on purpose.
+  **Second comparison, multi-tile:** a 26-token prompt ("Paris is the capital of France. ...
+  Rome is the capital of", two prefill tiles) on the full 28 layers generates [15344 13 15920
+  315] = " Italy. Which of", token-for-token identical to HF, including step 2 where HF's own
+  top-2 logit margin is only 0.060. Compared token ids and top-1s, not logits: logits were
+  not compared numerically, so small FP32 deviations that don't flip a token would not show.
 - [ ] **Commit the branch** (`chore/remove-int8-dead-code` is half staged,
   half unstaged, plus the work above).
 

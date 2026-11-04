@@ -104,10 +104,46 @@ def case_rejected_elsewhere():
     return True, ""
 
 
+def case_compiler_matmul(M, N, K):
+    """tvm_backend._emit_matmul_bf16w_fp32 against numpy with BF16-rounded
+    weights, and its weight DMA traffic is exactly half the FP32 matmul's."""
+    sys.path.insert(0, os.path.join(ROOT, "toolchain"))
+    from compiler_state import NPUCompiler, DType as CDType  # noqa: E402
+    import tvm_backend  # noqa: E402
+    rng = np.random.default_rng(M + N + K)
+    a = rng.normal(size=(M, K)).astype(np.float32)
+    b = rng.normal(size=(K, N)).astype(np.float32)
+    bb = tvm_backend.to_bf16_bits(b)
+    expected = a.astype(np.float64) @ tvm_backend.from_bf16_bits(bb).astype(np.float64)
+    comp = NPUCompiler(HAL)
+    comp.dtype = CDType.FP32
+    comp.instruction_stream = bytearray()
+    a_addr, b_addr, c_addr = 0x1000, 0x40000, 0x100000
+    tvm_backend._emit_matmul_bf16w_fp32(comp, M, N, K, a_addr, b_addr, c_addr)
+    dram = bytearray(0x200000)
+    # A is read as full 16-row tiles; rows past M stay zero.
+    ap = np.zeros((16, K), np.float32)
+    ap[:M] = a
+    dram[a_addr:a_addr + ap.nbytes] = ap.tobytes()
+    dram[b_addr:b_addr + bb.nbytes] = bb.tobytes()
+    raw, err = run([int.from_bytes(bytes(comp.instruction_stream[i:i + 16]), "big")
+                    for i in range(0, len(comp.instruction_stream), 16)],
+                   dram, c_addr, 16 * N * 4)
+    if raw is None:
+        return False, err[-300:]
+    got = np.frombuffer(raw, dtype=np.float32).reshape(16, N)[:M]
+    if not np.allclose(got, expected, rtol=1e-4, atol=1e-3):
+        return False, f"max delta {float(np.abs(got - expected).max()):.4g}"
+    return True, f"{len(comp.instruction_stream) // 16} instrs, B bytes {bb.nbytes} (fp32 would be {b.nbytes})"
+
+
 def main():
     cases = [("bf16w_gemm_1ktile", lambda: case_gemm(1)),
              ("bf16w_gemm_4ktile_accumulate", lambda: case_gemm(4)),
-             ("bf16w_rejected_on_non_gemm", case_rejected_elsewhere)]
+             ("bf16w_rejected_on_non_gemm", case_rejected_elsewhere),
+             ("compiler_matmul_16x16x16", lambda: case_compiler_matmul(16, 16, 16)),
+             ("compiler_matmul_16x64x128", lambda: case_compiler_matmul(16, 64, 128)),
+             ("compiler_matmul_1row_48x96", lambda: case_compiler_matmul(1, 96, 48))]
     n = 0
     for name, fn in cases:
         try:

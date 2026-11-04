@@ -126,6 +126,11 @@ class Codegen:
         # op writes at the operand width. Computed from self.w, not a fixed
         # module-level dict -- see _slot_map's docstring.
         self.kind = kind
+        # Column count REDUCE/SCALAR_ALU operate over (default one tile). A
+        # hand-driven single-row softmax over several key tiles sets this to
+        # the full row width: both ops already work over a whole dim_m x dim_n
+        # region.
+        self.dim_n = TILE
         self.slot = _slot_map(kind, self.w)
         self.out_w = 4 if kind in ("gemm", "reduce") else DType.BYTES[dtype]
         # Keyed by activation, not a single counter: softmax runs a MAX
@@ -298,7 +303,7 @@ class Codegen:
         dest_sram = (self.SCALAR_MAX if scalar_addr is None else scalar_addr) & 0xFFFF
         word = encode(opcode=Opcode.REDUCE, dep_id=0, dram_addr=0,
                       sram_addr=dest_sram, stride=self.slot["A"],
-                      dim_m=self.dim_m, dim_n=TILE, activation=int(activation),
+                      dim_m=self.dim_m, dim_n=self.dim_n, activation=int(activation),
                       accumulate=accumulate, dtype=int(self.dtype))
         self._emit_word(word)
         self._reduce_count[activation] = self._reduce_count.get(activation, 0) + 1
@@ -309,7 +314,7 @@ class Codegen:
         dest_sram = (self.SCALAR_MAX if scalar_addr is None else scalar_addr) & 0xFFFF
         word = encode(opcode=Opcode.SCALAR_ALU, dep_id=0, dram_addr=imm,
                       sram_addr=dest_sram, stride=self.slot["A"],
-                      dim_m=self.dim_m, dim_n=TILE, activation=int(activation),
+                      dim_m=self.dim_m, dim_n=self.dim_n, activation=int(activation),
                       dtype=int(self.dtype))
         self._emit_word(word)
 
