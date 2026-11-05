@@ -141,6 +141,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_byoc_graph          # graph-driven (BYOC) FFN half-layer: byte-identical to the hand-driven emitters
         test_byoc_decoder        # graph-driven decode layer/model: byte-identical to the hand-driven path
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
+        test_gemma4_model        # tiny random Gemma-4 (sandwich norms, dense+experts, K=V, partial RoPE, softcap) vs Hugging Face
         test_gelu                # GELU(tanh) composed from multiply/add/RELU/exp: no new hardware mode
         test_decode_step_cache   # derived decode step == full compile (stream + constants)
         test_parse_cache         # @T.prim_func parse memoization (tvm_fast_stack)

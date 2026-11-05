@@ -649,10 +649,30 @@ def _emit_relu_fp32(compiler, in_addr, out_addr, width):
 
 
 def _emit_exp_fp32(compiler, in_addr, out_addr, width):
-    """out = exp(in), elementwise: the softmax EXP_SUB pass with a zero scalar."""
+    """out = exp(in), elementwise: the softmax EXP_SUB pass with a scalar of exactly 0.
+
+    SCALAR_ALU takes its scalar from an SRAM slot that a PRECEDING reduce wrote (codegen never loads
+    it from DRAM), so the slot is zeroed first with a REDUCE_MAX over a zero tile. Without this the
+    pass silently used whatever an earlier RMSNorm/softmax reduce left there (caught by the Gemma-4
+    layer comparison: correct on a fresh simulator, wrong after any norm)."""
     M = compiler.tile_dim
-    zero = _get_or_build_const(compiler, ("zero_scalar",), 64,
-                               lambda: np.zeros(16, dtype=np.float32))
+    zeros = _get_or_build_const(compiler, ("zero_tile", 16), M * 16 * 4,
+                                lambda: np.zeros((M, 16), dtype=np.float32))
+    scalar = compiler.alloc_staging(64)
+
+    @T.prim_func(s_tir=True)
+    def rmax(a: T.handle, s: T.handle) -> None:
+        A = T.match_buffer(a, (M, 16), "float32")
+        S = T.match_buffer(s, (1,), "float32")
+        for i, j in T.grid(M, 16):
+            with T.sblock("rowmax"):
+                vi, vj = T.axis.remap("RR", [i, j])
+                with T.init():
+                    S[0] = T.float32(-3.0e38)
+                S[0] = T.max(S[0], A[vi, vj])
+
+    codegen.emit(compiler, schedule.schedule_reduce(rmax, "rowmax", intrin.register_rowmax_fp32()),
+                 {"A": zeros, "S": scalar}, dtype=DType.FP32, kind="reduce")
 
     @T.prim_func(s_tir=True)
     def esub(s: T.handle, a: T.handle, c: T.handle) -> None:
@@ -666,7 +686,7 @@ def _emit_exp_fp32(compiler, in_addr, out_addr, width):
 
     codegen.emit(compiler, schedule.schedule_tile_scalar(esub, "expsub",
                                                          intrin.register_exp_sub_fp32()),
-                 {"S": zero, "A": in_addr, "C": out_addr}, dtype=DType.FP32, kind="elemwise")
+                 {"S": scalar, "A": in_addr, "C": out_addr}, dtype=DType.FP32, kind="elemwise")
 
 
 def _emit_gelu_tanh_fp32(compiler, width, x_addr, out_addr):

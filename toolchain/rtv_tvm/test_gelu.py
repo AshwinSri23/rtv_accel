@@ -18,7 +18,7 @@ def gelu_ref(x):
     return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
 
 
-def run(x):
+def run(x, after_reduce=False):
     M, W = x.shape
     c = NPUCompiler(HAL)
     c.dtype = DType.FP32
@@ -27,6 +27,18 @@ def run(x):
     xa = c.alloc_staging(M * W * 4)
     oa = c.alloc_staging(M * W * 4)
     c._const_regions[xa] = x.astype(np.float32).tobytes()
+    if after_reduce:
+        # an RMSNorm first leaves a NONZERO scalar in the SRAM scalar slot; GELU's exp must not use it
+        g = c.alloc_staging(M * 16 * 4)
+        c._const_regions[g] = np.ones((M, 16), np.float32).tobytes()
+        src = c.alloc_staging(M * 16 * 4)
+        row = np.zeros((M, 16), np.float32)
+        row[0] = np.linspace(2.0, 9.0, 16)
+        c._const_regions[src] = row.tobytes()
+        c.rms_eps = 1e-6
+        tvm_backend._emit_rmsnorm_row_fp32(c, 16, x_addr=src, gamma_addr=g, out_addr=c.alloc_staging(M * 16 * 4),
+                                           scratch_addr=c.alloc_staging(4),
+                                           stage_addr=c.alloc_staging(M * 16 * 4))
     tvm_backend._emit_gelu_tanh_fp32(c, W, xa, oa)
     with tempfile.TemporaryDirectory() as wd:
         img, prog, out = (os.path.join(wd, n) for n in ("img", "prog", "out"))
@@ -52,8 +64,9 @@ def main():
         "huge": rng.uniform(-300, 300, size=(16, 16)),
     }
     ok = True
+    cases["after_norm"] = cases["normal"]
     for name, x in cases.items():
-        got, n = run(x)
+        got, n = run(x, after_reduce=(name == "after_norm"))
         ref = gelu_ref(x.astype(np.float32))
         err = np.abs(got - ref)
         rel = float((err / np.maximum(np.abs(ref), 1e-3)).max())
