@@ -142,6 +142,9 @@ if(EXISTS ${RTV_TVM_PY})
         test_byoc_decoder        # graph-driven decode layer/model: byte-identical to the hand-driven path
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
         test_gemma4_model        # tiny random Gemma-4 (sandwich norms, dense+experts, K=V, partial RoPE, softcap) vs Hugging Face
+        test_gguf_q4             # llama.cpp Q4_0 blocks -> INT4W g32 blob is lossless; chip GEMM on it
+        test_dram_image_4gb      # DRAM image > 4 GiB: loader and dumps use 64-bit addresses
+        test_gemma4_26b          # REAL Gemma-4-26B-A4B vs Hugging Face per layer (runs only with RTV_REAL_GEMMA4=1)
         test_gelu                # GELU(tanh) composed from multiply/add/RELU/exp: no new hardware mode
         test_decode_step_cache   # derived decode step == full compile (stream + constants)
         test_parse_cache         # @T.prim_func parse memoization (tvm_fast_stack)

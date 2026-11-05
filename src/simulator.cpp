@@ -90,7 +90,7 @@ int main(int argc, char* argv[])
     std::string       config_path = "toolchain/hal_config.json";
     std::size_t       dram_mb     = 32;
     std::string       dram_image;
-    struct DumpSpec { uint32_t addr; std::size_t len; std::string path; };
+    struct DumpSpec { uint64_t addr; std::size_t len; std::string path; };
     std::vector<DumpSpec> dumps;
 
     // Positional args 2 and 3 stay supported for backward compatibility; any
@@ -123,7 +123,7 @@ int main(int argc, char* argv[])
                     return 1;
                 }
                 dumps.push_back({
-                    static_cast<uint32_t>(std::stoul(spec.substr(0, c1), nullptr, 0)),
+                    static_cast<uint64_t>(std::stoul(spec.substr(0, c1), nullptr, 0)),
                     static_cast<std::size_t>(std::stoul(spec.substr(c1 + 1, c2 - c1 - 1),
                                                         nullptr, 0)),
                     spec.substr(c2 + 1),
@@ -176,21 +176,28 @@ int main(int argc, char* argv[])
             std::fprintf(stderr, "error: cannot open --dram-image %s\n", dram_image.c_str());
             return 1;
         }
-        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(img)),
-                                          std::istreambuf_iterator<char>());
-        if (bytes.size() > dram_mb * 1024 * 1024) {
+        // Stream in chunks: a multi-GB image must not be buffered a second time in host RAM.
+        img.seekg(0, std::ios::end);
+        const size_t img_bytes = static_cast<size_t>(img.tellg());
+        img.seekg(0);
+        if (img_bytes > dram_mb * 1024 * 1024) {
             std::fprintf(stderr,
                 "error: --dram-image is %zu bytes but DRAM is only %zu MiB\n",
-                bytes.size(), dram_mb);
+                img_bytes, dram_mb);
             return 1;
         }
         try {
-            mem.write_dram(0, bytes.data(), bytes.size());
+            std::vector<uint8_t> chunk(size_t(64) << 20);
+            for (size_t off = 0; off < img_bytes; off += chunk.size()) {
+                const size_t n = std::min(chunk.size(), img_bytes - off);
+                img.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(n));
+                mem.write_dram(off, chunk.data(), n);
+            }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "dram-image error: %s\n", e.what());
             return 1;
         }
-        std::printf("dram-img : %s (%zu bytes)\n", dram_image.c_str(), bytes.size());
+        std::printf("dram-img : %s (%zu bytes)\n", dram_image.c_str(), img_bytes);
     }
     PEArray pe;
     // BF16W is a COMPUTE_GEMM-only dtype; fail loudly rather than misread data.
@@ -460,7 +467,7 @@ int main(int argc, char* argv[])
                     if (!f) throw std::runtime_error("cannot open " + file);
                     const std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)),
                                                   std::istreambuf_iterator<char>());
-                    mem.write_dram(static_cast<uint32_t>(std::stoull(addr_s, nullptr, 0)),
+                    mem.write_dram(static_cast<uint64_t>(std::stoull(addr_s, nullptr, 0)),
                                    b.data(), b.size());
                     std::printf("OK wrote=%zu\n", b.size());
                 } else if (cmd == "RUN") {
@@ -471,7 +478,7 @@ int main(int argc, char* argv[])
                         const auto c1 = spec.find(':'), c2 = spec.find(':', c1 + 1);
                         if (c1 == std::string::npos || c2 == std::string::npos)
                             throw std::runtime_error("bad dump spec " + spec);
-                        ds.push_back({static_cast<uint32_t>(std::stoull(spec.substr(0, c1), nullptr, 0)),
+                        ds.push_back({static_cast<uint64_t>(std::stoull(spec.substr(0, c1), nullptr, 0)),
                                       static_cast<std::size_t>(std::stoull(spec.substr(c1 + 1, c2 - c1 - 1), nullptr, 0)),
                                       spec.substr(c2 + 1)});
                     }
@@ -543,7 +550,7 @@ int main(int argc, char* argv[])
                 d.path.c_str());
             return 1;
         }
-        std::printf("dumped   : 0x%08X +%zu -> %s\n", d.addr, d.len, d.path.c_str());
+        std::printf("dumped   : 0x%08llX +%zu -> %s\n", static_cast<unsigned long long>(d.addr), d.len, d.path.c_str());
     }
 
     // ── Results ───────────────────────────────────────────────────────────────

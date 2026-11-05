@@ -15,8 +15,7 @@ FIX = os.path.join(HERE, "rtv_tvm", "fixtures")
 PROMPT, N_NEW = [5, 17, 101, 42, 7], 6
 
 
-def main():
-    torch.manual_seed(7)
+def tiny_config():
     cfg = Gemma4TextConfig(
         vocab_size=256, hidden_size=32, intermediate_size=64, moe_intermediate_size=32,
         num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
@@ -26,6 +25,38 @@ def main():
         hidden_size_per_layer_input=0, final_logit_softcapping=30.0, max_position_embeddings=128,
         tie_word_embeddings=True, vocab_size_per_layer_input=256, num_kv_shared_layers=0,
         rms_norm_eps=1e-6)
+    return cfg
+
+
+LONG_PROMPT_LEN, LONG_N_NEW = 90, 6      # > the tiny model's sliding_window (64): exercises window masking
+
+
+def make_long_reference():
+    """Greedy ids + top-5 logits of the SAVED tiny model on a prompt longer than its sliding window."""
+    d = os.path.join(FIX, "gemma4_tiny_model")
+    from safetensors.torch import load_file
+    m = Gemma4ForCausalLM(tiny_config()).eval()
+    print(m.load_state_dict(load_file(os.path.join(d, "model.safetensors")), strict=False))
+    g = torch.Generator().manual_seed(23)
+    prompt = torch.randint(3, 256, (LONG_PROMPT_LEN,), generator=g).tolist()
+    with torch.no_grad():
+        out = m.generate(torch.tensor([prompt]), max_new_tokens=LONG_N_NEW, do_sample=False)[0].tolist()
+        steps = []
+        for t in range(len(prompt) - 1, len(out) - 1):
+            lg = m(torch.tensor([out[:t + 1]])).logits[0, -1]
+            top = lg.topk(5)
+            steps.append(dict(top_ids=top.indices.tolist(), top_logits=top.values.tolist()))
+    json.dump(dict(prompt=prompt, ids=out, steps=steps, sliding_window=m.config.sliding_window,
+                   model="random Gemma4 text, 3 layers, long prompt"),
+              open(os.path.join(FIX, "gemma4_tiny_hf_reference_long.json"), "w"), indent=1)
+    print("wrote long reference", out[-LONG_N_NEW:])
+
+
+def main():
+    if "--long" in sys.argv:
+        return make_long_reference()
+    torch.manual_seed(7)
+    cfg = tiny_config()
     m = Gemma4ForCausalLM(cfg).eval()
     g = torch.Generator().manual_seed(11)
     with torch.no_grad():

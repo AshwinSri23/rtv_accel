@@ -6,7 +6,8 @@ test_gemma4_model.py -- a whole (tiny, random) Gemma-4 text model on the simulat
 sandwich norms, K=V and head_dim 32 on the full-attention layer (partial "proportional" RoPE), randomised
 norm gains / router scales / per-expert scales / layer scalars, final logit softcap, tied embeddings.
 Compares generated ids AND the top-5 logits at every step with fixtures/gemma4_tiny_hf_reference.json
-(made by make_gemma4_fixture.py). Needs no download.
+(made by make_gemma4_fixture.py), checks that relocated/derived programs equal full compiles, and runs a prompt
+longer than the sliding window (gemma4_tiny_hf_reference_long.json). Needs no download.
 
 Run with the TVM venv:  .venv-tvm/bin/python toolchain/rtv_tvm/test_gemma4_model.py
 """
@@ -21,18 +22,41 @@ sys.path.insert(0, os.path.join(ROOT, "toolchain"))
 import gemma4_model  # noqa: E402
 
 
-def main():
-    ref = json.load(open(os.path.join(_HERE, "fixtures", "gemma4_tiny_hf_reference.json")))
-    ids, steps = gemma4_model.generate_gemma4(
+def run(ref):
+    return gemma4_model.generate_gemma4(
         os.path.join(_HERE, "fixtures", "gemma4_tiny_model"), ref["prompt"], len(ref["steps"]),
         os.path.join(ROOT, "build", "rtv_sim"), os.path.join(ROOT, "toolchain", "hal_config.json"))
+
+
+def compare(tag, ref, ids, steps, results):
     worst, ok_top = 0.0, True
     for st, r in zip(steps, ref["steps"]):
         ok_top &= st[0] == r["top_ids"]
         worst = max(worst, max(abs(a - b) for a, b in zip(st[1], r["top_logits"])))
-    results = [("generated_ids_match_hf", ids == ref["ids"], f"chip {ids[len(ref['prompt']):]} vs hf {ref['ids'][len(ref['prompt']):]}"),
-               ("top5_ids_match_every_step", ok_top, ""),
-               ("top5_logits_within_1e-4", worst < 1e-4, f"max |delta| {worst:.2e}")]
+    results += [(f"{tag}: generated_ids_match_hf", ids == ref["ids"],
+                 f"chip {ids[len(ref['prompt']):]} vs hf {ref['ids'][len(ref['prompt']):]}"),
+                (f"{tag}: top5_ids_match_every_step", ok_top, ""),
+                (f"{tag}: top5_logits_within_1e-4", worst < 1e-4, f"max |delta| {worst:.2e}")]
+
+
+def main():
+    results = []
+    ref = json.load(open(os.path.join(_HERE, "fixtures", "gemma4_tiny_hf_reference.json")))
+    ids, steps = run(ref)                      # relocated / derived programs (the default)
+    compare("short", ref, ids, steps, results)
+
+    # The relocated programs must equal compiling every program for real.
+    os.environ["RTV_NO_GEMMA_RELOC"] = "1"
+    ids0, steps0 = run(ref)
+    del os.environ["RTV_NO_GEMMA_RELOC"]
+    d = max(abs(a - b) for s1, s0 in zip(steps, steps0) for a, b in zip(s1[1], s0[1]))
+    results.append(("relocated == full compile", ids == ids0 and d < 1e-6, f"max |delta| {d:.2e}"))
+
+    # A prompt longer than the sliding window (64): sliding layers must drop the oldest keys.
+    ref_long = json.load(open(os.path.join(_HERE, "fixtures", "gemma4_tiny_hf_reference_long.json")))
+    ids, steps = run(ref_long)
+    compare("long (past the window)", ref_long, ids, steps, results)
+
     n = 0
     for name, ok, msg in results:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {msg}" if msg else ""))

@@ -9,13 +9,13 @@ void MemoryController::resize_dram(std::size_t bytes) {
     _dram.resize(bytes);
 }
 
-void MemoryController::write_dram(uint32_t addr, const uint8_t* src, std::size_t len) {
+void MemoryController::write_dram(uint64_t addr, const uint8_t* src, std::size_t len) {
     if (static_cast<std::size_t>(addr) + len > _dram.size())
         throw std::out_of_range("write_dram: address out of range");
     std::memcpy(_dram.data() + addr, src, len);
 }
 
-void MemoryController::read_dram(uint32_t addr, uint8_t* dst, std::size_t len) const {
+void MemoryController::read_dram(uint64_t addr, uint8_t* dst, std::size_t len) const {
     if (static_cast<std::size_t>(addr) + len > _dram.size())
         throw std::out_of_range("read_dram: address out of range");
     std::memcpy(dst, _dram.data() + addr, len);

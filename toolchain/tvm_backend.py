@@ -276,10 +276,17 @@ def _get_or_build_const(compiler, key, nbytes, build_fn):
     return addr
 
 
-def _kv_tail_mask_data(M, seq_k, valid_len):
+def _kv_tail_mask_data(M, seq_k, valid_len, lo=0):
     mask = np.zeros((M, seq_k), dtype=np.float32)
     mask[:, valid_len:] = -1e30
+    mask[:, :lo] = -1e30            # sliding window: keys older than the window
     return mask
+
+
+def _window_lo(pos, window, t0, M):
+    """First visible key (relative to the first attended cache tile t0) for a sliding window of `window` keys
+    ending at `pos` (HF: key j is visible iff j > pos - window)."""
+    return max(0, pos + 1 - window - t0 * M)
 
 
 def _rope_cossin_data(M, head_dim, pos, theta, rope_angles=None):
@@ -293,7 +300,9 @@ def _rope_cossin_data(M, head_dim, pos, theta, rope_angles=None):
 # The decode-step constants whose CONTENT depends on the position, keyed by the _get_or_build_const
 # tag: tag -> f(M, key, pos) -> ndarray. decode_step_cache.py rebuilds these for a derived step.
 POS_CONSTS = {
-    "kv_tail_mask": lambda M, key, pos: _kv_tail_mask_data(M, key[1], pos + 1),
+    "kv_tail_mask": lambda M, key, pos: (
+        _kv_tail_mask_data(M, key[1], pos + 1) if len(key) <= 3 else
+        _kv_tail_mask_data(M, key[1], pos + 1 - key[4] * M, _window_lo(pos, key[3], key[4], M))),
     "rope_cossin": lambda M, key, pos: _rope_cossin_data(M, key[1], pos, key[3],
                                                          key[4] if len(key) > 4 else None),
 }
@@ -2033,7 +2042,7 @@ def _emit_kv_cache_append_dma_fp32(compiler, cache_tile_addr, new_row_addr, row,
         compiler.instruction_stream.extend(to_bytes(word))
 
 
-def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len):
+def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len, window=None, t0=0):
     """Build (and register as a compile-time constant) an additive
     (16, seq_k) mask for attention over a KV-cache that isn't fully
     populated yet: 0.0 for the first `valid_len` columns (real cached
@@ -2060,6 +2069,13 @@ def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len):
     if not (0 < valid_len <= seq_k):
         raise ValueError(f"valid_len must be in (0, {seq_k}]; got {valid_len}")
 
+    if window:
+        # valid_len is relative to the first attended tile t0; the key encodes (window, t0) so a derived step can
+        # rebuild the mask for another position of the same tile (POS_CONSTS).
+        pos = valid_len - 1 + t0 * M
+        return _get_or_build_const(compiler, ("kv_tail_mask", seq_k, valid_len, window, t0),
+                                   M * seq_k * 4,
+                                   lambda: _kv_tail_mask_data(M, seq_k, valid_len, _window_lo(pos, window, t0, M)))
     return _get_or_build_const(compiler, ("kv_tail_mask", seq_k, valid_len),
                                M * seq_k * 4,
                                lambda: _kv_tail_mask_data(M, seq_k, valid_len))
@@ -2702,7 +2718,7 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
                                        out_addr, pos, k_cache_tiles, v_cache_tiles,
                                        rope_theta=1e6, q_norm_addr=None, k_norm_addr=None,
                                        attn_scale=None, v_norm=False, v_from_k=False,
-                                       rope_angles=None):
+                                       rope_angles=None, window=None):
     """The actual decode-step attention operation: project Q/K/V for the
     CURRENT real token, apply RoPE at its absolute position, append the
     new K/V into a genuine growing multi-tile KV-cache, then attend over
@@ -2739,7 +2755,10 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     Gemma-4 options (all off by default, leaving the Qwen3 stream byte-identical): `v_norm`
     applies a weightless per-head RMSNorm to V (gain 1); `v_from_k` takes V from the RAW K
     projection (before k_norm and RoPE) instead of a V projection (wv_addr unused); `rope_angles`
-    rotates only that many frequencies ("proportional" partial RoPE, rope_tables).
+    rotates only that many frequencies ("proportional" partial RoPE, rope_tables). `window` (sliding-window
+    attention): the new token sees only the last `window` keys; cache tiles that lie wholly before the window are not
+    even transposed or attended (tiles tile_idx-ceil(window/M)..tile_idx stay, so the shape of the stream changes only
+    at a KV-tile boundary, which is what DecodeStepCache needs), and the older keys of the first kept tile are masked.
 
     q_norm_addr/k_norm_addr: real Qwen3 applies a per-head RMSNorm to Q
     and K -- ONE shared (head_dim,) gain per projection, reused by every
@@ -2764,9 +2783,10 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     w = DType.BYTES[DType.FP32]
 
     tile_idx, row = divmod(pos, M)
-    n_active_tiles = tile_idx + 1
+    t0 = max(0, tile_idx - -(-window // M)) if window else 0     # first attended cache tile
+    n_active_tiles = tile_idx - t0 + 1
     seq_k = n_active_tiles * M
-    valid_len = pos + 1
+    valid_len = pos + 1 - t0 * M
     if tile_idx >= len(k_cache_tiles[0]):
         raise ValueError(
             f"pos={pos} needs cache tile {tile_idx}, but only "
@@ -2847,7 +2867,7 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
         q_stage = _emit_scale_fp32(compiler, q_stage, q_dim, attn_scale)
     _emit_broadcast_row0_fp32(compiler, q_stage, q_bcast, q_dim)
 
-    mask_addr = _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len)
+    mask_addr = _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len, window, t0)
 
     k_t_wide_per_kv = []
     for kv_h in range(n_kv_heads):
@@ -2869,7 +2889,7 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
         k_t_wide = compiler.alloc_staging(head_dim * seq_k * w)
         for ti in range(n_active_tiles):
             _emit_transpose_wide_fp32(compiler, head_dim,
-                                      in_addr=k_cache_tiles[kv_h][ti],
+                                      in_addr=k_cache_tiles[kv_h][t0 + ti],
                                       out_addr=k_t_wide + ti * M * w,
                                       out_stride=seq_k)
         k_t_wide_per_kv.append(k_t_wide)
@@ -2881,7 +2901,7 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
             compiler, seq_k, head_dim,
             q_addr=q_bcast + qh * head_dim * w,
             k_addr=k_t_wide_per_kv[kv_h],
-            v_addr=v_cache_tiles[kv_h][0],   # base of the CONTIGUOUS V block
+            v_addr=v_cache_tiles[kv_h][t0],   # base of the CONTIGUOUS V block (from the first attended tile)
             out_addr=ctx_stage + qh * head_dim * w,
             mask_addr=mask_addr, q_stride=q_dim, out_stride=q_dim,
         )
@@ -3576,8 +3596,13 @@ def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delt
     hi = w[:, 0]
     opc = (hi >> np.uint64(60)) & np.uint64(0xF)
     mem = (opc == np.uint64(int(Opcode.LOAD_TILE))) | (opc == np.uint64(int(Opcode.STORE_TILE)))
-    # dram_addr: bits 24..55 of the high word (the 32-bit field only; dram_hi is untouched).
-    addr = ((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)).astype(np.int64)
+    # LOAD/STORE address = 32-bit dram_addr field (hi bits 24..55) + dram_hi (lo bits 36..39, ISA v1.6) so
+    # images above 4 GB (real MoE expert pools) relocate correctly.
+    lo = w[:, 1]
+    # INDIRECT_ADDR loads reuse those bits as an SRAM pointer, not an address.
+    ind = mem & ((lo & np.uint64(0x7F)) == np.uint64(0x14))
+    addr = (((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)) |
+            np.where(ind, np.uint64(0), ((lo >> np.uint64(36)) & np.uint64(0xF)) << np.uint64(32))).astype(np.int64)
     todo = mem.copy()
     for start, nbytes in shared_ranges:          # (1) shared constants stay put
         todo &= ~((addr >= start) & (addr < start + nbytes))
@@ -3590,12 +3615,16 @@ def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delt
     changed = mem & (new != addr)
     if not changed.any():
         return bytes(instr_bytes)
-    if (new[changed] < 0).any() or (new[changed] > 0xFFFFFFFF).any():
-        raise ValueError("relocated DRAM address does not fit the 32-bit dram_addr field")
-    hi = np.where(changed,
-                  (hi & ~(np.uint64(0xFFFFFFFF) << np.uint64(24))) |
-                  (new.astype(np.uint64) << np.uint64(24)), hi)
+    if (new[changed] < 0).any() or (new[changed] >> 36).any():
+        raise ValueError("relocated DRAM address does not fit the 36-bit LOAD/STORE address")
+    nu = new.astype(np.uint64)
+    hi = np.where(changed, (hi & ~(np.uint64(0xFFFFFFFF) << np.uint64(24))) |
+                  ((nu & np.uint64(0xFFFFFFFF)) << np.uint64(24)), hi)
+    if (changed & ind & (new >> 32 != 0)).any():
+        raise ValueError("indirect LOAD/STORE address does not fit 32 bits")
+    lo = np.where(changed & ~ind, (lo & ~(np.uint64(0xF) << np.uint64(36))) | ((nu >> np.uint64(32)) << np.uint64(36)), lo)
     w[:, 0] = hi
+    w[:, 1] = lo
     return w.astype(">u8").tobytes()
 
 

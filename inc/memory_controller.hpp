@@ -49,11 +49,11 @@ public:
     // Copy `len` bytes from `src` into DRAM at `addr`.
     // Used by the weight loader to populate DRAM before running the simulator.
     // Throws std::out_of_range if addr + len exceeds the allocated DRAM size.
-    void write_dram(uint32_t addr, const uint8_t* src, std::size_t len);
+    void write_dram(uint64_t addr, const uint8_t* src, std::size_t len);
 
     // Read `len` bytes from DRAM at `addr` into `dst`.
     // Throws std::out_of_range if addr + len exceeds the allocated DRAM size.
-    void read_dram(uint32_t addr, uint8_t* dst, std::size_t len) const;
+    void read_dram(uint64_t addr, uint8_t* dst, std::size_t len) const;
 
     // ── Tile transfers (handlers for LOAD_TILE / STORE_TILE) ─────────────────
 

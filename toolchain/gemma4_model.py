@@ -16,7 +16,7 @@ Per layer (Hugging Face Gemma4TextDecoderLayer, FP32 activations):
 Gemma specifics handled: attention scale 1.0 (q/k norms carry it), weightless V norm, K=V on full-attention
 layers (no v_proj), per-layer head_dim / KV heads, "proportional" partial RoPE on full layers, GELU(tanh) built
 from existing ISA ops (tvm_backend._emit_gelu_tanh_fp32), sqrt(hidden) embedding scale and final logit softcap
-on the host. Sliding-window masking is NOT implemented (contexts must stay within the window).
+on the host. Sliding-window attention (last `window` keys; older cache tiles skipped) on the sliding layers.
 
     python toolchain/gemma4_model.py --model <dir> --prompt-ids 5,17,101 --steps 4
 """
@@ -37,6 +37,7 @@ from compiler_state import NPUCompiler, DType, _padded  # noqa: E402
 from hf_loader import SafeTensorsModel                   # noqa: E402
 import tvm_backend                                       # noqa: E402
 from generate import _SimSession, _SESSION_HEADROOM      # noqa: E402
+from decode_step_cache import DecodeStepCache            # noqa: E402
 
 M = 16
 
@@ -93,9 +94,23 @@ def load_gemma4_hf(model_dir):
     return cfg, layers, embed, _t(m, pre + "norm.weight")
 
 
-def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_group=0, trace=None):
+def _blob_bytes(K, N, int4_group):
+    return tvm_backend.int4_blob_nbytes(K, N, int4_group) if int4_group else K * N * 4
+
+
+def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_group=0, trace=None,
+                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=()):
     """Greedy-generate n_new tokens. `source` is a checkpoint dir or an already loaded
-    (cfg, layers, embed, final_norm). Returns (all_ids, per_step) with per_step[i] = (top5_ids, top5_logits)."""
+    (cfg, layers, embed, final_norm); matrices may be lazy gemma4_gguf.Q4Mat objects (then int4_group=32).
+    Returns (all_ids, per_step) with per_step[i] = (top5_ids, top5_logits).
+
+    Compile cost: the per-layer programs are NOT recompiled for every layer. Program A (attention + dense branch +
+    router) is compiled for one representative layer per layer TYPE (sliding / full) and its LOAD/STORE addresses are
+    relocated onto every other layer of that type (tvm_backend._relocate_instructions, same mechanism as the dense
+    model); successive positions of one KV tile are additionally derived rather than recompiled (DecodeStepCache).
+    Program B (the chosen experts) does not depend on the position at all: one template, relocated per (layer, chosen
+    experts), with the route weights and layer scalar patched in as constant tiles. RTV_NO_GEMMA_RELOC=1 compiles
+    every program for real (the oracle the relocation is tested against)."""
     cfg, layers, embed, final_norm = load_gemma4_hf(source) if isinstance(source, str) else source
     hidden, I, E = cfg["hidden_size"], cfg["moe_intermediate_size"], cfg["num_experts"]
     inter, top_k = cfg["intermediate_size"], cfg["top_k_experts"]
@@ -106,20 +121,32 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
     total = len(prompt_ids) - 1 + n_new
     max_tiles = -(-total // M)
     w4 = 4
+    reloc = not os.environ.get("RTV_NO_GEMMA_RELOC")
     for d in (hidden, I, inter) + tuple(l["head_dim"] for l in layers):
         if d % M:
             raise NotImplementedError(f"dimension {d} must be a multiple of {M}")
+    window = cfg.get("sliding_window")
 
-    image_parts = []
+    if image_dir:
+        os.makedirs(image_dir, exist_ok=True)
+    wd_ctx = tempfile.TemporaryDirectory(prefix="rtv_gemma4_", dir=image_dir)
+    wd = wd_ctx.name
+    img = os.path.join(wd, "state.img")
+    img_f = open(img, "wb")          # streamed: a real model's image is many GB and is never held in Python
     cursor = [0x1000]
 
     def place_bytes(b):
         a = cursor[0]
         cursor[0] += (len(b) + 0xFFF + 0x1000) & ~0xFFF
-        image_parts.append((a, b))
+        img_f.seek(a)
+        img_f.write(memoryview(b))
         return a
 
     def place(arr, quant=False):
+        if hasattr(arr, "blob"):                   # lazy Q4_0 weight (gemma4_gguf.Q4Mat): already INT4W g32
+            if int4_group != 32:
+                raise ValueError("GGUF Q4_0 weights need int4_group=32")
+            return place_bytes(arr.blob())
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         if quant and int4_group:
             return place_bytes(tvm_backend.int4_weight_blob(*tvm_backend.quantize_int4_group(arr, int4_group)).tobytes())
@@ -133,6 +160,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
     def gamma(v):
         return place(np.tile(np.asarray(v, np.float32), (M, 1)))
 
+    # Layout: everything small (activations, norm gains, router, KV caches) and the staging window sit BELOW 4 GiB
+    # (32-bit addresses); the big INT4 weights follow, above it if the model needs that (LOAD_TILE takes 36 bits).
     x_addr = place(np.zeros((M, hidden), np.float32))
     resid_addr = place(np.zeros((M, hidden), np.float32))
     h1_addr = place(np.zeros((M, hidden), np.float32))
@@ -144,18 +173,11 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         rproj = np.zeros((hidden, E_pad), np.float32)
         rproj[:, :E] = lw["router"].T
         d = dict(
-            wq=place(lw["wq"], True), wk=place(lw["wk"], True),
-            wv=place(lw["wv"], True) if lw["wv"] is not None else None, wo=place(lw["wo"], True),
             q_norm=gamma(lw["q_norm"]), k_norm=gamma(lw["k_norm"]),
             g_in=gamma(lw["g_in"]), g_post_attn=gamma(lw["g_post_attn"]), g_pre_ff=gamma(lw["g_pre_ff"]),
             g_post_ff=gamma(lw["g_post_ff"]), g_pre_ff2=gamma(lw["g_pre_ff2"]),
             g_post_ff1=gamma(lw["g_post_ff1"]), g_post_ff2=gamma(lw["g_post_ff2"]),
-            g_router=gamma(lw["router_scale"] * hidden ** -0.5),
-            mlp_gate=place(lw["mlp_gate"], True), mlp_up=place(lw["mlp_up"], True),
-            mlp_down=place(lw["mlp_down"], True), router=place(rproj),
-            experts=[dict(w_gate=place(e["w_gate"], True), w_up=place(e["w_up"], True),
-                          w_down=place(e["w_down"], True)) for e in lw["experts"]],
-            k_cache=[], v_cache=[])
+            g_router=gamma(lw["router_scale"] * hidden ** -0.5), router=place(rproj), k_cache=[], v_cache=[])
         for _ in range(nkv):
             kb = place_zeros(max_tiles * M * hd * w4)
             d["k_cache"].append([kb + t * M * hd * w4 for t in range(max_tiles)])
@@ -163,9 +185,19 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             d["v_cache"].append([vb + t * M * hd * w4 for t in range(max_tiles)])
         L.append(d)
     staging_base = (cursor[0] + 0xFFF) & ~0xFFF
-    image = bytearray(staging_base)
-    for a, b in image_parts:
-        image[a:a + len(b)] = b
+    cursor[0] = staging_base + staging_reserve
+    for lw, d in zip(layers, L):
+        d.update(wq=place(lw["wq"], True), wk=place(lw["wk"], True),
+                 wv=place(lw["wv"], True) if lw["wv"] is not None else None, wo=place(lw["wo"], True),
+                 mlp_gate=place(lw["mlp_gate"], True), mlp_up=place(lw["mlp_up"], True),
+                 mlp_down=place(lw["mlp_down"], True),
+                 experts=[dict(w_gate=place(e["w_gate"], True), w_up=place(e["w_up"], True),
+                               w_down=place(e["w_down"], True)) for e in lw["experts"]])
+        if verbose:
+            print(f"  placed weights, image {cursor[0] / 2**30:.2f} GiB", file=sys.stderr)
+    image_bytes = (cursor[0] + 0xFFF) & ~0xFFF
+    img_f.truncate(image_bytes)
+    img_f.close()
 
     def fresh():
         c = NPUCompiler(hal)
@@ -200,7 +232,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             wv_addr=a["wv"] if a["wv"] is not None else a["wk"], wo_addr=a["wo"], out_addr=attn, pos=pos,
             k_cache_tiles=a["k_cache"], v_cache_tiles=a["v_cache"], rope_theta=lw["theta"],
             q_norm_addr=a["q_norm"], k_norm_addr=a["k_norm"], attn_scale=None, v_norm=True,
-            v_from_k=a["wv"] is None, rope_angles=lw["rope_angles"])
+            v_from_k=a["wv"] is None, rope_angles=lw["rope_angles"],
+            window=window if lw["type"] == "sliding_attention" else None)
         an = buf(c)
         norm(c, attn, a["g_post_attn"], an)
         tvm_backend._emit_residual_add_fp32(c, x_addr, an, resid_addr, hidden)
@@ -217,7 +250,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         norm(c, resid_addr, a["g_pre_ff2"], en_addr)
         return c
 
-    def program_b(li, idx, wts):
+    def program_b(li, idx, wts, scalar=None):
         lw, a = layers[li], L[li]
         c = fresh()
         y = buf(c)
@@ -231,21 +264,118 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         norm(c, hsum, a["g_post_ff"], hn)
         x2 = buf(c)
         tvm_backend._emit_residual_add_fp32(c, resid_addr, hn, x2, hidden)
-        sc = tvm_backend._emit_scale_fp32(c, x2, hidden, lw["layer_scalar"])
+        sc = tvm_backend._emit_scale_fp32(c, x2, hidden, lw["layer_scalar"] if scalar is None else scalar)
         tvm_backend._emit_copy_slice_fp32(c, sc, x_addr, hidden, width=hidden)
         return c
 
-    with tempfile.TemporaryDirectory(prefix="rtv_gemma4_") as wd:
-        img = os.path.join(wd, "state.img")
-        open(img, "wb").write(bytes(image))
-        sess = _SimSession(sim, hal, img, len(image) + _SESSION_HEADROOM, wd)
+    # ---- relocation -------------------------------------------------------------------------------------------
+    def a_roles(li):
+        lw, a = layers[li], L[li]
+        hd, nkv = lw["head_dim"], lw["n_kv"]
+        q_dim, kv_dim = n_heads * hd, nkv * hd
+        wb = lambda K, N: _blob_bytes(K, N, int4_group)  # noqa: E731
+        r = {"wq": (a["wq"], wb(hidden, q_dim)), "wk": (a["wk"], wb(hidden, kv_dim)),
+             "wo": (a["wo"], wb(q_dim, hidden)), "mlp_gate": (a["mlp_gate"], wb(hidden, inter)),
+             "mlp_up": (a["mlp_up"], wb(hidden, inter)), "mlp_down": (a["mlp_down"], wb(inter, hidden)),
+             "router": (a["router"], hidden * E_pad * 4),
+             "q_norm": (a["q_norm"], M * hd * 4), "k_norm": (a["k_norm"], M * hd * 4)}
+        if a["wv"] is not None:
+            r["wv"] = (a["wv"], wb(hidden, kv_dim))
+        for g in ("g_in", "g_post_attn", "g_pre_ff", "g_post_ff1", "g_router", "g_pre_ff2"):
+            r[g] = (a[g], M * hidden * 4)
+        for h in range(nkv):
+            for t in range(max_tiles):
+                r[f"k{h}_{t}"] = (a["k_cache"][h][t], M * hd * 4)
+                r[f"v{h}_{t}"] = (a["v_cache"][h][t], M * hd * 4)
+        return r
+
+    def b_roles(li, idx):
+        a = L[li]
+        r = {"g_post_ff2": (a["g_post_ff2"], M * hidden * 4), "g_post_ff": (a["g_post_ff"], M * hidden * 4)}
+        for j, e in enumerate(idx):
+            ex = a["experts"][int(e)]
+            r[f"e{j}_gate"] = (ex["w_gate"], _blob_bytes(hidden, I, int4_group))
+            r[f"e{j}_up"] = (ex["w_up"], _blob_bytes(hidden, I, int4_group))
+            r[f"e{j}_down"] = (ex["w_down"], _blob_bytes(I, hidden, int4_group))
+        return r
+
+    def clone(tpl, stream, regions):
+        c = fresh()
+        c.instruction_stream = bytearray(stream)
+        c._const_regions = dict(regions)
+        c._const_cache = dict(tpl._const_cache)
+        c._dram_cursor, c._staging_cursor, c._staging_peak = tpl._dram_cursor, tpl._staging_cursor, tpl._staging_peak
+        return c
+
+    type_key = [(l["head_dim"], l["n_kv"], l["wv"] is not None, l["type"]) for l in layers]
+    rep_of = {}
+    for li, k in enumerate(type_key):
+        rep_of.setdefault(k, li)
+    step_caches = {k: DecodeStepCache(M, x_addr) for k in rep_of}
+    a_templates = {}                     # type key -> (pos, compiler) for the current position
+    b_state = {}                         # template compiler, sentinel region addresses, rep roles
+    SENT_W, SENT_S = 1234.5, 4321.25
+
+    def a_program(li, pos, xin):
+        if not reloc:
+            return program_a(li, pos, xin)
+        k = type_key[li]
+        tpl = a_templates.get(k)
+        if tpl is None or tpl[0] != pos:
+            rep = rep_of[k]
+            comp = step_caches[k].derive(pos, fresh())
+            if comp is None:
+                comp = program_a(rep, pos, None)
+                step_caches[k].observe(pos, comp)
+            tpl = a_templates[k] = (pos, comp)
+        comp = tpl[1]
+        rep = rep_of[k]
+        if li == rep:
+            stream = comp.instruction_stream
+        else:
+            stream = tvm_backend._relocate_instructions(
+                bytes(comp.instruction_stream), a_roles(rep), a_roles(li), 0, list(comp._const_cache.values()))
+        c = clone(comp, stream, comp._const_regions)
+        if xin is not None:
+            c._const_regions[x_addr] = xin.tobytes()
+        return c
+
+    def b_program(li, idx, wts):
+        if not reloc:
+            return program_b(li, idx, wts)
+        if not b_state:
+            idx0 = list(range(top_k))
+            tpl = program_b(0, idx0, [SENT_W + j for j in range(top_k)], scalar=SENT_S)
+            sent = {}
+            for addr, data in tpl._const_regions.items():
+                v = np.frombuffer(data, np.float32)
+                if v.size and (v == v[0]).all():
+                    for j in range(top_k):
+                        if v[0] == np.float32(SENT_W + j):
+                            sent[addr] = ("w", j)
+                    if v[0] == np.float32(SENT_S):
+                        sent[addr] = ("s", 0)
+            if sum(1 for v in sent.values() if v[0] == "w") != top_k or sum(1 for v in sent.values() if v[0] == "s") != 1:
+                raise RuntimeError("could not locate the route-weight / layer-scalar constant tiles in program B")
+            b_state.update(tpl=tpl, sent=sent, roles=b_roles(0, idx0))
+        tpl = b_state["tpl"]
+        stream = tvm_backend._relocate_instructions(
+            bytes(tpl.instruction_stream), b_state["roles"], b_roles(li, idx), 0, list(tpl._const_cache.values()))
+        regions = dict(tpl._const_regions)
+        for addr, (kind, j) in b_state["sent"].items():
+            val = wts[j] if kind == "w" else layers[li]["layer_scalar"]
+            regions[addr] = np.full((M, hidden), val, np.float32).tobytes()
+        return clone(tpl, stream, regions)
+
+    with wd_ctx:
+        sess = _SimSession(sim, hal, img, image_bytes + _SESSION_HEADROOM, wd)
         try:
             def step(token, pos):
                 xin = np.zeros((M, hidden), np.float32)
                 xin[0] = embed[token] * np.float32(hidden ** 0.5)
                 last = None
                 for li in range(n_layers):
-                    ca = program_a(li, pos, xin if li == 0 else None)
+                    ca = a_program(li, pos, xin if li == 0 else None)
                     tr = trace is not None and pos == len(prompt_ids) - 1
                     dbg = [(resid_addr, M * hidden * 4, "r"), (h1_addr, M * hidden * 4, "h"),
                            (en_addr, M * hidden * 4, "e"), (dbg_addrs["n2"], M * hidden * 4, "n"),
@@ -256,7 +386,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
                     p /= p.sum()
                     idx = np.argsort(-p, kind="stable")[:top_k]
                     wts = p[idx] / p[idx].sum() * layers[li]["per_expert_scale"][idx]
-                    cb = program_b(li, idx, wts)
+                    cb = b_program(li, idx, wts)
                     dumps = [(x_addr, M * hidden * 4, "x")] if (li == n_layers - 1 or tr) else ()
                     res = sess.run_step(cb, extra_dumps=dumps)
                     if tr:
@@ -271,7 +401,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             def head(h):
                 h = h.astype(np.float64)
                 n = h / np.sqrt((h ** 2).mean() + eps) * final_norm.astype(np.float64)
-                lg = n @ embed.T.astype(np.float64)
+                lg = (embed @ n.astype(np.float32)).astype(np.float64)
                 if softcap:
                     lg = np.tanh(lg / softcap) * softcap
                 return lg
@@ -287,25 +417,63 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
                     ids.append(int(top[0]))
                     if verbose:
                         print(f"  pos {pos}: token {ids[-1]}", file=sys.stderr)
+                    if ids[-1] in stop_ids:
+                        break
         finally:
             sess.close()
+    if stats is not None:
+        stats.update({str(k): dict(c.stats) for k, c in step_caches.items()})
     return ids, per_step
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--prompt-ids", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--model", help="Hugging Face Gemma-4 checkpoint directory")
+    src.add_argument("--gguf", help="llama.cpp Q4_0 GGUF (runs as INT4W g32)")
+    ap.add_argument("--layers", type=int, default=None, help="GGUF only: run just the first N layers")
+    ap.add_argument("--prompt-ids")
+    ap.add_argument("--prompt", help="text prompt (chat format); needs --tokenizer")
+    ap.add_argument("--tokenizer", default=os.path.expanduser("~/models/hf/gemma-4-12B-it-assistant"),
+                    help="directory with a Gemma-4 tokenizer.json (the vocab is shared across the family)")
     ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--int4-group", type=int, default=0)
+    ap.add_argument("--image-dir", default=None,
+                    help="where the DRAM image file is written (a real model is ~16 GB; /tmp is often a small tmpfs)")
+    ap.add_argument("--trace-out", help="save the per-layer hidden state at the last prompt position (.npz)")
     ap.add_argument("--sim", default=os.path.join(ROOT, "build", "rtv_sim"))
     ap.add_argument("--hal", default=os.path.join(_HERE, "hal_config.json"))
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
-    ids, steps = generate_gemma4(a.model, [int(x) for x in a.prompt_ids.split(",")], a.steps,
-                                 a.sim, a.hal, verbose=a.verbose)
+    group = a.int4_group
+    if a.gguf:
+        from gemma4_gguf import load_gemma4_gguf
+        source, group = load_gemma4_gguf(a.gguf, a.layers), 32
+    else:
+        source = a.model
+    trace = [] if a.trace_out else None
+    tok = None
+    stop = ()
+    if a.prompt is not None:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(a.tokenizer)
+        # Gemma-4 chat format: <bos><|turn>user\n{text}<turn|>\n<|turn>model\n ; <turn|> (106) / <eos> (1) end a reply
+        prompt_ids = [2] + tok(f"<|turn>user\n{a.prompt}<turn|>\n<|turn>model\n", add_special_tokens=False)["input_ids"]
+        stop = (1, 106)
+    elif a.prompt_ids:
+        prompt_ids = [int(x) for x in a.prompt_ids.split(",")]
+    else:
+        ap.error("give --prompt or --prompt-ids")
+    ids, steps = generate_gemma4(source, prompt_ids, a.steps,
+                                 a.sim, a.hal, verbose=a.verbose, int4_group=group, trace=trace, stop_ids=stop,
+                                 image_dir=a.image_dir or (os.path.expanduser("~/.cache/rtv_accel") if a.gguf else None))
     print("ids:", ids)
+    if tok is not None:
+        print("reply:", tok.decode([i for i in ids[len(prompt_ids):] if i not in stop]))
     for i, (t, l) in enumerate(steps):
         print(f"  step {i}: top5 {t}  logits {[round(v, 4) for v in l]}")
+    if trace:
+        np.savez(a.trace_out, hidden=np.stack([t["hidden"] for t in trace]))
     return 0
 
 
