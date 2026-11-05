@@ -48,6 +48,9 @@ M = 16
 
 def load_moe_checkpoint(model_dir):
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
+    # transformers 5 writes num_local_experts and nests the rope theta; classic configs use these keys
+    cfg.setdefault("num_experts", cfg.get("num_local_experts"))
+    cfg.setdefault("rope_theta", (cfg.get("rope_parameters") or {}).get("rope_theta", 1e6))
     m = SafeTensorsModel(model_dir)
     names = {name for name, _ in m.named_parameters()}
 
@@ -100,8 +103,7 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
     n_heads, n_kv = cfg["num_attention_heads"], cfg["num_key_value_heads"]
     head_dim = cfg.get("head_dim") or hidden // n_heads
     eps, theta = cfg["rms_norm_eps"], cfg.get("rope_theta", 1e6)
-    if E > M:
-        raise NotImplementedError(f"router is one 16-wide tile; num_experts={E} > {M}")
+    E_pad = (E + M - 1) // M * M           # router logits span ceil(E/16) output tiles
     for d in (hidden, I, head_dim):
         if d % M:
             raise NotImplementedError(f"dimension {d} must be a multiple of {M}")
@@ -142,14 +144,14 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
 
     routers, expert_addrs = [], []
     for lw in layers:
-        rp = np.zeros((hidden, M), np.float32)
+        rp = np.zeros((hidden, E_pad), np.float32)
         rp[:, :E] = lw["router"].T
         routers.append(place(rp))
         expert_addrs.append([dict(w_gate=place(e["w_gate"], True), w_up=place(e["w_up"], True),
                                   w_down=place(e["w_down"], True)) for e in lw["experts"]])
     resid_addr = place(np.zeros((M, hidden), np.float32))
     norm2_addr = place(np.zeros((M, hidden), np.float32))
-    logits_addr = place(np.zeros((M, M), np.float32))
+    logits_addr = place(np.zeros((M, E_pad), np.float32))
     staging_base = cursor[0]
     image = bytearray(max(len(dram), staging_base))
     image[:len(dram)] = dram
@@ -196,10 +198,10 @@ def generate_moe(model_dir, prompt_ids, n_new, sim, hal, verbose=False, trace=No
                         attn_scale=attn_scale)
                     tvm_backend._emit_residual_add_fp32(a, x_addr, attn, resid_addr, hidden)
                     norm(a, resid_addr, lw["gamma2"], norm2_addr)
-                    tvm_backend._emit_matmul_fp32(a, M, M, hidden, norm2_addr, routers[li],
+                    tvm_backend._emit_matmul_fp32(a, M, E_pad, hidden, norm2_addr, routers[li],
                                                   logits_addr)
-                    (raw,) = sess.run_step(a, extra_dumps=[(logits_addr, M * M * 4, "l")])
-                    lg = np.frombuffer(raw, np.float32).reshape(M, M)[0, :E].astype(np.float64)
+                    (raw,) = sess.run_step(a, extra_dumps=[(logits_addr, M * E_pad * 4, "l")])
+                    lg = np.frombuffer(raw, np.float32).reshape(M, E_pad)[0, :E].astype(np.float64)
 
                     p = np.exp(lg - lg.max())
                     p /= p.sum()
