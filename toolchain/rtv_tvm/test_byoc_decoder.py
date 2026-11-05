@@ -101,6 +101,15 @@ def graph_prefill(m, n_layers, n_real, tile_idx):
     return c, out
 
 
+def graph_prefill_relocated(m, n_layers, n_real, tile_idx):
+    c = fresh(m["base"])
+    out = tvm_backend._emit_model_kvcache_fp32_relocated(
+        c, n_layers, HID, INTER, NH, NKV, HD, x_addr=m["x"], layer_weights=m["lws"],
+        scratch_a=m["sa"], scratch_b=m["sb"], pos=0, rope_theta=THETA, attn_scale=SCALE,
+        layer_emitter=decoder_graph.make_prefill_layer_emitter(CFG, n_real, tile_idx, THETA, SCALE))
+    return c, out
+
+
 def compare(name, hc, ho, gc, go):
     same = bytes(hc.instruction_stream) == bytes(gc.instruction_stream) and ho == go
     return (name, same, f"{len(hc.instruction_stream) // 16} instrs"
@@ -155,6 +164,10 @@ def main():
                            *hand_prefill(mp, 3, 10, 0), *graph_prefill(mp, 3, 10, 0)))
     results.append(compare("prefill_second_tile_attends_back_byte_identical",
                            *hand_prefill(mp, 3, 6, 1), *graph_prefill(mp, 3, 6, 1)))
+    results.append(compare("prefill_relocated_3layers_byte_identical",
+                           *graph_prefill(mp, 3, 16, 0), *graph_prefill_relocated(mp, 3, 16, 0)))
+    results.append(compare("prefill_relocated_second_tile_byte_identical",
+                           *graph_prefill(mp, 3, 6, 1), *graph_prefill_relocated(mp, 3, 6, 1)))
     xb = np.random.default_rng(8).normal(size=(10, HID)).astype(np.float32)
     (hc, ho), (gc, go) = hand_prefill(mp, 3, 10, 0), graph_prefill(mp, 3, 10, 0)
     a, b = run_sim(mp, hc, ho, xb, rows=10), run_sim(mp, gc, go, xb, rows=10)

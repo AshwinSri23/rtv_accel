@@ -165,6 +165,19 @@ def emit_prefill_graph(compiler, cfg, n_layers, x_addr, layer_weights, scratch_a
     return out
 
 
+def make_prefill_layer_emitter(cfg, n_real, tile_idx, rope_theta=1e6, attn_scale=None):
+    """Prefill counterpart of make_layer_emitter, for tvm_backend._emit_model_kvcache_fp32_relocated:
+    compiles ONE layer of the batched (16-row) graph; layers 2+ are address-patched."""
+    def emit_layer(compiler, i, x_in, out, lw):
+        qk_norm = lw.get("q_norm") is not None
+        mod = build_decode_graph(cfg, 1, qk_norm, batched=True)
+        byoc_graph.emit_graph(
+            compiler, mod, _inputs({0: lw}, [0], x_in, qk_norm),
+            extern=prefill_lowering(cfg, {0: lw}, n_real, tile_idx, rope_theta, attn_scale),
+            fixed_outputs={BINDINGS_PER_LAYER - 1: out}, batch_alloc=True)
+    return emit_layer
+
+
 def _inputs(layer_weights, layer_ids, x_addr, qk_norm):
     inp = {"x": x_addr}
     for i in layer_ids:

@@ -281,9 +281,13 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
             if use_graph:
                 # prefill through the graph path too (per-row norms and the multi-tile causal
                 # attention are registered externs; adds and SwiGLU are pattern-claimed)
-                final_addr = decoder_graph.emit_prefill_graph(
-                    comp, graph_cfg, actual_n_layers, x_addr, layer_weights, scratch_a,
-                    scratch_b, n_real, c, rope_theta, attn_scale)
+                # layers 0-1 compile for real, the rest are address-patched (as in decode)
+                final_addr = tvm_backend._emit_model_kvcache_fp32_relocated(
+                    comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
+                    x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
+                    scratch_b=scratch_b, pos=0, rope_theta=rope_theta, attn_scale=attn_scale,
+                    layer_emitter=decoder_graph.make_prefill_layer_emitter(
+                        graph_cfg, n_real, c, rope_theta, attn_scale))
             else:
                 final_addr = tvm_backend._emit_model_kvcache_batched_fp32(
                     comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
