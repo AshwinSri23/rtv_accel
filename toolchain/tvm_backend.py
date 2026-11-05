@@ -3409,32 +3409,33 @@ def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delt
          because every layer at a given config consumes exactly the
          same amount of staging).
     """
-    source_ranges = [(addr, addr + nbytes, role)
-                     for role, (addr, nbytes) in source_roles.items()]
-
-    out = bytearray(instr_bytes)
-    for off in range(0, len(instr_bytes), 16):
-        word = int.from_bytes(instr_bytes[off:off + 16], "big")
-        fields = decode(word)
-        if fields["opcode"] not in (Opcode.LOAD_TILE, Opcode.STORE_TILE):
-            continue
-        addr = fields["dram_addr"]
-        if _addr_is_shared(addr, shared_ranges):
-            continue
-        new_addr = None
-        for start, end, role in source_ranges:
-            if start <= addr < end:
-                target_addr, _ = target_roles[role]
-                new_addr = target_addr + (addr - start)
-                break
-        if new_addr is None:
-            new_addr = addr + staging_delta
-        if new_addr == addr:
-            continue
-        fields["dram_addr"] = new_addr
-        new_word = encode(**fields)
-        out[off:off + 16] = new_word.to_bytes(16, "big")
-    return bytes(out)
+    import numpy as np
+    n = len(instr_bytes) // 16
+    w = np.frombuffer(instr_bytes, dtype=">u8").reshape(n, 2).astype(np.uint64)
+    hi = w[:, 0]
+    opc = (hi >> np.uint64(60)) & np.uint64(0xF)
+    mem = (opc == np.uint64(int(Opcode.LOAD_TILE))) | (opc == np.uint64(int(Opcode.STORE_TILE)))
+    # dram_addr: bits 24..55 of the high word (the 32-bit field only; dram_hi is untouched).
+    addr = ((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)).astype(np.int64)
+    todo = mem.copy()
+    for start, nbytes in shared_ranges:          # (1) shared constants stay put
+        todo &= ~((addr >= start) & (addr < start + nbytes))
+    new = addr.copy()
+    for role, (start, nbytes) in source_roles.items():   # (2) first matching role wins
+        sel = todo & (addr >= start) & (addr < start + nbytes)
+        new[sel] = target_roles[role][0] + (addr[sel] - start)
+        todo &= ~sel
+    new[todo] = addr[todo] + staging_delta          # (3) per-layer staging
+    changed = mem & (new != addr)
+    if not changed.any():
+        return bytes(instr_bytes)
+    if (new[changed] < 0).any() or (new[changed] > 0xFFFFFFFF).any():
+        raise ValueError("relocated DRAM address does not fit the 32-bit dram_addr field")
+    hi = np.where(changed,
+                  (hi & ~(np.uint64(0xFFFFFFFF) << np.uint64(24))) |
+                  (new.astype(np.uint64) << np.uint64(24)), hi)
+    w[:, 0] = hi
+    return w.astype(">u8").tobytes()
 
 
 def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_heads,
