@@ -26,10 +26,11 @@ Structure produced by rtv_tvm.schedule, which this walks:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tvm_ffi                                           # noqa: E402
 import tvm.ir as tir_ir                                  # noqa: E402
 import tvm.tirx as tir                                   # noqa: E402
 from rtv_isa import (Opcode, ActivationMode, SRAMMap, DType,  # noqa: E402
-                     encode, to_bytes)
+                     encode, decode, to_bytes)
 
 # Backward-compatibility aliases
 NPUOpcodes = Opcode
@@ -564,9 +565,121 @@ class Codegen:
             self.visit(node.body, env)
 
 
+# ---------------------------------------------------------------------------------------------
+# Instruction-stream cache.
+#
+# Walking a scheduled PrimFunc tile by tile in Python is the largest remaining compile cost
+# (profiled: ~1.3M _tile_copy calls for a 6-layer run). The SAME scheduled function is emitted
+# over and over with different DRAM base addresses (per-head attention matmuls, per-layer
+# projections), and the instruction stream is a pure function of (function, dtype, kind, the
+# emit arguments) except for the DRAM addresses of LOAD_TILE/STORE_TILE. So: emit once with FAKE,
+# distinct, far-apart base addresses per buffer, remember the bytes, and on a later call patch
+# the real bases in. Every LOAD/STORE address in the template is fake_base[k] + offset, so which
+# buffer it belongs to and its offset are unambiguous.
+#
+# Not cached (falls back to a normal emit): INDIRECT_ADDR loads (they reuse the high-address
+# bits for the pointer) and anything with more buffers than fit in the fake address space.
+# RTV_NO_STREAM_CACHE=1 disables it; test_stream_cache checks cached == uncached byte for byte.
+# ---------------------------------------------------------------------------------------------
+_STREAM_CACHE = {}          # key -> (primfunc, template bytes, [fake base per name]) | None
+_FAKE_STRIDE = 1 << 32      # buffer k's fake base is (k + 1) << 32; a buffer's span is 4 GiB
+_MAX_BUFFERS = 14
+STREAM_CACHE_STATS = {"hit": 0, "miss": 0, "uncacheable": 0}
+
+
+class _StreamSink:
+    """Stands in for the compiler while building a template: Codegen only appends bytes."""
+    def __init__(self):
+        self.instruction_stream = bytearray()
+
+
+def _patch_template(template, fake_bases, real_bases):
+    """Rewrite LOAD_TILE/STORE_TILE DRAM addresses: fake_bases[k] + off -> real_bases[k] + off."""
+    import numpy as np
+    n = len(template) // 16
+    w = np.frombuffer(template, dtype=">u8").reshape(n, 2).astype(np.uint64)
+    hi, lo = w[:, 0], w[:, 1]
+    opc = (hi >> np.uint64(60)) & np.uint64(0xF)
+    mem = (opc == np.uint64(int(Opcode.LOAD_TILE))) | (opc == np.uint64(int(Opcode.STORE_TILE)))
+    addr = ((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)) | \
+        (((lo >> np.uint64(36)) & np.uint64(0xF)) << np.uint64(32))
+    new = addr.copy()
+    for fb, rb in zip(fake_bases, real_bases):
+        sel = mem & (addr >= np.uint64(fb)) & (addr < np.uint64(fb + _FAKE_STRIDE))
+        new[sel] = addr[sel] - np.uint64(fb) + np.uint64(rb)
+    if (new[mem] >> np.uint64(36)).any():
+        raise ValueError("relocated DRAM address exceeds 36 bits")
+    hi = (hi & ~(np.uint64(0xFFFFFFFF) << np.uint64(24))) | \
+        ((new & np.uint64(0xFFFFFFFF)) << np.uint64(24))
+    lo = (lo & ~(np.uint64(0xF) << np.uint64(36))) | (((new >> np.uint64(32)) & np.uint64(0xF)) << np.uint64(36))
+    w[:, 0] = np.where(mem, hi, w[:, 0])
+    w[:, 1] = np.where(mem, lo, w[:, 1])
+    return w.astype(">u8").tobytes()
+
+
+def _template_ok(template, fake_bases):
+    """Every LOAD/STORE address must belong to exactly one fake buffer, and no indirect loads."""
+    for off in range(0, len(template), 16):
+        f = decode(int.from_bytes(template[off:off + 16], "big"))
+        if f["opcode"] not in (Opcode.LOAD_TILE, Opcode.STORE_TILE):
+            continue
+        if f["activation"] == ActivationMode.INDIRECT_ADDR:
+            return False
+        a = f["dram_addr"] | (f["dram_hi"] << 32)
+        if not any(fb <= a < fb + _FAKE_STRIDE for fb in fake_bases):
+            return False
+    return True
+
+
 def emit(compiler, sch, dram, dtype=DType.INT8, kind="gemm", scale_num=0,
          lut_dram=None, temperature=0, reduce_accumulate=False, indirect=None):
-    """Emit instructions for a scheduled PrimFunc into `compiler`."""
+    """Emit instructions for a scheduled PrimFunc into `compiler` (through the stream cache)."""
+    import os
+    names = sorted(dram)
+    if indirect or os.environ.get("RTV_NO_STREAM_CACHE") or len(names) + 1 > _MAX_BUFFERS \
+            or not hasattr(compiler, "instruction_stream"):
+        return _emit_uncached(compiler, sch, dram, dtype, kind, scale_num, lut_dram, temperature,
+                              reduce_accumulate, indirect)
+    func = sch.mod["main"]
+    key = (tvm_ffi.structural_hash(func), tuple(str(getattr(p, "name", p)) for p in func.params),
+           tuple(names), int(dtype), kind, scale_num, temperature, bool(reduce_accumulate),
+           lut_dram is not None)
+    ent = _STREAM_CACHE.get(key, False)
+    if ent is not False and ent is not None and not tvm_ffi.structural_equal(ent[0], func):
+        ent = None                   # hash collision: do not trust, do not cache
+        STREAM_CACHE_STATS["uncacheable"] += 1
+        return _emit_uncached(compiler, sch, dram, dtype, kind, scale_num, lut_dram, temperature,
+                              reduce_accumulate, indirect)
+    keys = names + (["__lut__"] if lut_dram is not None else [])
+    real = [dram[n] for n in names] + ([lut_dram] if lut_dram is not None else [])
+    if ent is None:
+        STREAM_CACHE_STATS["uncacheable"] += 1
+        return _emit_uncached(compiler, sch, dram, dtype, kind, scale_num, lut_dram, temperature,
+                              reduce_accumulate, indirect)
+    if ent is False:
+        fake = [(i + 1) * _FAKE_STRIDE for i in range(len(keys))]
+        sink = _StreamSink()
+        fdram = {n: fake[i] for i, n in enumerate(names)}
+        _emit_uncached(sink, sch, fdram, dtype, kind, scale_num,
+                       fake[-1] if lut_dram is not None else None, temperature,
+                       reduce_accumulate, None)
+        template = bytes(sink.instruction_stream)
+        if not _template_ok(template, fake):
+            _STREAM_CACHE[key] = None
+            STREAM_CACHE_STATS["uncacheable"] += 1
+            return _emit_uncached(compiler, sch, dram, dtype, kind, scale_num, lut_dram,
+                                  temperature, reduce_accumulate, indirect)
+        ent = (func, template, fake)
+        _STREAM_CACHE[key] = ent
+        STREAM_CACHE_STATS["miss"] += 1
+    else:
+        STREAM_CACHE_STATS["hit"] += 1
+    compiler.instruction_stream.extend(_patch_template(ent[1], ent[2], real))
+    return compiler.instruction_stream
+
+
+def _emit_uncached(compiler, sch, dram, dtype=DType.INT8, kind="gemm", scale_num=0,
+                   lut_dram=None, temperature=0, reduce_accumulate=False, indirect=None):
     cg = Codegen(compiler, dram, dtype, kind)
     cg.scale_num = scale_num
     cg.lut_dram = lut_dram
