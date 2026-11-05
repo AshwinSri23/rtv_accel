@@ -50,6 +50,9 @@ from tvm import relax                               # noqa: E402
 from tvm.relax.dpl import pattern as dpl            # noqa: E402
 from tvm.relax.backend.pattern_registry import register_patterns  # noqa: E402
 from tvm.script import tirx as T                    # noqa: E402
+import tvm_fast_stack                                # noqa: E402
+if not os.environ.get("RTV_NO_FAST_STACK"):
+    tvm_fast_stack.install()    # cheap TVMScript decorators; see tvm_fast_stack.py
 
 from compiler_state import NPUCompiler, DType, SRAMMap, _padded, _align   # noqa: E402
 
