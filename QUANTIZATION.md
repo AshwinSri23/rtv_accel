@@ -96,8 +96,10 @@ rows via `generate(..., prefill_hook=)`, then the trailing norm and lm_head on t
 same dequantised weights. INT4 g32 GPTQ, first 64 tokens: chip ppl 45.5234, PyTorch 45.5214, max per-token |dNLL|
 1.1e-4. So the chip computes the model the study measured. The absolute number is for 63 tokens and is not comparable to
 the 2048-token study figures (29.39 FP32 / 30.77 INT4); a 64-token run takes ~7 minutes on the simulator, so the full
-2048 tokens was not run.
+2048 tokens was not run (after the compile-time work a 64-token run takes under a minute, so a longer run is now practical).
+
+Same 63 tokens, BF16 weights: chip ppl 49.8571 vs PyTorch 49.8549 (max |dNLL| 1.0e-4). INT8 weights (per-channel): chip 49.2227 vs PyTorch 49.2205 (max |dNLL| 1.05e-4). (FP32 reference on these tokens is not shown here; compare formats against each other only through the 2048-token study.)
 
 ## 4. Not done
 
-INT4 on a real trained MoE (only the tiny random one is tested); chip perplexity beyond 64 tokens (slow); AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.
+INT4 on a real trained MoE (only the tiny random one is tested); chip perplexity beyond 64 tokens; AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.

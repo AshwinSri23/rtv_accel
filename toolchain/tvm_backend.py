@@ -276,6 +276,27 @@ def _get_or_build_const(compiler, key, nbytes, build_fn):
     return addr
 
 
+def _kv_tail_mask_data(M, seq_k, valid_len):
+    mask = np.zeros((M, seq_k), dtype=np.float32)
+    mask[:, valid_len:] = -1e30
+    return mask
+
+
+def _rope_cossin_data(M, head_dim, pos, theta):
+    cos_tab, sin_tab = NPUCompiler.rope_tables(pos + 1, head_dim, base=theta, dtype=DType.FP32)
+    cos_bcast = np.tile(cos_tab[pos], (M, 1)).astype(np.float32)
+    sin_bcast = np.tile(sin_tab[pos], (M, 1)).astype(np.float32)
+    return np.concatenate([cos_bcast, sin_bcast], axis=0)
+
+
+# The decode-step constants whose CONTENT depends on the position, keyed by the _get_or_build_const
+# tag: tag -> f(M, key, pos) -> ndarray. decode_step_cache.py rebuilds these for a derived step.
+POS_CONSTS = {
+    "kv_tail_mask": lambda M, key, pos: _kv_tail_mask_data(M, key[1], pos + 1),
+    "rope_cossin": lambda M, key, pos: _rope_cossin_data(M, key[1], pos, key[3]),
+}
+
+
 def _rmsnorm_prim_fp32(M, N, x_stride=None, out_stride=None):
     """One RMSNorm-with-gamma tile, as three chained FP32 PrimFuncs.
 
@@ -1913,13 +1934,9 @@ def _emit_kv_cache_tail_mask_fp32(compiler, seq_k, valid_len):
     if not (0 < valid_len <= seq_k):
         raise ValueError(f"valid_len must be in (0, {seq_k}]; got {valid_len}")
 
-    def _build():
-        mask = np.zeros((M, seq_k), dtype=np.float32)
-        mask[:, valid_len:] = -1e30
-        return mask
-
     return _get_or_build_const(compiler, ("kv_tail_mask", seq_k, valid_len),
-                               M * seq_k * 4, _build)
+                               M * seq_k * 4,
+                               lambda: _kv_tail_mask_data(M, seq_k, valid_len))
 
 
 def _emit_causal_mask_fp32(compiler, n_real, tile_idx=0):
@@ -2211,15 +2228,9 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     # this function is called 24 times per layer (16 Q heads + 8 K heads)
     # x28 layers = 672 times per decode step, all with the SAME head_dim/
     # pos/theta -- see _get_or_build_const's own docstring.
-    def _build_cossin():
-        cos_tab, sin_tab = NPUCompiler.rope_tables(pos + 1, head_dim, base=theta,
-                                                    dtype=DType.FP32)
-        cos_bcast = np.tile(cos_tab[pos], (M, 1)).astype(np.float32)
-        sin_bcast = np.tile(sin_tab[pos], (M, 1)).astype(np.float32)
-        return np.concatenate([cos_bcast, sin_bcast], axis=0)
-
     cossin_addr = _get_or_build_const(compiler, ("rope_cossin", head_dim, pos, theta),
-                                      2 * M * head_dim * 4, _build_cossin)
+                                      2 * M * head_dim * 4,
+                                      lambda: _rope_cossin_data(M, head_dim, pos, theta))
     cos_addr = cossin_addr
     sin_addr = cossin_addr + M * head_dim * 4
 

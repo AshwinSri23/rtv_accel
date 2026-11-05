@@ -79,7 +79,8 @@ sys.path.insert(0, _HERE)
 
 from compiler_state import NPUCompiler, DType  # noqa: E402
 import tvm_backend                             # noqa: E402
-import checkpoint_loader                       # noqa: E402
+import checkpoint_loader
+from decode_step_cache import DecodeStepCache                       # noqa: E402
 
 ROOT = os.path.dirname(_HERE)
 M = 16
@@ -321,34 +322,50 @@ def generate(model_dir, prompt, n_new_tokens, n_layers=None, sim=None, hal=None,
         # later layer is a cheap address patch instead of a fresh TVM
         # schedule/codegen pass (~7x faster per step at Qwen3-0.6B's real
         # 28-layer scale; see _emit_model_kvcache_fp32_relocated).
+        step_cache = None if os.environ.get("RTV_NO_STEP_CACHE") else \
+            DecodeStepCache(M, x_addr)
+        step_final_addr = None
         for pos in range(n_batch, total_steps):
             token_id = prompt_ids[pos] if pos < P else next_input_id
 
-            comp = NPUCompiler(hal)
-            comp.bf16_weights = bf16_weights
-            comp.int8_weights = int8_weights
-            comp.int4_group = int4_group
-            comp.reuse_layer_staging = True    # layers 2+ share layer 1's staging (test_staging_reuse)
-            comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
-            comp.dtype = DType.FP32
-            comp.instruction_stream = bytearray()
-            comp._dram_cursor = base_dram_cursor
+            def _new_comp():
+                comp = NPUCompiler(hal)
+                comp.bf16_weights = bf16_weights
+                comp.int8_weights = int8_weights
+                comp.int4_group = int4_group
+                comp.reuse_layer_staging = True    # layers 2+ share layer 1's staging (test_staging_reuse)
+                comp.rms_eps = eps      # RMSNorm epsilon (the chip's norms add it into the sum of squares)
+                comp.dtype = DType.FP32
+                comp.instruction_stream = bytearray()
+                comp._dram_cursor = base_dram_cursor
+                return comp
 
             x_row = np.zeros((M, hidden), dtype=np.float32)
             x_row[0, :] = embed_tokens[token_id].astype(np.float32)
-            comp._const_regions[x_addr] = x_row.tobytes()
 
-            final_addr = tvm_backend._emit_model_kvcache_fp32_relocated(
-                comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
-                x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
-                scratch_b=scratch_b, pos=pos, rope_theta=rope_theta,
-                attn_scale=attn_scale,
-                # --graph: compile each decode layer through the Relax/BYOC graph path
-                # (decoder_graph.py) instead of the hand-driven emitter; the stream is
-                # byte-identical (test_byoc_decoder.py); prefill is graph-driven too.
-                layer_emitter=(decoder_graph.make_layer_emitter(
-                    graph_cfg, layer_weights, pos, rope_theta, attn_scale) if use_graph else None),
-            )
+            # within one KV tile consecutive steps differ only in a few addresses and two
+            # position-dependent constants: derive them (decode_step_cache.py) instead of recompiling
+            comp = step_cache.derive(pos, _new_comp()) if step_cache is not None else None
+            if comp is not None:
+                comp._const_regions[x_addr] = x_row.tobytes()
+                final_addr = step_final_addr
+            else:
+                comp = _new_comp()
+                comp._const_regions[x_addr] = x_row.tobytes()
+                final_addr = tvm_backend._emit_model_kvcache_fp32_relocated(
+                    comp, actual_n_layers, hidden, inter, n_heads, n_kv_heads, head_dim,
+                    x_addr=x_addr, layer_weights=layer_weights, scratch_a=scratch_a,
+                    scratch_b=scratch_b, pos=pos, rope_theta=rope_theta,
+                    attn_scale=attn_scale,
+                    # --graph: compile each decode layer through the Relax/BYOC graph path
+                    # (decoder_graph.py) instead of the hand-driven emitter; the stream is
+                    # byte-identical (test_byoc_decoder.py); prefill is graph-driven too.
+                    layer_emitter=(decoder_graph.make_layer_emitter(
+                        graph_cfg, layer_weights, pos, rope_theta, attn_scale) if use_graph else None),
+                )
+                step_final_addr = final_addr
+                if step_cache is not None:
+                    step_cache.observe(pos, comp)
 
             (out_raw,) = session.run_step(
                 comp, extra_dumps=[(final_addr, M * hidden * 4, "out")])
