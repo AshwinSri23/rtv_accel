@@ -120,6 +120,10 @@ def main():
         ("two_tiles_16_plus_4_then_decode", lambda: run_case(32, 48, 4, 2, 16, 2, 20, 3)),
         ("two_full_tiles_then_decode", lambda: run_case(32, 48, 4, 2, 16, 2, 32, 2)),
         ("three_tiles_40_headdim32", lambda: run_case(48, 64, 2, 1, 32, 2, 40, 2)),
+        # long context: 5 KV tiles (prefill 4 full tiles + 8 rows) then decode across the 80-row boundary
+        ("five_tiles_72_then_decode", lambda: run_case(32, 48, 4, 2, 16, 1, 72, 10)),
+        ("scaled_six_tiles_90_then_decode", lambda: run_case(32, 48, 2, 1, 16, 2, 90, 4,
+                                                            attn_scale=16 ** -0.5)),
         # attn_scale = head_dim**-0.5: real attention scores are q.k/sqrt(head_dim).
         # Missing from the production path until the Hugging Face comparison caught it.
         ("scaled_two_tiles_then_decode", lambda: run_case(32, 48, 4, 2, 16, 2, 20, 3,

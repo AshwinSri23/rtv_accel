@@ -230,6 +230,8 @@ def main():
          lambda: run_decode_loop_case(32, 48, 4, 2, 16, n_layers=2, n_steps=10)),
         ("decode_1layer_1head_20steps_spans_2tiles",
          lambda: run_decode_loop_case(32, 48, 1, 1, 16, n_layers=1, n_steps=20)),
+        ("decode_1layer_gqa_40steps_spans_3tiles",
+         lambda: run_decode_loop_case(32, 48, 4, 2, 16, n_layers=1, n_steps=40)),
         ("decode_2layer_headdim32",
          lambda: run_decode_loop_case(48, 64, 2, 1, 32, n_layers=2, n_steps=8)),
         ("decode_2layer_gqa_qk_norm",
