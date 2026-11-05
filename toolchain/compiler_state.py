@@ -154,7 +154,8 @@ class NPUCompiler:
     # ── RoPE host-side tables ────────────────────────────────────────────
 
     @staticmethod
-    def rope_tables(max_pos: int, head_dim: int, base: float = 1e6, dtype: int = 0):
+    def rope_tables(max_pos: int, head_dim: int, base: float = 1e6, dtype: int = 0,
+                    rope_angles=None):
         """(cos, signed_sin) tables, each (max_pos, head_dim). theta_i =
         base ** (-2i/head_dim); angle at position p is p*theta_i. Both
         halves of each row share the same angles (the half-split
@@ -172,6 +173,8 @@ class NPUCompiler:
 
         half = head_dim // 2
         inv = base ** (-np.arange(0, half, dtype=np.float64) * 2.0 / head_dim)
+        if rope_angles is not None:      # "proportional" partial RoPE (Gemma-4): only the first
+            inv[rope_angles:] = 0.0      # rope_angles frequencies rotate; the rest pass through
         ang = np.outer(np.arange(max_pos, dtype=np.float64), inv)
 
         cos = np.concatenate([np.cos(ang), np.cos(ang)], axis=1)

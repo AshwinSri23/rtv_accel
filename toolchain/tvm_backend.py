@@ -282,8 +282,9 @@ def _kv_tail_mask_data(M, seq_k, valid_len):
     return mask
 
 
-def _rope_cossin_data(M, head_dim, pos, theta):
-    cos_tab, sin_tab = NPUCompiler.rope_tables(pos + 1, head_dim, base=theta, dtype=DType.FP32)
+def _rope_cossin_data(M, head_dim, pos, theta, rope_angles=None):
+    cos_tab, sin_tab = NPUCompiler.rope_tables(pos + 1, head_dim, base=theta, dtype=DType.FP32,
+                                               rope_angles=rope_angles)
     cos_bcast = np.tile(cos_tab[pos], (M, 1)).astype(np.float32)
     sin_bcast = np.tile(sin_tab[pos], (M, 1)).astype(np.float32)
     return np.concatenate([cos_bcast, sin_bcast], axis=0)
@@ -293,7 +294,8 @@ def _rope_cossin_data(M, head_dim, pos, theta):
 # tag: tag -> f(M, key, pos) -> ndarray. decode_step_cache.py rebuilds these for a derived step.
 POS_CONSTS = {
     "kv_tail_mask": lambda M, key, pos: _kv_tail_mask_data(M, key[1], pos + 1),
-    "rope_cossin": lambda M, key, pos: _rope_cossin_data(M, key[1], pos, key[3]),
+    "rope_cossin": lambda M, key, pos: _rope_cossin_data(M, key[1], pos, key[3],
+                                                         key[4] if len(key) > 4 else None),
 }
 
 
@@ -474,7 +476,8 @@ def _emit_matmul_fp32(compiler, M, N, K, a_addr, b_addr, c_addr,
                  indirect={"B": indirect_b} if indirect_b is not None else None)
 
 
-def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, out_addr):
+def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, out_addr,
+                       act="silu"):
     """Mixture-of-experts FFN for ONE token whose routing is already decided:
     out = sum_j route_weights[j] * SwiGLU_{experts[j]}(x).
 
@@ -493,7 +496,7 @@ def _emit_moe_ffn_fp32(compiler, hidden, inter, x_addr, experts, route_weights, 
     for j, (ex, w) in enumerate(zip(experts, route_weights)):
         y = compiler.alloc_staging(M * hidden * 4)
         _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, ex["w_gate"],
-                              ex["w_up"], ex["w_down"], y)
+                              ex["w_up"], ex["w_down"], y, act=act)
         # The route weight is a runtime value (it depends on the router), so it
         # enters as a constant tile in this program's own DRAM constants.
         wt = compiler.alloc_staging(M * hidden * 4)
@@ -991,7 +994,7 @@ def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32,
 
 
 def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,
-                          w_up_addr, w_down_addr, out_addr):
+                          w_up_addr, w_down_addr, out_addr, act="silu"):
     """SwiGLU FFN entirely via TVM schedule+codegen -- npu_compiler.py's
     compile_mlp_block is not called.
 
@@ -1023,9 +1026,16 @@ def _emit_swiglu_ffn_fp32(compiler, hidden, inter, x_addr, w_gate_addr,
                 C[vi, vj] = A[vi, vj] / (T.float32(1.0)
                                         + T.exp(T.float32(0.0) - A[vi, vj]))
 
-    codegen.emit(compiler,
-                 schedule.schedule_unary(silu, "silu", intrin.register_silu_fp32()),
-                 {"A": gate_stage, "C": gate_stage}, dtype=DType.FP32, kind="elemwise")
+    if act == "silu":
+        codegen.emit(compiler,
+                     schedule.schedule_unary(silu, "silu", intrin.register_silu_fp32()),
+                     {"A": gate_stage, "C": gate_stage}, dtype=DType.FP32, kind="elemwise")
+    elif act == "gelu_tanh":          # Gemma: built from existing ops (see _emit_gelu_tanh_fp32)
+        g_out = compiler.alloc_staging(stage_bytes)
+        _emit_gelu_tanh_fp32(compiler, inter, gate_stage, g_out)
+        gate_stage = g_out
+    else:
+        raise ValueError(f"unknown activation {act!r}")
 
     @T.prim_func(s_tir=True)
     def mul(a: T.handle, b: T.handle, c: T.handle) -> None:
@@ -2258,7 +2268,8 @@ def _emit_mul_fp32(compiler, a_addr, b_addr, out_addr, width, a_stride=None):
                  dtype=DType.FP32, kind="elemwise")
 
 
-def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_stride=None):
+def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_stride=None,
+                    rope_angles=None):
     """Apply RoPE to a (16, head_dim) tile at absolute position `pos`:
     out = in*cos + rotate_half(in)*sin, the "half-split" convention Qwen/
     Llama use -- q' = q*cos + rotate_half(q)*sin, rotate_half(x1,x2) =
@@ -2324,9 +2335,9 @@ def _emit_rope_fp32(compiler, head_dim, pos, in_addr, out_addr, theta=1e6, in_st
     # this function is called 24 times per layer (16 Q heads + 8 K heads)
     # x28 layers = 672 times per decode step, all with the SAME head_dim/
     # pos/theta -- see _get_or_build_const's own docstring.
-    cossin_addr = _get_or_build_const(compiler, ("rope_cossin", head_dim, pos, theta),
-                                      2 * M * head_dim * 4,
-                                      lambda: _rope_cossin_data(M, head_dim, pos, theta))
+    key = ("rope_cossin", head_dim, pos, theta) + ((rope_angles,) if rope_angles is not None else ())
+    cossin_addr = _get_or_build_const(compiler, key, 2 * M * head_dim * 4,
+                                      lambda: _rope_cossin_data(M, head_dim, pos, theta, rope_angles))
     cos_addr = cossin_addr
     sin_addr = cossin_addr + M * head_dim * 4
 
@@ -2670,7 +2681,8 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
                                        x_addr, wq_addr, wk_addr, wv_addr, wo_addr,
                                        out_addr, pos, k_cache_tiles, v_cache_tiles,
                                        rope_theta=1e6, q_norm_addr=None, k_norm_addr=None,
-                                       attn_scale=None):
+                                       attn_scale=None, v_norm=False, v_from_k=False,
+                                       rope_angles=None):
     """The actual decode-step attention operation: project Q/K/V for the
     CURRENT real token, apply RoPE at its absolute position, append the
     new K/V into a genuine growing multi-tile KV-cache, then attend over
@@ -2703,6 +2715,11 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     (the layer-level convention -- see _emit_rmsnorm_row_fp32's
     docstring). head_dim must be a multiple of compiler.tile_dim (16),
     same as _emit_attention_block_fp32.
+
+    Gemma-4 options (all off by default, leaving the Qwen3 stream byte-identical): `v_norm`
+    applies a weightless per-head RMSNorm to V (gain 1); `v_from_k` takes V from the RAW K
+    projection (before k_norm and RoPE) instead of a V projection (wv_addr unused); `rope_angles`
+    rotates only that many frequencies ("proportional" partial RoPE, rope_tables).
 
     q_norm_addr/k_norm_addr: real Qwen3 applies a per-head RMSNorm to Q
     and K -- ONE shared (head_dim,) gain per projection, reused by every
@@ -2745,7 +2762,14 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
 
     _emit_weight_matmul_fp32(compiler, M, q_dim, hidden, x_addr, wq_addr, q_stage)
     _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wk_addr, k_proj_stage)
-    _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_proj_stage)
+    k_src = k_proj_stage            # where k_norm reads (and, in-place, writes) the K projection
+    if v_from_k:
+        if k_norm_addr is None:
+            raise ValueError("v_from_k needs k_norm (K is normed out of place, V keeps the raw K)")
+        v_proj_stage = k_proj_stage                       # V = the raw K projection
+        k_proj_stage = compiler.alloc_staging(M * kv_dim * w)   # normed + rotated K lives here
+    else:
+        _emit_weight_matmul_fp32(compiler, M, kv_dim, hidden, x_addr, wv_addr, v_proj_stage)
 
     # Qwen3's per-head q_norm/k_norm: one shared (head_dim,) RMSNorm gain,
     # applied independently to each head's own head_dim-wide slice, IN
@@ -2768,8 +2792,18 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
         norm_stage = compiler.alloc_staging(M * _padded(head_dim) * w)
         for kv_h in range(n_kv_heads):
             off = kv_h * head_dim * w
-            _emit_rmsnorm_row_fp32(compiler, head_dim, x_addr=k_proj_stage + off,
+            _emit_rmsnorm_row_fp32(compiler, head_dim, x_addr=k_src + off,
                                    gamma_addr=k_norm_addr, out_addr=k_proj_stage + off,
+                                   scratch_addr=norm_scratch, stage_addr=norm_stage,
+                                   x_stride=kv_dim, out_stride=kv_dim)
+    if v_norm:
+        ones = _const_tile_fp32(compiler, head_dim, 1.0)
+        norm_scratch = compiler.alloc_staging(w)
+        norm_stage = compiler.alloc_staging(M * _padded(head_dim) * w)
+        for kv_h in range(n_kv_heads):
+            off = kv_h * head_dim * w
+            _emit_rmsnorm_row_fp32(compiler, head_dim, x_addr=v_proj_stage + off,
+                                   gamma_addr=ones, out_addr=v_proj_stage + off,
                                    scratch_addr=norm_scratch, stage_addr=norm_stage,
                                    x_stride=kv_dim, out_stride=kv_dim)
 
@@ -2781,11 +2815,11 @@ def _emit_attention_block_kvcache_fp32(compiler, hidden, n_heads, n_kv_heads, he
     for qh in range(n_heads):
         off = qh * head_dim * w
         _emit_rope_fp32(compiler, head_dim, pos, q_stage + off, q_stage + off,
-                        theta=rope_theta, in_stride=q_dim)
+                        theta=rope_theta, in_stride=q_dim, rope_angles=rope_angles)
     for kv_h in range(n_kv_heads):
         off = kv_h * head_dim * w
         _emit_rope_fp32(compiler, head_dim, pos, k_proj_stage + off, k_proj_stage + off,
-                        theta=rope_theta, in_stride=kv_dim)
+                        theta=rope_theta, in_stride=kv_dim, rope_angles=rope_angles)
 
     # Q needs to be all-16-replicated for the attention core's own
     # softmax convention (see _emit_attention_block_fp32's docstring).
