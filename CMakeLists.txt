@@ -141,6 +141,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_byoc_graph          # graph-driven (BYOC) FFN half-layer: byte-identical to the hand-driven emitters
         test_byoc_decoder        # graph-driven decode layer/model: byte-identical to the hand-driven path
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
+        test_parse_cache         # @T.prim_func parse memoization (tvm_fast_stack)
         test_fast_stack          # cheap TVMScript decorators: same frames/context as inspect.stack, parses @ir_module
         test_staging_reuse       # per-layer staging reuse: footprint, byte-identical relocation, bit-identical numerics
         test_moe_quant           # BF16 and INT4 experts: host-segmented and on-device-routed

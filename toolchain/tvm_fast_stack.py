@@ -51,6 +51,78 @@ class _InspectProxy(types.ModuleType):
     stack = staticmethod(fast_stack)      # not a wrapper: fast_stack's frame 0 must be the caller
 
 
+PARSE_CACHE_STATS = {"hits": 0, "misses": 0, "uncacheable": 0}
+_PARSE_CACHE = {}
+_SIMPLE = (int, float, str, bool, type(None), bytes)
+
+
+def _simple(v):
+    if isinstance(v, _SIMPLE):
+        return True
+    if isinstance(v, (tuple, list)):
+        return all(_simple(x) for x in v)
+    return False
+
+
+def _freeze(v):
+    return tuple(_freeze(x) for x in v) if isinstance(v, (tuple, list)) else v
+
+
+def _parse_key(func, kw):
+    """(code object, closure values, decorator kwargs), or None when any closure value is not a
+    plain constant (then the parse could depend on something we cannot compare)."""
+    if func.__defaults__ or func.__kwdefaults__:
+        return None
+    vals = []
+    for cell in func.__closure__ or ():
+        try:
+            v = cell.cell_contents
+        except ValueError:
+            return None
+        if not _simple(v):
+            return None
+        vals.append((type(v).__name__, _freeze(v)))
+    return (func.__code__, tuple(vals), tuple(sorted(kw.items())))
+
+
+def _install_parse_cache():
+    """Memoize @T.prim_func: PrimFuncs are immutable (scheduling builds new modules), and the
+    emitters re-declare the same function body with the same closure constants thousands of times."""
+    import os
+    from tvm.script import tirx as T
+    orig = T.prim_func
+    if getattr(orig, "_rtv_cached", False) or os.environ.get("RTV_NO_PARSE_CACHE"):
+        return
+
+    def cached(func=None, **kw):
+        dec = orig(**kw) if func is None else None
+
+        def apply(f):
+            if not inspect.isfunction(f):
+                return (dec or orig(**kw))(f) if dec else orig(f, **kw)
+            try:
+                key = _parse_key(f, kw)
+            except Exception:
+                key = None
+            if key is None:
+                PARSE_CACHE_STATS["uncacheable"] += 1
+                return dec(f) if dec else orig(f, **kw)
+            hit = _PARSE_CACHE.get(key)
+            if hit is not None:
+                PARSE_CACHE_STATS["hits"] += 1
+                return hit
+            PARSE_CACHE_STATS["misses"] += 1
+            r = dec(f) if dec else orig(f, **kw)
+            _PARSE_CACHE[key] = r
+            return r
+        apply.dispatch_token = "tirx"      # the parser identifies the decorator by this
+        return apply if func is None else apply(func)
+
+    cached._rtv_cached = True
+    cached.dispatch_token = getattr(orig, "dispatch_token", "tirx")
+    T.prim_func = cached
+
+
 _installed = False
 
 
@@ -68,4 +140,5 @@ def install():
             continue
         if getattr(m, "inspect", None) is inspect:
             m.inspect = proxy
+    _install_parse_cache()
     _installed = True
