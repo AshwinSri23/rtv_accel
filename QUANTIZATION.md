@@ -100,6 +100,27 @@ the 2048-token study figures (29.39 FP32 / 30.77 INT4); a 64-token run takes ~7 
 
 Same 63 tokens, BF16 weights: chip ppl 49.8571 vs PyTorch 49.8549 (max |dNLL| 1.0e-4). INT8 weights (per-channel): chip 49.2227 vs PyTorch 49.2205 (max |dNLL| 1.05e-4). (FP32 reference on these tokens is not shown here; compare formats against each other only through the 2048-token study.)
 
+## 3d. Embedding / lm_head table (`quant_embed_study.py`)
+
+The tied table (151936 x 1024, 622 MB FP32) is the biggest tensor in Qwen3-0.6B and was left FP32. Fake-quantized per
+vocab row (INT4: groups along the hidden dim), WikiText-2 test, first 2048 tokens, layers FP32:
+
+| table | MB | ppl, shared by lookup + lm_head | ppl, lm_head only |
+|---|---|---|---|
+| FP32 | 622 | 29.39 | 29.39 |
+| BF16 | 311 | 29.39 | 29.39 |
+| **INT8 per row** | **156** | **29.38** | 29.38 |
+| INT4 g128 RTN | 83 | 31.72 (+7.9%) | 31.63 |
+| INT4 g32 RTN | 97 | 30.74 (+4.6%) | 30.38 (+3.4%) |
+
+On top of INT8 layers (29.69): INT8 table 29.68, INT4 g32 table 31.08 (the errors add roughly, nothing compounds).
+Conclusion: **INT8 per-row costs nothing measurable and cuts the table 4x**; INT4 g32 RTN costs 3-5% and would want
+GPTQ-style calibration (not tried; the lm_head Hessian is the final-norm output, cheap to collect). Greedy-token
+agreement drops for INT8 (77/98) because near-ties flip; perplexity is the metric that decides, as in section 1.
+Caveat: today the embedding lookup and lm_head run on the host (the chip returns the final hidden rows), so this only
+shrinks host memory. If lm_head moves on-device the INT8W GEMM already supports it (K=1024, N=151936, per-channel
+scale) with no new ISA.
+
 ## 4. Not done
 
 INT4 on a real trained MoE (only the tiny random one is tested); chip perplexity beyond 64 tokens; AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.
