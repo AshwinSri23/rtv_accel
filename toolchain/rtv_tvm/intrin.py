@@ -491,6 +491,7 @@ MUL_FP32_NAME = "rtv.mul_16x16_fp32"
 SUMSQ_FP32_NAME = "rtv.sumsq_16x16_fp32"
 RMSSCALE_FP32_NAME = "rtv.rms_scale_16x16_fp32"
 SILU_FP32_NAME = "rtv.silu_16x16_fp32"
+RELU_FP32_NAME = "rtv.relu_16x16_fp32"
 
 
 @T.prim_func(s_tir=True)
@@ -670,6 +671,36 @@ def register_silu_fp32():
     s_tir.TensorIntrin.register(SILU_FP32_NAME, silu_fp32_desc, silu_fp32_impl,
                                 override=True)
     return SILU_FP32_NAME
+
+
+@T.prim_func(s_tir=True)
+def relu_fp32_desc(a: T.handle, c: T.handle) -> None:
+    """ReLU at FP32: max(0, x). The ISA's RELU mode, exposed to the compiler so composed
+    activations (GELU) can clamp and take |x| without a new hardware mode."""
+    A = T.match_buffer(a, (TILE, TILE), "float32", offset_factor=1, scope="shared")
+    C = T.match_buffer(c, (TILE, TILE), "float32", offset_factor=1, scope="shared")
+    with T.sblock("root"):
+        T.reads(A[0:TILE, 0:TILE])
+        T.writes(C[0:TILE, 0:TILE])
+        for i, j in T.grid(TILE, TILE):
+            with T.sblock("relu"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                C[vi, vj] = T.max(A[vi, vj], T.float32(0.0))
+
+
+@T.prim_func(s_tir=True)
+def relu_fp32_impl(a: T.handle, c: T.handle) -> None:
+    A = T.match_buffer(a, (TILE, TILE), "float32", offset_factor=1, scope="shared")
+    C = T.match_buffer(c, (TILE, TILE), "float32", offset_factor=1, scope="shared")
+    with T.sblock("root"):
+        T.reads(A[0:TILE, 0:TILE])
+        T.writes(C[0:TILE, 0:TILE])
+        T.evaluate(T.call_extern("rtv_relu_fp32", C.data, A.data, dtype="float32"))
+
+
+def register_relu_fp32():
+    s_tir.TensorIntrin.register(RELU_FP32_NAME, relu_fp32_desc, relu_fp32_impl, override=True)
+    return RELU_FP32_NAME
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -559,6 +559,8 @@ class Codegen:
                     # FP32 SiLU: the true function, no table (see
                     # intrin.py's silu_fp32_impl for why this isn't LUT).
                     self._unary(NPUActivations.SILU)
+                elif "rtv_relu_fp32" in name:
+                    self._unary(NPUActivations.RELU)
                 elif "rtv_transpose" in name:
                     self._unary(NPUActivations.TRANSPOSE)
         elif hasattr(node, "body"):

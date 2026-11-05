@@ -621,6 +621,102 @@ def _emit_scale_fp32(compiler, in_addr, width, scale):
     return out
 
 
+def _const_tile_fp32(compiler, width, value):
+    """DRAM address of a (tile_dim, width) FP32 tile filled with `value` (cached per step)."""
+    M = compiler.tile_dim
+    return _get_or_build_const(compiler, ("scale_tile", width, float(value)), M * width * 4,
+                               lambda: np.full((M, width), value, dtype=np.float32))
+
+
+def _emit_relu_fp32(compiler, in_addr, out_addr, width):
+    """out = max(0, in) over a (tile_dim, width) FP32 tile (the ISA's RELU mode)."""
+    M = compiler.tile_dim
+
+    @T.prim_func(s_tir=True)
+    def relu(a: T.handle, c: T.handle) -> None:
+        A = T.match_buffer(a, (M, width), "float32")
+        C = T.match_buffer(c, (M, width), "float32")
+        for i, j in T.grid(M, width):
+            with T.sblock("relu"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                C[vi, vj] = T.max(A[vi, vj], T.float32(0.0))
+
+    codegen.emit(compiler, schedule.schedule_unary(relu, "relu", intrin.register_relu_fp32()),
+                 {"A": in_addr, "C": out_addr}, dtype=DType.FP32, kind="elemwise")
+
+
+def _emit_exp_fp32(compiler, in_addr, out_addr, width):
+    """out = exp(in), elementwise: the softmax EXP_SUB pass with a zero scalar."""
+    M = compiler.tile_dim
+    zero = _get_or_build_const(compiler, ("zero_scalar",), 64,
+                               lambda: np.zeros(16, dtype=np.float32))
+
+    @T.prim_func(s_tir=True)
+    def esub(s: T.handle, a: T.handle, c: T.handle) -> None:
+        S = T.match_buffer(s, (1,), "float32")
+        A = T.match_buffer(a, (M, width), "float32")
+        C = T.match_buffer(c, (M, width), "float32")
+        for i, j in T.grid(M, width):
+            with T.sblock("expsub"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                C[vi, vj] = T.exp(A[vi, vj] - S[0])
+
+    codegen.emit(compiler, schedule.schedule_tile_scalar(esub, "expsub",
+                                                         intrin.register_exp_sub_fp32()),
+                 {"S": zero, "A": in_addr, "C": out_addr}, dtype=DType.FP32, kind="elemwise")
+
+
+def _emit_gelu_tanh_fp32(compiler, width, x_addr, out_addr):
+    """out = GELU_tanh(x) = 0.5 x (1 + tanh(u)), u = sqrt(2/pi) x (1 + 0.044715 x^2), built ONLY from
+    ops the ISA already has (multiply, add, RELU, exp) -- no GELU mode and no divide.
+
+      tanh(u) = f(relu(u)) - f(relu(-u)),   f(z) = (1 - e^-2z)/(1 + e^-2z) = 1 - 2 s r  for z >= 0
+      s = e^-2z in (0, 1],   r = 1/(1 + s): linear start on [1, 2] (max rel. error 1/17), three Newton
+      steps r <- r (2 - d r).  One of the two relu terms is always 0 and f(0) = 0, so no sign() is needed
+      (an earlier clamp-based sign cancelled catastrophically in float32 for large |u|).
+
+    x_addr must stay distinct from out_addr (x is read again at the end). About 60 elementwise passes
+    over the (tile_dim, width) buffer."""
+    M = compiler.tile_dim
+    nb = M * width * 4
+    A, B, C, D, E, F = (compiler.alloc_staging(nb) for _ in range(6))
+    k = lambda v: _const_tile_fp32(compiler, width, v)       # noqa: E731
+    mul = lambda a, b, o: _emit_mul_fp32(compiler, a, b, o, width)             # noqa: E731
+    add = lambda a, b, o: _emit_residual_add_fp32(compiler, a, b, o, width)    # noqa: E731
+    relu = lambda a, o: _emit_relu_fp32(compiler, a, o, width)                 # noqa: E731
+
+    def f(z, out):                              # out = (1 - e^-2z)/(1 + e^-2z), z >= 0; clobbers C, D, E
+        mul(z, k(-2.0), C)
+        _emit_exp_fp32(compiler, C, C, width)   # s
+        add(C, k(1.0), D)                       # d = 1 + s
+        mul(D, k(-8.0 / 17.0), out)
+        add(out, k(24.0 / 17.0), out)           # r0
+        for _ in range(3):
+            mul(D, out, E)
+            mul(E, k(-1.0), E)
+            add(E, k(2.0), E)
+            mul(out, E, out)                    # r
+        mul(C, out, out)                        # s r
+        mul(out, k(-2.0), out)
+        add(out, k(1.0), out)                   # 1 - 2 s r
+
+    mul(x_addr, x_addr, A)                      # x^2
+    mul(A, k(0.044715), A)
+    add(A, k(1.0), A)                           # g = 1 + 0.044715 x^2
+    mul(x_addr, k(0.7978845608028654), B)
+    mul(B, A, B)                                # u
+    relu(B, A)                                  # relu(u)
+    mul(B, k(-1.0), B)
+    relu(B, B)                                  # relu(-u)
+    f(A, F)                                     # f(relu(u))
+    f(B, A)                                     # f(relu(-u))
+    mul(A, k(-1.0), A)
+    add(F, A, F)                                # tanh(u)
+    add(F, k(1.0), F)
+    mul(x_addr, k(0.5), E)
+    mul(E, F, out_addr)                         # 0.5 x (1 + tanh u)
+
+
 def to_bf16_bits(x):
     """FP32 array -> BF16 bit patterns (uint16), round-to-nearest-even.
     NaN/inf are not special-cased (weights are finite)."""

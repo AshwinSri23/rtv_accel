@@ -16,7 +16,7 @@ layer only registers itself when `.venv-tvm/` exists (`cmake` prints
 `TVM path tests skipped: .venv-tvm not present` otherwise) — a checkout
 without that venv still configures and builds cleanly, it just doesn't
 get compiler coverage. As of 2026-11-04: 3 C++ tests + 31 TVM-path
-tests = 44 total, all passing. (Newer than the numbered tour below:
+tests = 45 total, all passing. (Newer than the numbered tour below:
 `test_schedule_relocation`, `test_prefill_batching`, `test_const_memoization`,
 `test_swiglu_resident`, `test_dram36` (ISA v1.6 36-bit addresses),
 `test_bf16w` (ISA v1.6 BF16 weights + the compiler's BF16-weight matmul),
@@ -32,7 +32,7 @@ Qwen3-MoE vs a recorded Hugging Face reference; skips without the checkpoint),
 `test_int4w` (ISA v1.9 INT4 group-scaled GEMM), `test_int4_weights_model` (whole model on INT4, relocation byte-identical),
 `test_moe_int8` (INT8 experts, host-segmented and on-device routed; `test_moe_model` also runs INT8 and INT4 cases),
 `test_moe_quant` (BF16 and INT4 experts in both routing modes),
-`test_decode_step_cache` (a derived decode step equals a full compile exactly), `test_parse_cache` (`@T.prim_func` parse memoization), `test_stream_cache` (codegen's instruction-stream cache is byte-identical to a plain emit),
+`test_gelu` (GELU(tanh) from existing ops, < 4e-7), `test_decode_step_cache` (a derived decode step equals a full compile exactly), `test_parse_cache` (`@T.prim_func` parse memoization), `test_stream_cache` (codegen's instruction-stream cache is byte-identical to a plain emit),
 `test_fast_stack` (the TVMScript stack shim matches `inspect.stack`),
 `test_staging_reuse` (layers 2+ share layer 1's staging: footprint, byte-identical relocation, bit-identical numerics).
 There is no automated test against Hugging Face: that comparison needs PyTorch, which
