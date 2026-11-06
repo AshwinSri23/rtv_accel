@@ -526,8 +526,13 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
     per_step = []
     with open_gemma4(source, total, sim, hal, verbose, int4_group, trace, len(prompt_ids) - 1, staging_reserve, stats,
                      image_dir) as s:
+        t0 = time.time()
         for pos in range(total):
             h = s.step(ids[pos], pos)
+            if score_out is not None and (pos % 16 == 15 or pos + 1 == total):
+                el = time.time() - t0
+                print(f"  scored {pos + 1}/{total} positions, {el / 60:.1f} min elapsed, "
+                      f"~{el / (pos + 1) * (total - pos - 1) / 60:.0f} min left at the average pace", file=sys.stderr, flush=True)
             if score_out is not None and pos + 1 < len(prompt_ids):
                 lg = s.head(h)
                 top = np.argsort(-lg)[:5]
