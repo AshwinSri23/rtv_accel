@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--tokenizer", default=os.path.expanduser("~/models/hf/gemma-4-12B-it-assistant"))
     ap.add_argument("--out", required=True)
     ap.add_argument("--stage", choices=["chip", "ref", "compare"], required=True)
+    ap.add_argument("--window", type=int, default=None, help="override the sliding window (chip and reference)")
+    ap.add_argument("--only-ppl", action="store_true", help="skip the chat prompts")
     ap.add_argument("--reply-tokens", type=int, default=8)
     ap.add_argument("--wiki-ids", required=True, help="JSON list of token ids for the perplexity text")
     a = ap.parse_args()
@@ -54,8 +56,10 @@ def main():
         from gemma4_gguf import load_gemma4_gguf
         sim, hal = os.path.join(ROOT, "build", "rtv_sim"), os.path.join(_HERE, "hal_config.json")
         src = load_gemma4_gguf(a.gguf)
+        if a.window:
+            src = (dict(src[0], sliding_window=a.window),) + tuple(src[1:])
         chip = {}
-        for i, p in enumerate(PROMPTS):
+        for i, p in enumerate([] if a.only_ppl else PROMPTS):
             ids = [2] + tok(f"<|turn>user\n{p}<turn|>\n<|turn>model\n", add_special_tokens=False)["input_ids"]
             full, steps = gemma4_model.generate_gemma4(src, ids, a.reply_tokens, sim, hal, int4_group=32,
                                                        image_dir=os.path.expanduser("~/.cache/rtv_accel"),
@@ -75,7 +79,7 @@ def main():
         for name, c in chip.items():
             subprocess.run([TORCH_PY, os.path.join(_HERE, "gemma4_gguf_reference.py"), "--gguf", a.gguf,
                             "--prompt-ids", ",".join(map(str, c["ids"])), "--out", os.path.join(a.out, f"ref_{name}.npz"),
-                            "--all-positions"], check=True)
+                            "--all-positions"] + (["--sliding-window", str(a.window)] if a.window else []), check=True)
     else:
         chip = json.load(open(os.path.join(a.out, "chip.json")))
         for name, c in chip.items():

@@ -28,11 +28,16 @@ def main():
     ap.add_argument("--prompt-ids", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--sliding-window", type=int, default=None,
+                    help="override the sliding window (to exercise window masking with a short sequence)")
+    ap.add_argument("--router-probs", action="store_true", help="save every layer's router probabilities [layers, T, E]")
     ap.add_argument("--all-positions", action="store_true",
                     help="also score every position: top-5 and the log-prob of the next token (teacher forcing)")
     a = ap.parse_args()
     ids = [int(x) for x in a.prompt_ids.split(",")]
     cfg_d, layers, embed, final_norm = load_gemma4_gguf(a.gguf, a.layers)
+    if a.sliding_window:
+        cfg_d["sliding_window"] = a.sliding_window
     cfg = Gemma4TextConfig(
         vocab_size=cfg_d["vocab_size"], hidden_size=cfg_d["hidden_size"], intermediate_size=cfg_d["intermediate_size"],
         moe_intermediate_size=cfg_d["moe_intermediate_size"], num_hidden_layers=cfg_d["num_hidden_layers"],
@@ -53,7 +58,12 @@ def main():
     pos = torch.arange(T).unsqueeze(0)
     rot = Gemma4TextRotaryEmbedding(cfg)
     mask = torch.full((T, T), float("-inf")).triu(1)[None, None]
+    # sliding layers: key j is visible to query i iff j > i - window (as in transformers' sliding_window_overlay)
+    qi, kj = torch.arange(T)[:, None], torch.arange(T)[None, :]
+    swa_mask = torch.where((kj <= qi) & (kj > qi - cfg_d["sliding_window"]), 0.0, float("-inf"))[None, None]
     out = {"hidden": []}
+    gaps = []                                   # per layer: router prob [T, E] captured by a hook
+    cap_probs = []
     with torch.no_grad():
         for li, lw in enumerate(layers):
             layer = Gemma4TextDecoderLayer(cfg, li).eval()
@@ -61,8 +71,10 @@ def main():
             missing = layer.load_state_dict(sd, strict=False)
             assert not missing.unexpected_keys, missing.unexpected_keys
             assert not [m for m in missing.missing_keys if m != "layer_scalar"], missing.missing_keys
+            if a.router_probs:
+                layer.router.register_forward_hook(lambda m, i, o: cap_probs.append(o[0].detach().numpy().copy()))
             pe = rot(x, pos, cfg_d["layer_types"][li])
-            x = layer(x, shared_kv_states={}, position_embeddings=pe, attention_mask=mask, position_ids=pos)
+            x = layer(x, shared_kv_states={}, position_embeddings=pe, attention_mask=(swa_mask if cfg_d["layer_types"][li] == "sliding_attention" else mask), position_ids=pos)
             out["hidden"].append(x[0, -1].numpy().copy())
             print(f"layer {li} done  |h|={x[0, -1].norm():.3f}", flush=True)
             del layer, sd
@@ -85,6 +97,8 @@ def main():
         t5 = L.topk(5, dim=-1)
         extra = dict(pos_top_ids=t5.indices.numpy(), pos_top_logits=t5.values.numpy(),
                      pos_logprob=lp[torch.arange(T - 1), torch.tensor(ids[1:])].numpy())
+    if a.router_probs:
+        extra["router_probs"] = np.stack(cap_probs)
     np.savez(a.out, hidden=np.stack(out["hidden"]), top_ids=top.indices.numpy(), top_logits=top.values.numpy(), **extra)
     print("top5", top.indices.tolist(), [round(v, 3) for v in top.values.tolist()])
 
