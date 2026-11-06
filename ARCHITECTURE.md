@@ -271,8 +271,8 @@ Measured by `toolchain/isa_coverage.py` on the real-sized per-layer programs (po
 
 A sliding Gemma layer is A + B = 2.56 M instructions and a full layer 2.91 M, so one token through 25 sliding + 5 full
 layers is about **79 M instructions** (Qwen3-0.6B: 28 x 0.38 M = 10.8 M). Every `LOAD_TILE` is paired with a
-`WAIT_SYNC`, and weight streaming (`LOAD_TILE` + `COMPUTE_GEMM`) is about 98% of every program: the model is
-bandwidth-shaped, not ALU-shaped. These are instruction counts, not cycles or seconds.
+`WAIT_SYNC`, and `LOAD_TILE` + `WAIT_SYNC` + `COMPUTE_GEMM` make up about 98% of every program (that includes
+activation tile loads as well as weight tiles): the work is data-movement- and GEMM-shaped, not ALU-shaped. These are instruction counts, not cycles or seconds.
 
 ### Weak spots (what this table does not hide)
 
