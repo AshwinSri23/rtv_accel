@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--stage", choices=["chip", "ref", "compare"], required=True)
     ap.add_argument("--window", type=int, default=None, help="override the sliding window (chip and reference)")
+    ap.add_argument("--embed-int8", action="store_true", help="INT8-per-row embedding / lm_head table on the host")
     ap.add_argument("--only-ppl", action="store_true", help="skip the chat prompts")
     ap.add_argument("--reply-tokens", type=int, default=8)
     ap.add_argument("--wiki-ids", required=True, help="JSON list of token ids for the perplexity text")
@@ -55,7 +56,7 @@ def main():
         import gemma4_model
         from gemma4_gguf import load_gemma4_gguf
         sim, hal = os.path.join(ROOT, "build", "rtv_sim"), os.path.join(_HERE, "hal_config.json")
-        src = load_gemma4_gguf(a.gguf)
+        src = load_gemma4_gguf(a.gguf, embed_int8=a.embed_int8)
         if a.window:
             src = (dict(src[0], sliding_window=a.window),) + tuple(src[1:])
         chip = {}

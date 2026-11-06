@@ -124,3 +124,10 @@ scale) with no new ISA.
 ## 4. Not done
 
 INT4 on a real trained MoE (only the tiny random one is tested); chip perplexity beyond 64 tokens; AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.
+
+### 3e. Gemma-4 embedding / lm_head table as INT8 per row (2026-11-05)
+
+`load_gemma4_gguf(embed_int8=True)` keeps the 262144 x 2816 tied table as INT8 with one FP32 scale per row (0.74 GB
+instead of 2.95 GB; host-side only). On the real 26B model, 47 wikitext tokens: perplexity 994.15 (FP32 table) ->
+1010.13 (+1.6%), largest per-token log-prob change 0.68 nats. Unlike Qwen3-0.6B (section 3d, free), Gemma pays for it;
+off by default. Group-scaled INT8 (a scale per 32 inputs) is the obvious next try and is untested.

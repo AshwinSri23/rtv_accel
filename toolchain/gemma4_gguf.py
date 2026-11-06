@@ -79,8 +79,32 @@ def gguf_config(g):
         rope_theta_sliding=m["gemma4.rope.freq_base_swa"])
 
 
-def load_gemma4_gguf(path, n_layers=None, load_embed=True):
-    """-> (cfg, layers, embed fp32 [vocab, hidden], final_norm). Weight matrices are lazy Q4Mat objects."""
+class Int8Rows:
+    """The tied embedding / lm_head table as INT8 with one FP32 scale per row (0.74 GB instead of 2.95 GB for the
+    262144 x 2816 table). Row lookup dequantises one row; `table @ v` (the lm_head) runs in chunks so the full FP32
+    table never exists. Host-side only -- the chip never sees it."""
+
+    def __init__(self, table):
+        self.shape = table.shape
+        amax = np.abs(table).max(axis=1)
+        self.scale = np.where(amax > 0, amax / 127.0, 1.0).astype(np.float32)
+        self.q = np.empty(table.shape, np.int8)
+        for i in range(0, table.shape[0], 16384):
+            self.q[i:i + 16384] = np.clip(np.rint(table[i:i + 16384] / self.scale[i:i + 16384, None]), -127, 127)
+
+    def __getitem__(self, i):
+        return self.q[i].astype(np.float32) * self.scale[i]
+
+    def __matmul__(self, v):
+        v = np.asarray(v, np.float32)
+        out = np.empty(self.shape[0], np.float32)
+        for i in range(0, self.shape[0], 16384):
+            out[i:i + 16384] = (self.q[i:i + 16384].astype(np.float32) @ v) * self.scale[i:i + 16384]
+        return out
+
+
+def load_gemma4_gguf(path, n_layers=None, load_embed=True, embed_int8=False):
+    """-> (cfg, layers, embed fp32 [vocab, hidden] (or Int8Rows), final_norm). Weight matrices are lazy Q4Mat objects."""
     g = GGUF(path)
     cfg = gguf_config(g)
     if n_layers is not None:
@@ -115,6 +139,8 @@ def load_gemma4_gguf(path, n_layers=None, load_embed=True):
                           w_down=_q4(g, p + "ffn_down_exps.weight", None, e)) for e in range(E)],
             layer_scalar=float(f(p + "layer_output_scale.weight").reshape(-1)[0])))
     embed = f("token_embd.weight") if load_embed else None
+    if embed is not None and embed_int8:
+        embed = Int8Rows(embed)
     return cfg, layers, embed, f("output_norm.weight")
 
 
