@@ -272,7 +272,26 @@ Measured by `toolchain/isa_coverage.py` on the real-sized per-layer programs (po
 A sliding Gemma layer is A + B = 2.56 M instructions and a full layer 2.91 M, so one token through 25 sliding + 5 full
 layers is about **79 M instructions** (Qwen3-0.6B: 28 x 0.38 M = 10.8 M). Every `LOAD_TILE` is paired with a
 `WAIT_SYNC`, and `LOAD_TILE` + `WAIT_SYNC` + `COMPUTE_GEMM` make up about 98% of every program (that includes
-activation tile loads as well as weight tiles): the work is data-movement- and GEMM-shaped, not ALU-shaped. These are instruction counts, not cycles or seconds.
+activation tile loads as well as weight tiles): the work is data-movement- and GEMM-shaped, not ALU-shaped. See the
+traffic table below for how little of that movement is weights. These are instruction counts, not cycles or seconds.
+
+### DRAM traffic per decode layer (bytes moved by `LOAD_TILE` / `STORE_TILE`)
+
+Decoded from the same programs (weights = loads from the weight region; "other" = activations, KV cache, constants):
+
+| Program | Weight loads | Other loads | Stores |
+|---|---:|---:|---:|
+| Gemma-4 sliding layer, A | 32.8 MB | 238 MB | 14.4 MB |
+| Gemma-4 full layer, A | 41.8 MB | 299 MB | 15.9 MB |
+| Gemma-4, B (8 experts) | 29.7 MB | 236 MB | 26.0 MB |
+
+Per token (25 sliding + 5 full layers): **1.92 GB of weights** (12.0 M INT4 weight tiles x 128 B + one 64 B FP32 scale
+row per two K tiles; Q4_0's own fp16 scales would make it 1.73 GB), but **14.5 GB of other loads and 1.2 GB of
+stores**. Weights are only about 11% of the DRAM traffic. (Qwen3-0.6B: 61,440 INT4 tiles per layer, ~275 MB of weights
+per token.) The excess is the activation: decode has one real row but every GEMM re-reads a full 16-row FP32 activation
+tile (1 KB, 15 rows zero) for each output tile, against a 128 B weight tile. That is a compiler/dataflow choice, not
+an ISA limit: keeping the activation row resident in SRAM across the output tiles of a GEMM (or packing it) would cut
+most of the 14.5 GB. It is the largest single inefficiency measured so far, ahead of GELU or routing.
 
 ### Weak spots (what this table does not hide)
 
