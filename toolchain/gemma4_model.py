@@ -209,6 +209,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         c._dram_cursor = staging_base
         c.rms_eps = eps
         c.int4_group = int4_group
+        if not os.environ.get("RTV_FULL_A_TILES"):
+            c.gemm_a_rows = 1        # decode: one real row, load 64 B of activation per GEMM step, not a 1 KB tile
         return c
 
     def norm(c, src, g, dst):

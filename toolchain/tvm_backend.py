@@ -770,6 +770,25 @@ def _indirect_fields(indirect_b):
                 c_slot=(indirect_b >> 8) & 0xF, dram_hi=(indirect_b >> 12) & 0xF)
 
 
+def _gemm_a_rows(compiler):
+    """Rows of the activation tile a weight GEMM actually loads. Decode has ONE real row (row 0), so the decode
+    drivers set compiler.gemm_a_rows = 1 and the A LOAD_TILE moves 64 bytes instead of a 1 KB tile that is 15/16
+    zeros (the weight tile it multiplies is only 128 bytes). None/unset = the full tile (prefill, tests)."""
+    return getattr(compiler, "gemm_a_rows", None) or compiler.tile_dim
+
+
+def _emit_a_slot_zero_fill(compiler, a_slots, emit):
+    """With row-0-only A loads, rows 1..15 of each A SRAM slot must be zero (they feed output rows 1..15). Other
+    ops reuse these slots with full tiles, so zero them at the start of every GEMM: depth x 1 KB of loads."""
+    T = compiler.tile_dim
+    zero = _const_tile_fp32(compiler, T, 0.0)
+    for k, slot in enumerate(a_slots):
+        emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + k, dram_addr=zero, sram_addr=slot,
+             dim_m=T, dim_n=T * 4, stride=T * 4, dtype=int(DType.FP32))
+    for k in range(len(a_slots)):
+        emit(opcode=Opcode.WAIT_SYNC, dep_id=codegen.ROT_A_BASE + k)
+
+
 def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=None,
                             depth=3, indirect_b=None):
     """C(M,N) = A(M,K) fp32 @ B(K,N) bf16 -> fp32, with the weight matrix B
@@ -808,11 +827,14 @@ def _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
         jn, kn = steps[i]
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + i % depth,
              dram_addr=a_addr + kn * T * 4, sram_addr=a_slots[i % depth],
-             dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
+             dim_m=a_rows, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
              dram_addr=b_addr + (kn * T * N + jn * T) * 2, sram_addr=b_slots[i % depth],
              dim_m=T, dim_n=T * 2, stride=N * 2, dtype=int(DType.FP32), **ind)
 
+    a_rows = _gemm_a_rows(compiler)
+    if a_rows < T:
+        _emit_a_slot_zero_fill(compiler, a_slots, emit)
     for i in range(min(depth - 1, len(steps))):
         load(i)
     for i, (jn, kn) in enumerate(steps):
@@ -882,7 +904,7 @@ def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
         jn, kn = steps[i]
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + i % depth,
              dram_addr=a_addr + kn * T * 4, sram_addr=a_slots[i % depth],
-             dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
+             dim_m=a_rows, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
              dram_addr=b_addr + kn * T * N + jn * T, sram_addr=b_slots[i % depth],
              dim_m=T, dim_n=T, stride=N, dtype=int(DType.FP32), **ind)
@@ -894,6 +916,9 @@ def _emit_matmul_int8w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, a_stride=
     scale_slot = SRAMMap.output_slot(1)
     SCALE_TAG = 5
 
+    a_rows = _gemm_a_rows(compiler)
+    if a_rows < T:
+        _emit_a_slot_zero_fill(compiler, a_slots, emit)
     for i in range(min(depth - 1, len(steps))):
         load(i)
     for i, (jn, kn) in enumerate(steps):
@@ -993,7 +1018,7 @@ def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32,
         jn, kn = steps[i]
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + i % depth,
              dram_addr=a_addr + kn * T * 4, sram_addr=a_slots[i % depth],
-             dim_m=T, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
+             dim_m=a_rows, dim_n=T * 4, stride=a_pitch, dtype=int(DType.FP32))
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_B_BASE + i % depth,
              dram_addr=b_addr + kn * T * (N // 2) + jn * (T // 2), sram_addr=b_slots[i % depth],
              dim_m=T, dim_n=T // 2, stride=N // 2, dtype=int(DType.FP32), **ind)
@@ -1004,6 +1029,9 @@ def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32,
                  sram_addr=scale_slots[g % 4], dim_m=1, dim_n=T * 4, stride=T * 4,
                  dtype=int(DType.FP32), **ind)
 
+    a_rows = _gemm_a_rows(compiler)
+    if a_rows < T:
+        _emit_a_slot_zero_fill(compiler, a_slots, emit)
     for i in range(min(depth - 1, len(steps))):
         load(i)
     for i, (jn, kn) in enumerate(steps):
