@@ -28,6 +28,8 @@ def main():
     ap.add_argument("--prompt-ids", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--all-positions", action="store_true",
+                    help="also score every position: top-5 and the log-prob of the next token (teacher forcing)")
     a = ap.parse_args()
     ids = [int(x) for x in a.prompt_ids.split(",")]
     cfg_d, layers, embed, final_norm = load_gemma4_gguf(a.gguf, a.layers)
@@ -71,7 +73,19 @@ def main():
     if cap:
         lg = torch.tanh(lg / cap) * cap
     top = lg.topk(5)
-    np.savez(a.out, hidden=np.stack(out["hidden"]), top_ids=top.indices.numpy(), top_logits=top.values.numpy())
+    extra = {}
+    if a.all_positions:
+        hs = x[0].double()
+        n = hs / torch.sqrt((hs ** 2).mean(-1, keepdim=True) + cfg_d["rms_norm_eps"]) * torch.from_numpy(final_norm).double()
+        L = torch.from_numpy(embed).float() @ n.float().T          # [vocab, T]
+        L = L.T
+        if cap:
+            L = torch.tanh(L / cap) * cap
+        lp = torch.log_softmax(L.double(), dim=-1)
+        t5 = L.topk(5, dim=-1)
+        extra = dict(pos_top_ids=t5.indices.numpy(), pos_top_logits=t5.values.numpy(),
+                     pos_logprob=lp[torch.arange(T - 1), torch.tensor(ids[1:])].numpy())
+    np.savez(a.out, hidden=np.stack(out["hidden"]), top_ids=top.indices.numpy(), top_logits=top.values.numpy(), **extra)
     print("top5", top.indices.tolist(), [round(v, 3) for v in top.values.tolist()])
 
 

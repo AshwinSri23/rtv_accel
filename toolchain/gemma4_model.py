@@ -99,10 +99,13 @@ def _blob_bytes(K, N, int4_group):
 
 
 def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_group=0, trace=None,
-                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=()):
+                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=(), score_out=None):
     """Greedy-generate n_new tokens. `source` is a checkpoint dir or an already loaded
     (cfg, layers, embed, final_norm); matrices may be lazy gemma4_gguf.Q4Mat objects (then int4_group=32).
     Returns (all_ids, per_step) with per_step[i] = (top5_ids, top5_logits).
+
+    score_out (a list): teacher-forced scoring. Every position's logits are computed and, if ids[pos+1] is known
+    (prompt_ids is then the whole sequence, n_new=0), (top5_ids, top5_logits, logprob_of_next_token) is appended.
 
     Compile cost: the per-layer programs are NOT recompiled for every layer. Program A (attention + dense branch +
     router) is compiled for one representative layer per layer TYPE (sliding / full) and its LOAD/STORE addresses are
@@ -414,6 +417,12 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             per_step = []
             for pos in range(total):
                 h = step(ids[pos], pos)
+                if score_out is not None and pos + 1 < len(prompt_ids):
+                    lg = head(h)
+                    top = np.argsort(-lg)[:5]
+                    m = lg.max()
+                    logp = float(lg[prompt_ids[pos + 1]] - m - np.log(np.exp(lg - m).sum()))
+                    score_out.append(([int(i) for i in top], [float(lg[i]) for i in top], logp))
                 if pos >= len(prompt_ids) - 1:
                     lg = head(h)
                     top = np.argsort(-lg)[:5]
