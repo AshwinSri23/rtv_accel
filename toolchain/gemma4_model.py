@@ -102,6 +102,23 @@ def _blob_bytes(K, N, int4_group):
     return tvm_backend.int4_blob_nbytes(K, N, int4_group) if int4_group else K * N * 4
 
 
+_COMPILE_JOB = None
+
+
+def _noop(_):
+    return None
+
+
+def _compiler_state(c):
+    """What a derived decode step needs from a compiled program, as plain picklable data."""
+    return dict(stream=bytes(c.instruction_stream), regions=dict(c._const_regions), cache=dict(c._const_cache),
+                cursors=(c._dram_cursor, c._staging_cursor, c._staging_peak))
+
+
+def _run_compile_job(rep, pos):
+    return _COMPILE_JOB(rep, pos)
+
+
 @contextlib.contextmanager
 def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=None, trace_pos=None,
                 staging_reserve=1 << 30, stats=None, image_dir=None):
@@ -357,6 +374,38 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
     b_state = {}                         # template compiler, sentinel region addresses, rep roles
     SENT_W, SENT_S = 1234.5, 4321.25
 
+    # ── Compile-ahead worker processes ──
+    # The real attention compiles (TVM scheduling, Python emit) are CPU-bound Python, so threads cannot overlap them
+    # (GIL). They depend only on (layer type, position), never on the token, so forked workers compile the programs
+    # of the current and next KV tiles while this process drives the simulator. Workers inherit the placed weights
+    # and layer tables copy-on-write; they return only the compiler state a derived step needs.
+    n_workers = int(os.environ.get("RTV_COMPILE_WORKERS", min(3, max(0, (os.cpu_count() or 1) // 2 - 1))))
+    pool, ahead = None, {}
+    if reloc and n_workers > 0:
+        import concurrent.futures as cf
+        import multiprocessing as mp
+        global _COMPILE_JOB
+        _COMPILE_JOB = lambda rep, pos: _compiler_state(program_a(rep, pos, None))     # noqa: E731
+        pool = cf.ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork"))
+        list(pool.map(_noop, range(n_workers)))            # start every worker now: before the simulator's pipes exist
+
+    def submit_ahead(pos):
+        t = pos // M
+        want = [(k, p) for k in rep_of for p in (pos, pos + 1) if p // M == t and p < total]
+        want += [(k, p) for k in rep_of for tt in range(t + 1, t + 3) for p in (tt * M, tt * M + 1) if p < total]
+        for k in [key for key in ahead if key[1] // M < t]:
+            ahead.pop(k)
+        for key in want:
+            if key not in ahead:
+                ahead[key] = pool.submit(_run_compile_job, rep_of[key[0]], key[1])
+
+    def from_state(st):
+        c = fresh()
+        c.instruction_stream = bytearray(st["stream"])
+        c._const_regions, c._const_cache = st["regions"], st["cache"]
+        c._dram_cursor, c._staging_cursor, c._staging_peak = st["cursors"]
+        return c
+
     def a_program(li, pos, xin):
         if not reloc:
             return program_a(li, pos, xin)
@@ -366,7 +415,11 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
             rep = rep_of[k]
             comp = step_caches[k].derive(pos, fresh())
             if comp is None:
-                comp = program_a(rep, pos, None)
+                if pool is not None:
+                    submit_ahead(pos)
+                    comp = from_state(ahead.pop((k, pos)).result())
+                else:
+                    comp = program_a(rep, pos, None)
                 step_caches[k].observe(pos, comp)
                 if stats is not None:
                     stats.setdefault("programs", {}).setdefault(f"A_{k[3]}", bytes(comp.instruction_stream))
@@ -456,6 +509,8 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
             yield types.SimpleNamespace(step=step, head=head, max_total=total)
         finally:
             sess.close()
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
     if stats is not None:
         stats.update({str(k): dict(c.stats) for k, c in step_caches.items() if k != "programs"})
 
