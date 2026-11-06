@@ -16,21 +16,20 @@ layer only registers itself when `.venv-tvm/` exists (`cmake` prints
 `TVM path tests skipped: .venv-tvm not present` otherwise) — a checkout
 without that venv still configures and builds cleanly, it just doesn't
 get compiler coverage. As of 2026-11-04: 3 C++ tests + 31 TVM-path
-tests = 49 total, all passing (`test_gemma4_26b` skips unless `RTV_REAL_GEMMA4=1`). (Newer than the numbered tour below:
+tests = 48 total, all passing (`test_gemma4_26b` skips unless `RTV_REAL_GEMMA4=1`). (Newer than the numbered tour below:
 `test_schedule_relocation`, `test_prefill_batching`, `test_const_memoization`,
 `test_swiglu_resident`, `test_dram36` (ISA v1.6 36-bit addresses),
 `test_bf16w` (ISA v1.6 BF16 weights + the compiler's BF16-weight matmul),
 `test_persistent_session` (`rtv_sim --serve`), `test_moe_ffn` (host-segmented MoE
 routing), `test_prefill_multitile` (prompts past one tile, incl. attention scale),
 `test_moe_block` (norm + router + shared expert + residual), `test_bf16_weights_model`
-(whole model on BF16 weights, relocation byte-identical), `test_moe_model` (a whole tiny
-Qwen3-MoE vs a recorded Hugging Face reference; skips without the checkpoint),
+(whole model on BF16 weights, relocation byte-identical),
 `test_byoc_graph` (graph-driven FFN half-layer, byte-identical to the hand-driven path),
 `test_byoc_decoder` (graph-driven decode layer / model / relocated model AND batched prefill tiles, byte-identical),
 `test_moe_ondevice` (ISA v1.7 on-device top-1 routing, one fixed stream),
 `test_int8w` (ISA v1.8 INT8 weight GEMM + per-channel scale), `test_int8_weights_model` (whole model on INT8 weights, relocation byte-identical),
 `test_int4w` (ISA v1.9 INT4 group-scaled GEMM), `test_int4_weights_model` (whole model on INT4, relocation byte-identical),
-`test_moe_int8` (INT8 experts, host-segmented and on-device routed; `test_moe_model` also runs INT8 and INT4 cases),
+`test_moe_int8` (INT8 experts, host-segmented and on-device routed),
 `test_moe_quant` (BF16 and INT4 experts in both routing modes),
 `test_gemma4_model` (a tiny random Gemma-4 matches Hugging Face to 2e-7; relocated == full compile; a 90-token prompt past the sliding window), `test_gguf_q4` (Q4_0 -> INT4W blob is lossless, chip GEMM on it), `test_dram_image_4gb` (images above 4 GiB), `test_gemma4_26b` (the real 26B model per layer vs Hugging Face; opt-in, 3 min, ~24 GB RAM), `test_gelu` (GELU(tanh) from existing ops, < 4e-7), `test_decode_step_cache` (a derived decode step equals a full compile exactly), `test_parse_cache` (`@T.prim_func` parse memoization), `test_stream_cache` (codegen's instruction-stream cache is byte-identical to a plain emit),
 `test_fast_stack` (the TVMScript stack shim matches `inspect.stack`),

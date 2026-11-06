@@ -78,7 +78,7 @@ Experts take the same path: `_emit_swiglu_ffn_fp32` already goes through the wei
 INDIRECT_ADDR offset applies to the INT8 weight tiles *and* to the scale-row load (`_emit_broadcast_row0_fp32(...,
 indirect_ptr=)`), so an expert's blob (weights then scales) must sit at the fixed routing stride. The router, norms,
 embeddings and lm_head stay FP32. Tests: `test_moe_int8` (both routing modes vs numpy on dequantised weights, one
-stream picking all 4 experts on-device; expert 9.44 MB -> 2.37 MB) and `test_moe_model` (whole tiny Qwen3-MoE on INT8
+stream picking all 4 experts on-device; expert 9.44 MB -> 2.37 MB) and `test_moe_model` (removed 2026-11-05 with the Qwen3-MoE driver; whole tiny Qwen3-MoE on INT8
 attention + experts vs an INT8-fake-quantized Hugging Face reference, logits within 2e-7; the INT8 and FP32 references
 differ by 3e-3, so the INT8 path is genuinely exercised). Not measured: accuracy of INT8 on a *real* trained MoE.
 
@@ -86,7 +86,7 @@ BF16 and INT4 experts work the same way, in both routing modes. The indirect (on
 `_emit_matmul_bf16w_fp32` and `_emit_matmul_int4w_fp32` through `indirect_b=`; for INT4 the offset applies to the packed
 weight loads and to every scale-row load, so an expert's blob (packed nibbles, then scale rows) sits at the routing
 stride. Tests: `test_moe_quant` (4 cases, errors ~1e-7 vs numpy on dequantised weights; one stream picks all 4 experts)
-and `test_moe_model`'s INT4 case (tiny Qwen3-MoE, INT4 g16 round-to-nearest attention + experts vs
+and `test_moe_model`'s INT4 case (removed 2026-11-05; tiny Qwen3-MoE, INT4 g16 round-to-nearest attention + experts vs
 `make_moe_int4_fixture.py`'s Hugging Face reference, top-5 logits within 3.6e-7, tokens differ from FP32 and INT8).
 
 ## 3c. Perplexity on the chip

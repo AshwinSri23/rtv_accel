@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 gemma4_model.py -- run a Gemma-4 text model (dense MLP + routed experts in every layer) on the simulated chip,
-with HOST-SEGMENTED routing (same scheme as moe_model.py): each layer is two device programs and the host
+with HOST-SEGMENTED routing (the host picks the experts between two device programs): each layer is two device programs and the host
 picks the top-k experts between them, all on one persistent `rtv_sim --serve` session.
 
 Per layer (Hugging Face Gemma4TextDecoderLayer, FP32 activations):

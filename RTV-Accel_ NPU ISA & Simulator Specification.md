@@ -80,7 +80,7 @@ Together they let a program pick WHICH weights to fetch from a runtime value: on
 (`tvm_backend._emit_moe_top1_ondevice_fp32`, `test_moe_ondevice.py`) is one fixed instruction stream for any
 input. The cost is that a DRAM address is no longer a pure literal for these loads (it is a literal plus
 one SRAM word), so static address analysis must treat `INDIRECT_ADDR` transfers as "base plus runtime
-offset". Host-segmented routing (`test_moe_ffn.py`, `moe_model.py`) needs neither instruction.
+offset". Host-segmented routing (`test_moe_ffn.py`, `gemma4_model.py`) needs neither instruction.
 
 ### **Instruction Bit-Layout — v1.8 (INT8 weights)**
 

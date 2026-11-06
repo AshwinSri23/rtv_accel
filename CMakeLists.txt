@@ -137,7 +137,6 @@ if(EXISTS ${RTV_TVM_PY})
         test_persistent_session  # rtv_sim --serve: DRAM resident across programs
         test_moe_ffn             # host-segmented MoE routing on a persistent session
         test_moe_block           # MoE FFN block: RMSNorm + router + shared expert + residual
-        test_moe_model           # whole tiny Qwen3-MoE model vs Hugging Face (skips without the checkpoint)
         test_byoc_graph          # graph-driven (BYOC) FFN half-layer: byte-identical to the hand-driven emitters
         test_byoc_decoder        # graph-driven decode layer/model: byte-identical to the hand-driven path
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
