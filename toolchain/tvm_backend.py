@@ -3620,40 +3620,59 @@ def _relocate_instructions(instr_bytes, source_roles, target_roles, staging_delt
     """
     import numpy as np
     n = len(instr_bytes) // 16
-    w = np.frombuffer(instr_bytes, dtype=">u8").reshape(n, 2).astype(np.uint64)
-    hi = w[:, 0]
-    opc = (hi >> np.uint64(60)) & np.uint64(0xF)
-    mem = (opc == np.uint64(int(Opcode.LOAD_TILE))) | (opc == np.uint64(int(Opcode.STORE_TILE)))
+    raw = np.frombuffer(instr_bytes, dtype=np.uint8).reshape(n, 16)
+    opc = raw[:, 0] >> 4                           # opcode = hi bits 60..63 (big-endian byte 0, high nibble)
+    mem_idx = np.flatnonzero((opc == int(Opcode.LOAD_TILE)) | (opc == int(Opcode.STORE_TILE)))
+    if mem_idx.size == 0:
+        return bytes(instr_bytes)
+    be = np.frombuffer(instr_bytes, dtype=">u8").reshape(n, 2)
+    hi = be[mem_idx, 0].astype(np.uint64)          # only LOAD/STORE rows are ever looked at or rewritten
+    lo = be[mem_idx, 1].astype(np.uint64)
     # LOAD/STORE address = 32-bit dram_addr field (hi bits 24..55) + dram_hi (lo bits 36..39, ISA v1.6) so
     # images above 4 GB (real MoE expert pools) relocate correctly.
-    lo = w[:, 1]
     # INDIRECT_ADDR loads reuse those bits as an SRAM pointer, not an address.
-    ind = mem & ((lo & np.uint64(0x7F)) == np.uint64(0x14))
-    addr = (((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)) |
-            np.where(ind, np.uint64(0), ((lo >> np.uint64(36)) & np.uint64(0xF)) << np.uint64(32))).astype(np.int64)
-    todo = mem.copy()
+    ind = (lo & np.uint64(0x7F)) == np.uint64(0x14)
+    a = (((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)) |
+         np.where(ind, np.uint64(0), ((lo >> np.uint64(36)) & np.uint64(0xF)) << np.uint64(32))).astype(np.int64)
+    todo = np.ones(a.shape, bool)
     for start, nbytes in shared_ranges:          # (1) shared constants stay put
-        todo &= ~((addr >= start) & (addr < start + nbytes))
-    new = addr.copy()
-    for role, (start, nbytes) in source_roles.items():   # (2) first matching role wins
-        sel = todo & (addr >= start) & (addr < start + nbytes)
-        new[sel] = target_roles[role][0] + (addr[sel] - start)
-        todo &= ~sel
-    new[todo] = addr[todo] + staging_delta          # (3) per-layer staging
-    changed = mem & (new != addr)
+        todo &= ~((a >= start) & (a < start + nbytes))
+    new = a.copy()
+    if source_roles:                              # (2) the region (role) an address falls in
+        names = list(source_roles)
+        st = np.array([source_roles[r][0] for r in names], dtype=np.int64)
+        nb = np.array([source_roles[r][1] for r in names], dtype=np.int64)
+        tg = np.array([target_roles[r][0] for r in names], dtype=np.int64)
+        order = np.argsort(st, kind="stable")
+        st, nb, tg = st[order], nb[order], tg[order]
+        if (st[1:] >= st[:-1] + nb[:-1]).all():   # disjoint regions (the normal case): one binary search
+            j = np.searchsorted(st, a, side="right") - 1
+            jc = np.maximum(j, 0)
+            hit = todo & (j >= 0) & (a < st[jc] + nb[jc])
+            new[hit] = tg[jc[hit]] + (a[hit] - st[jc[hit]])
+            todo &= ~hit
+        else:                                     # overlapping regions: the first one listed wins
+            for role, (start, nbytes) in source_roles.items():
+                sel = todo & (a >= start) & (a < start + nbytes)
+                new[sel] = target_roles[role][0] + (a[sel] - start)
+                todo &= ~sel
+    new[todo] = a[todo] + staging_delta          # (3) per-layer staging
+    changed = new != a
     if not changed.any():
         return bytes(instr_bytes)
     if (new[changed] < 0).any() or (new[changed] >> 36).any():
         raise ValueError("relocated DRAM address does not fit the 36-bit LOAD/STORE address")
+    if (changed & ind & (new >> 32 != 0)).any():
+        raise ValueError("indirect LOAD/STORE address does not fit 32 bits")
     nu = new.astype(np.uint64)
     hi = np.where(changed, (hi & ~(np.uint64(0xFFFFFFFF) << np.uint64(24))) |
                   ((nu & np.uint64(0xFFFFFFFF)) << np.uint64(24)), hi)
-    if (changed & ind & (new >> 32 != 0)).any():
-        raise ValueError("indirect LOAD/STORE address does not fit 32 bits")
     lo = np.where(changed & ~ind, (lo & ~(np.uint64(0xF) << np.uint64(36))) | ((nu >> np.uint64(32)) << np.uint64(36)), lo)
-    w[:, 0] = hi
-    w[:, 1] = lo
-    return w.astype(">u8").tobytes()
+    out = bytearray(instr_bytes)
+    ob = np.frombuffer(out, dtype=">u8").reshape(n, 2)
+    ob[mem_idx, 0] = hi
+    ob[mem_idx, 1] = lo
+    return bytes(out)
 
 
 def _emit_model_kvcache_fp32_relocated(compiler, n_layers, hidden, inter, n_heads,

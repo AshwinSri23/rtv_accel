@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(rtv_accel LANGUAGES CXX)
 
+# The simulator executes ~10^8 instructions per generated token: an unoptimised build (CMake's default when
+# CMAKE_BUILD_TYPE is empty) is several times slower.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -141,6 +147,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_byoc_decoder        # graph-driven decode layer/model: byte-identical to the hand-driven path
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
         test_gemma4_model        # tiny random Gemma-4 (sandwich norms, dense+experts, K=V, partial RoPE, softcap) vs Hugging Face
+        test_relocate_fast       # _relocate_instructions (binary search, LOAD/STORE rows only) == the plain mask-per-region algorithm
         test_gemma4_chat         # multi-turn session: reuse the KV cache of a common prefix, rewind on divergence
         test_gguf_q4             # llama.cpp Q4_0 blocks -> INT4W g32 blob is lossless; chip GEMM on it
         test_int8_embed          # host-side INT8-per-row embedding / lm_head table
