@@ -99,7 +99,7 @@ def _blob_bytes(K, N, int4_group):
 
 
 def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_group=0, trace=None,
-                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=(), score_out=None):
+                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=(), score_out=None, on_token=None):
     """Greedy-generate n_new tokens. `source` is a checkpoint dir or an already loaded
     (cfg, layers, embed, final_norm); matrices may be lazy gemma4_gguf.Q4Mat objects (then int4_group=32).
     Returns (all_ids, per_step) with per_step[i] = (top5_ids, top5_logits).
@@ -432,6 +432,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
                     ids.append(int(top[0]))
                     if verbose:
                         print(f"  pos {pos}: token {ids[-1]}", file=sys.stderr)
+                    if on_token is not None:
+                        on_token(ids[-1])
                     if ids[-1] in stop_ids:
                         break
         finally:
@@ -448,7 +450,8 @@ def main():
     src.add_argument("--gguf", help="llama.cpp Q4_0 GGUF (runs as INT4W g32)")
     ap.add_argument("--layers", type=int, default=None, help="GGUF only: run just the first N layers")
     ap.add_argument("--prompt-ids")
-    ap.add_argument("--prompt", help="text prompt (chat format); needs --tokenizer")
+    ap.add_argument("--prompt", help="user message; rendered with the GGUF's own chat template (needs --gguf)")
+    ap.add_argument("--system", default=None, help="optional system message")
     ap.add_argument("--tokenizer", default=os.path.expanduser("~/models/hf/gemma-4-12B-it-assistant"),
                     help="directory with a Gemma-4 tokenizer.json (the vocab is shared across the family)")
     ap.add_argument("--steps", type=int, default=4)
@@ -469,24 +472,40 @@ def main():
     trace = [] if a.trace_out else None
     tok = None
     stop = ()
+    on_token = None
     if a.prompt is not None:
+        if not a.gguf:
+            ap.error("--prompt needs --gguf (the chat template is read from the GGUF)")
+        from gemma4_gguf import render_chat
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(a.tokenizer)
-        # Gemma-4 chat format: <bos><|turn>user\n{text}<turn|>\n<|turn>model\n ; <turn|> (106) / <eos> (1) end a reply
-        prompt_ids = [2] + tok(f"<|turn>user\n{a.prompt}<turn|>\n<|turn>model\n", add_special_tokens=False)["input_ids"]
-        stop = (1, 106)
+        msgs = ([{"role": "system", "content": a.system}] if a.system else []) + [{"role": "user", "content": a.prompt}]
+        prompt_ids = tok(render_chat(a.gguf, msgs), add_special_tokens=False)["input_ids"]
+        assert prompt_ids[0] == 2, "the rendered prompt must start with <bos>"
+        stop = (1, 106)                     # <eos>, <turn|>
+        n_prompt, seen = len(prompt_ids), []
+
+        def on_token(t):                     # stream: print the newly decoded text as tokens arrive
+            if t in stop:
+                return
+            seen.append(t)
+            text = tok.decode(seen)
+            print(text[on_token.printed:], end="", flush=True)
+            on_token.printed = len(text)
+        on_token.printed = 0
     elif a.prompt_ids:
         prompt_ids = [int(x) for x in a.prompt_ids.split(",")]
     else:
         ap.error("give --prompt or --prompt-ids")
     ids, steps = generate_gemma4(source, prompt_ids, a.steps,
-                                 a.sim, a.hal, verbose=a.verbose, int4_group=group, trace=trace, stop_ids=stop,
+                                 a.sim, a.hal, verbose=a.verbose, int4_group=group, trace=trace, stop_ids=stop, on_token=on_token,
                                  image_dir=a.image_dir or (os.path.expanduser("~/.cache/rtv_accel") if a.gguf else None))
-    print("ids:", ids)
     if tok is not None:
-        print("reply:", tok.decode([i for i in ids[len(prompt_ids):] if i not in stop]))
-    for i, (t, l) in enumerate(steps):
-        print(f"  step {i}: top5 {t}  logits {[round(v, 4) for v in l]}")
+        print()                              # the reply was streamed above
+    if tok is None or a.verbose:
+        print("ids:", ids)
+        for i, (t, l) in enumerate(steps):
+            print(f"  step {i}: top5 {t}  logits {[round(v, 4) for v in l]}")
     if trace:
         np.savez(a.trace_out, hidden=np.stack([t["hidden"] for t in trace]))
     return 0

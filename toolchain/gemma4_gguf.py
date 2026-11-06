@@ -141,3 +141,17 @@ def hf_layer_tensors(layer):
     if layer["wv"] is not None:
         d["self_attn.v_proj.weight"] = layer["wv"].dense().T
     return {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in d.items()}
+
+
+def render_chat(gguf_path, messages):
+    """The GGUF's own Jinja chat template applied to `messages` ([{"role","content"}, ...]) with the generation
+    prompt added; returns the prompt string (it starts with the literal '<bos>')."""
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+    g = GGUF(gguf_path)
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+
+    def raise_exception(msg):
+        raise ValueError(msg)
+    env.globals["raise_exception"] = raise_exception
+    return env.from_string(g.meta["tokenizer.chat_template"]).render(
+        messages=messages, add_generation_prompt=True, bos_token="<bos>")
