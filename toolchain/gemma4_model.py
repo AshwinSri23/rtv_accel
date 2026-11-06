@@ -21,10 +21,13 @@ on the host. Sliding-window attention (last `window` keys; older cache tiles ski
     python toolchain/gemma4_model.py --model <dir> --prompt-ids 5,17,101 --steps 4
 """
 import argparse
+import contextlib
+import types
 import json
 import os
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -98,14 +101,17 @@ def _blob_bytes(K, N, int4_group):
     return tvm_backend.int4_blob_nbytes(K, N, int4_group) if int4_group else K * N * 4
 
 
-def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_group=0, trace=None,
-                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=(), score_out=None, on_token=None):
-    """Greedy-generate n_new tokens. `source` is a checkpoint dir or an already loaded
-    (cfg, layers, embed, final_norm); matrices may be lazy gemma4_gguf.Q4Mat objects (then int4_group=32).
-    Returns (all_ids, per_step) with per_step[i] = (top5_ids, top5_logits).
-
-    score_out (a list): teacher-forced scoring. Every position's logits are computed and, if ids[pos+1] is known
-    (prompt_ids is then the whole sequence, n_new=0), (top5_ids, top5_logits, logprob_of_next_token) is appended.
+@contextlib.contextmanager
+def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=None, trace_pos=None,
+                staging_reserve=1 << 30, stats=None, image_dir=None):
+    """Open a model session: build the DRAM image, start `rtv_sim --serve`, yield `s` with
+        s.step(token, pos) -> the final hidden row after running every layer for `token` at position `pos`
+        s.head(h)          -> the next-token logits (final norm, tied lm_head, softcap; on the host)
+        s.max_total        -> positions the KV cache holds
+    Positions may be rewound: stepping `pos` again overwrites that KV row and later rows are masked out, so a chat
+    can keep the cache of a common prefix and re-feed only the part that changed. `source` is a checkpoint dir or an
+    already loaded (cfg, layers, embed, final_norm); matrices may be lazy gemma4_gguf.Q4Mat objects (int4_group=32).
+    generate_gemma4 below is the one-shot driver built on this.
 
     Compile cost: the per-layer programs are NOT recompiled for every layer. Program A (attention + dense branch +
     router) is compiled for one representative layer per layer TYPE (sliding / full) and its LOAD/STORE addresses are
@@ -121,7 +127,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
     softcap = cfg.get("final_logit_softcapping")
     E_pad = (E + M - 1) // M * M
     n_layers = len(layers)
-    total = len(prompt_ids) - 1 + n_new
+    total = max_total
     max_tiles = -(-total // M)
     w4 = 4
     reloc = not os.environ.get("RTV_NO_GEMMA_RELOC")
@@ -274,7 +280,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         return c
 
     # ---- relocation -------------------------------------------------------------------------------------------
-    def a_roles(li):
+    def a_roles(li, nt):
         lw, a = layers[li], L[li]
         hd, nkv = lw["head_dim"], lw["n_kv"]
         q_dim, kv_dim = n_heads * hd, nkv * hd
@@ -289,7 +295,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         for g in ("g_in", "g_post_attn", "g_pre_ff", "g_post_ff1", "g_router", "g_pre_ff2"):
             r[g] = (a[g], M * hidden * 4)
         for h in range(nkv):
-            for t in range(max_tiles):
+            for t in range(nt):
                 r[f"k{h}_{t}"] = (a["k_cache"][h][t], M * hd * 4)
                 r[f"v{h}_{t}"] = (a["v_cache"][h][t], M * hd * 4)
         return r
@@ -341,7 +347,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             stream = comp.instruction_stream
         else:
             stream = tvm_backend._relocate_instructions(
-                bytes(comp.instruction_stream), a_roles(rep), a_roles(li), 0, list(comp._const_cache.values()))
+                bytes(comp.instruction_stream), a_roles(rep, pos // M + 1), a_roles(li, pos // M + 1), 0, list(comp._const_cache.values()))
         c = clone(comp, stream, comp._const_regions)
         if xin is not None:
             c._const_regions[x_addr] = xin.tobytes()
@@ -385,7 +391,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
                 last = None
                 for li in range(n_layers):
                     ca = a_program(li, pos, xin if li == 0 else None)
-                    tr = trace is not None and pos == len(prompt_ids) - 1
+                    tr = trace is not None and pos == trace_pos
                     dbg = [(resid_addr, M * hidden * 4, "r"), (h1_addr, M * hidden * 4, "h"),
                            (en_addr, M * hidden * 4, "e"), (dbg_addrs["n2"], M * hidden * 4, "n"),
                            (dbg_addrs["mlp"], M * hidden * 4, "m")] if tr else []
@@ -415,32 +421,128 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
                     lg = np.tanh(lg / softcap) * softcap
                 return lg
 
-            ids = list(prompt_ids)
-            per_step = []
-            for pos in range(total):
-                h = step(ids[pos], pos)
-                if score_out is not None and pos + 1 < len(prompt_ids):
-                    lg = head(h)
-                    top = np.argsort(-lg)[:5]
-                    m = lg.max()
-                    logp = float(lg[prompt_ids[pos + 1]] - m - np.log(np.exp(lg - m).sum()))
-                    score_out.append(([int(i) for i in top], [float(lg[i]) for i in top], logp))
-                if pos >= len(prompt_ids) - 1:
-                    lg = head(h)
-                    top = np.argsort(-lg)[:5]
-                    per_step.append(([int(i) for i in top], [float(lg[i]) for i in top]))
-                    ids.append(int(top[0]))
-                    if verbose:
-                        print(f"  pos {pos}: token {ids[-1]}", file=sys.stderr)
-                    if on_token is not None:
-                        on_token(ids[-1])
-                    if ids[-1] in stop_ids:
-                        break
+            yield types.SimpleNamespace(step=step, head=head, max_total=total)
         finally:
             sess.close()
     if stats is not None:
         stats.update({str(k): dict(c.stats) for k, c in step_caches.items() if k != "programs"})
+
+
+def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_group=0, trace=None,
+                    staging_reserve=1 << 30, stats=None, image_dir=None, stop_ids=(), score_out=None, on_token=None):
+    """Greedy-generate n_new tokens. Returns (all_ids, per_step) with per_step[i] = (top5_ids, top5_logits).
+
+    score_out (a list): teacher-forced scoring. Every position's logits are computed and, if ids[pos+1] is known
+    (prompt_ids is then the whole sequence, n_new=0), (top5_ids, top5_logits, logprob_of_next_token) is appended."""
+    total = len(prompt_ids) - 1 + n_new
+    ids = list(prompt_ids)
+    per_step = []
+    with open_gemma4(source, total, sim, hal, verbose, int4_group, trace, len(prompt_ids) - 1, staging_reserve, stats,
+                     image_dir) as s:
+        for pos in range(total):
+            h = s.step(ids[pos], pos)
+            if score_out is not None and pos + 1 < len(prompt_ids):
+                lg = s.head(h)
+                top = np.argsort(-lg)[:5]
+                m = lg.max()
+                logp = float(lg[prompt_ids[pos + 1]] - m - np.log(np.exp(lg - m).sum()))
+                score_out.append(([int(i) for i in top], [float(lg[i]) for i in top], logp))
+            if pos >= len(prompt_ids) - 1:
+                lg = s.head(h)
+                top = np.argsort(-lg)[:5]
+                per_step.append(([int(i) for i in top], [float(lg[i]) for i in top]))
+                ids.append(int(top[0]))
+                if verbose:
+                    print(f"  pos {pos}: token {ids[-1]}", file=sys.stderr)
+                if on_token is not None:
+                    on_token(ids[-1])
+                if ids[-1] in stop_ids:
+                    break
     return ids, per_step
+
+
+class Chat:
+    """Multi-turn driver over an open session. Keeps the token ids whose KV rows are in the cache; a new turn is
+    the whole re-rendered conversation, and only the part after the longest common prefix is run (the cache is
+    rewound to that point: stepping a position again overwrites its KV row and later rows are masked)."""
+
+    def __init__(self, session, stop_ids=()):
+        self.s, self.stop, self.cache, self.fed = session, tuple(stop_ids), [], 0
+
+    def feed(self, ids):
+        if len(ids) > self.s.max_total:
+            raise ValueError(f"{len(ids)} tokens exceed the {self.s.max_total}-position context")
+        c = 0
+        for a, b in zip(self.cache, ids):
+            if a != b:
+                break
+            c += 1
+        c = min(c, len(ids) - 1)             # the last token is always re-run: its hidden state seeds the reply
+        del self.cache[c:]
+        h = None
+        for pos in range(c, len(ids)):
+            h = self.s.step(ids[pos], pos)
+            self.cache.append(ids[pos])
+        self.fed = len(ids) - c
+        return h
+
+    def reply(self, ids, max_new, on_token=None):
+        """Feed `ids`, then greedy-decode up to max_new tokens (stops after a stop id or when the context is full).
+        Returns the reply ids, stop id included."""
+        h = self.feed(ids)
+        out = []
+        for _ in range(max_new):
+            t = int(np.argmax(self.s.head(h)))
+            out.append(t)
+            if on_token is not None:
+                on_token(t)
+            if t in self.stop or len(self.cache) >= self.s.max_total:
+                break
+            h = self.s.step(t, len(self.cache))
+            self.cache.append(t)
+        return out
+
+
+def chat_main(a, source, group):
+    """Interactive multi-turn chat. Each turn re-renders the whole conversation with the GGUF's template; only the
+    tokens after the longest common prefix with what the cache holds are run (Chat). An empty line or Ctrl-D ends."""
+    from gemma4_gguf import render_chat
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(a.tokenizer)
+    stop = (1, 106)
+    msgs = [{"role": "system", "content": a.system}] if a.system else []
+    print(f"loading (the image build takes a minute or two); context {a.max_ctx} tokens", file=sys.stderr)
+    with open_gemma4(source, a.max_ctx, a.sim, a.hal, int4_group=group,
+                     image_dir=a.image_dir or os.path.expanduser("~/.cache/rtv_accel")) as s:
+        chat = Chat(s, stop)
+        while True:
+            try:
+                user = input("\nyou> ").strip()
+            except EOFError:
+                break
+            if not user:
+                break
+            msgs.append({"role": "user", "content": user})
+            ids = tok(render_chat(a.gguf, msgs), add_special_tokens=False)["input_ids"]
+            if len(ids) + a.max_new > a.max_ctx:
+                print(f"[context full: {len(ids)} tokens + {a.max_new} reply > {a.max_ctx}; restart with a larger --max-ctx]")
+                msgs.pop()
+                break
+            seen = []
+
+            def on_token(t):
+                if t in stop:
+                    return
+                seen.append(t)
+                text = tok.decode(seen)
+                print(text[on_token.printed:], end="", flush=True)
+                on_token.printed = len(text)
+            on_token.printed = 0
+            t0 = time.time()
+            reply = chat.reply(ids, a.max_new, on_token)
+            print(f"\n[{chat.fed} tokens fed, {len(reply)} generated, {time.time() - t0:.0f} s]", file=sys.stderr)
+            msgs.append({"role": "assistant", "content": tok.decode([t for t in reply if t not in stop])})
+    return 0
 
 
 def main():
@@ -455,6 +557,10 @@ def main():
     ap.add_argument("--tokenizer", default=os.path.expanduser("~/models/hf/gemma-4-12B-it-assistant"),
                     help="directory with a Gemma-4 tokenizer.json (the vocab is shared across the family)")
     ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--chat", action="store_true",
+                    help="interactive multi-turn chat (needs --gguf): the model and KV cache stay loaded between turns")
+    ap.add_argument("--max-ctx", type=int, default=2048, help="--chat: KV cache capacity in tokens")
+    ap.add_argument("--max-new", type=int, default=256, help="--chat: longest reply in tokens")
     ap.add_argument("--int4-group", type=int, default=0)
     ap.add_argument("--image-dir", default=None,
                     help="where the DRAM image file is written (a real model is ~16 GB; /tmp is often a small tmpfs)")
@@ -469,6 +575,10 @@ def main():
         source, group = load_gemma4_gguf(a.gguf, a.layers), 32
     else:
         source = a.model
+    if a.chat:
+        if not a.gguf:
+            ap.error("--chat needs --gguf")
+        return chat_main(a, source, group)
     trace = [] if a.trace_out else None
     tok = None
     stop = ()

@@ -141,6 +141,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_byoc_decoder        # graph-driven decode layer/model: byte-identical to the hand-driven path
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
         test_gemma4_model        # tiny random Gemma-4 (sandwich norms, dense+experts, K=V, partial RoPE, softcap) vs Hugging Face
+        test_gemma4_chat         # multi-turn session: reuse the KV cache of a common prefix, rewind on divergence
         test_gguf_q4             # llama.cpp Q4_0 blocks -> INT4W g32 blob is lossless; chip GEMM on it
         test_int8_embed          # host-side INT8-per-row embedding / lm_head table
         test_dram_image_4gb      # DRAM image > 4 GiB: loader and dumps use 64-bit addresses
