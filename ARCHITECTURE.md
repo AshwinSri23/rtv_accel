@@ -277,21 +277,26 @@ traffic table below for how little of that movement is weights. These are instru
 
 ### DRAM traffic per decode layer (bytes moved by `LOAD_TILE` / `STORE_TILE`)
 
-Decoded from the same programs (weights = loads from the weight region; "other" = activations, KV cache, constants):
+Decoded from the compiled programs (`isa_coverage.py` for Qwen3, the same decoder on a Gemma run for Gemma). Weights =
+loads from the weight region; "other" = activations, KV cache, constants. Decode has one real row, so GEMMs load a
+**single activation row** (64 B, `compiler.gemm_a_rows = 1`, rows 1-15 of the SRAM slot kept zero) instead of a 16-row
+tile (1 KB, 15/16 zeros) per output tile. Before -> after:
 
 | Program | Weight loads | Other loads | Stores |
 |---|---:|---:|---:|
-| Gemma-4 sliding layer, A | 32.8 MB | 238 MB | 14.4 MB |
-| Gemma-4 full layer, A | 41.8 MB | 299 MB | 15.9 MB |
-| Gemma-4, B (8 experts) | 29.7 MB | 236 MB | 26.0 MB |
+| Qwen3-0.6B dense layer | 9.8 MB | 68.1 -> **9.1 MB** | 3.4 MB |
+| Gemma-4 sliding layer, A | 32.8 MB | 238 -> **41.4 MB** | 14.4 MB |
+| Gemma-4 full layer, A | 41.8 MB | 299 -> **47.8 MB** | 15.9 MB |
+| Gemma-4, B (8 experts) | 29.7 MB | 236 -> **57.8 MB** | 26.0 MB |
 
-Per token (25 sliding + 5 full layers): **1.92 GB of weights** (12.0 M INT4 weight tiles x 128 B + one 64 B FP32 scale
-row per two K tiles; Q4_0's own fp16 scales would make it 1.73 GB), but **14.5 GB of other loads and 1.2 GB of
-stores**. Weights are only about 11% of the DRAM traffic. (Qwen3-0.6B: 61,440 INT4 tiles per layer, ~275 MB of weights
-per token.) The excess is the activation: decode has one real row but every GEMM re-reads a full 16-row FP32 activation
-tile (1 KB, 15 rows zero) for each output tile, against a 128 B weight tile. That is a compiler/dataflow choice, not
-an ISA limit: keeping the activation row resident in SRAM across the output tiles of a GEMM (or packing it) would cut
-most of the 14.5 GB. It is the largest single inefficiency measured so far, ahead of GELU or routing.
+Per token: Gemma-4 **1.92 GB of weights** (12.0 M INT4 weight tiles x 128 B + one 64 B FP32 scale row per two K tiles;
+Q4_0's own fp16 scales would make it 1.73 GB) and now ~3.0 GB of other loads (was 14.5 GB) plus 1.2 GB of stores, so
+weights went from ~11% to ~31% of the DRAM traffic. Qwen3-0.6B: 275 MB of weights, ~255 MB of other loads (was 1.9 GB).
+Numerics are unchanged (real-model per-layer error vs Hugging Face identical to before, 3.6e-6). What is left in "other"
+is element-wise work (norms, residuals, the composed GELU, RoPE, masks) that still loads/stores whole 16-row tiles;
+making those row-0-only is a separate, riskier change (later ops such as the attention core and K transposes do read
+all 16 rows) and has not been done. Not covered by the one-row load: the FP32-weight GEMM (Gemma's small router) and
+prefill/batched paths, which have real rows.
 
 ### Weak spots (what this table does not hide)
 

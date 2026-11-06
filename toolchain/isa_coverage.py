@@ -45,15 +45,32 @@ def histogram(stream):
     return n, ops, modes
 
 
-def show(title, stream):
+def traffic(stream, is_weight):
+    """Bytes moved by LOAD_TILE / STORE_TILE, weights (addresses where is_weight(addr)) vs everything else."""
+    n = len(stream) // 16
+    w = np.frombuffer(bytes(stream), dtype=">u8").reshape(n, 2)
+    hi, lo = w[:, 0], w[:, 1]
+    opc = ((hi >> np.uint64(60)) & np.uint64(0xF)).astype(int)
+    addr = ((hi >> np.uint64(24)) & np.uint64(0xFFFFFFFF)) | (((lo >> np.uint64(36)) & np.uint64(0xF)) << np.uint64(32))
+    rows = (((hi & np.uint64(0xFF)) << np.uint64(8)) | (lo >> np.uint64(56))) & np.uint64(0xFF)
+    byt = (rows * ((lo >> np.uint64(40)) & np.uint64(0xFFFF))).astype(np.int64)
+    ld, st = opc == Opcode.LOAD_TILE, opc == Opcode.STORE_TILE
+    wt = ld & is_weight(addr)
+    return dict(weights=int(byt[wt].sum()), other_loads=int(byt[ld & ~wt].sum()), stores=int(byt[st].sum()))
+
+
+def show(title, stream, is_weight=None):
     n, ops, modes = histogram(stream)
     print(f"\n### {title}: {n:,} instructions")
     print("  by opcode:", ", ".join(f"{k} {v:,}" for k, v in ops.most_common()))
     print("  by mode:  ", ", ".join(f"{k} {v:,}" for k, v in modes.most_common()))
+    if is_weight is not None:
+        t = traffic(stream, is_weight)
+        print("  DRAM traffic:", ", ".join(f"{k} {v / 1e6:.1f} MB" for k, v in t.items()))
     return n
 
 
-def qwen3_layer(pos, hal):
+def qwen3_layer(pos, hal, row0=False):
     hidden, inter, heads, kv, hd = 1024, 3072, 16, 8, 128
     c = NPUCompiler(hal)
     c.dtype = CDType.FP32
@@ -61,6 +78,8 @@ def qwen3_layer(pos, hal):
     c.int4_group = 32
     c._dram_cursor = 0x40000000
     c.rms_eps = 1e-6
+    if row0:
+        c.gemm_a_rows = 1
     c.init_staging()
     g = 1 << 24
     tiles = pos // 16 + 1
@@ -80,7 +99,12 @@ def main():
     ap.add_argument("--hal", default=os.path.join(_HERE, "hal_config.json"))
     a = ap.parse_args()
     tot = {}
-    tot["Qwen3-0.6B layer"] = show(f"Qwen3-0.6B dense layer (INT4W g32, pos {a.pos})", qwen3_layer(a.pos, a.hal))
+    g = 1 << 24
+    qw = lambda addr: (addr >= np.uint64(4 * g)) & (addr < np.uint64(11 * g))  # noqa: E731  (wq..wdown regions)
+    for r0 in (False, True):
+        tot[f"Qwen3 row0={r0}"] = show(f"Qwen3-0.6B dense layer (INT4W g32, pos {a.pos}, "
+                                       f"{'one-row' if r0 else 'full-tile'} activation loads)",
+                                       qwen3_layer(a.pos, a.hal, r0), qw)
     if a.gguf:
         import gemma4_model
         from gemma4_gguf import load_gemma4_gguf
