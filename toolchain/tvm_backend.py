@@ -818,11 +818,12 @@ def _gemm_a_rows(compiler):
     return getattr(compiler, "gemm_a_rows", None) or compiler.tile_dim
 
 
-def _emit_a_slot_zero_fill(compiler, a_slots, emit):
+def _emit_a_slot_zero_fill(compiler, a_slots, emit, zero=None):
     """With row-0-only A loads, rows 1..15 of each A SRAM slot must be zero (they feed output rows 1..15). Other
     ops reuse these slots with full tiles, so zero them at the start of every GEMM: depth x 1 KB of loads."""
     T = compiler.tile_dim
-    zero = _const_tile_fp32(compiler, T, 0.0)
+    if zero is None:
+        zero = _const_tile_fp32(compiler, T, 0.0)
     for k, slot in enumerate(a_slots):
         emit(opcode=Opcode.LOAD_TILE, dep_id=codegen.ROT_A_BASE + k, dram_addr=zero, sram_addr=slot,
              dim_m=T, dim_n=T * 4, stride=T * 4, dtype=int(DType.FP32))
@@ -1017,8 +1018,45 @@ def int4_dequant(q, scales, group):
     return q * np.repeat(np.asarray(scales, dtype=np.float64), group, axis=0)
 
 
+_INT4W_TEMPLATES = {}
+_TMPL_BASE = {"a": 1 << 32, "b": 2 << 32, "c": 3 << 32, "z": 4 << 32}
+_TMPL_SPAN = 1 << 30
+
+
 def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32, a_stride=None,
                             depth=3, indirect_b=None):
+    """See _emit_matmul_int4w_fp32_raw. The instruction stream of a GEMM depends on the shape, group, depth, A pitch and
+    the number of A rows loaded, and on the three base addresses only through LOAD/STORE addresses that are linear in
+    them -- so it is emitted ONCE per shape (with the A, B and C bases in three far-apart regions) and every other call
+    is a vectorised address rewrite of that template (_relocate_instructions). Emitting is ~0.3 s of Python per
+    GEMM; this is ~1 ms. Byte-identical to the direct emission (test_relocate_fast). Indirect (on-device routing)
+    GEMMs and operands over 1 GiB take the direct path. RTV_NO_GEMM_TEMPLATES=1 disables it."""
+    nbytes_b = K * N // 2 + (K // group) * N * 4 if group else 0
+    if (indirect_b is not None or os.environ.get("RTV_NO_GEMM_TEMPLATES") or nbytes_b >= _TMPL_SPAN
+            or K * (a_stride or K) * 4 >= _TMPL_SPAN or 16 * N * 4 >= _TMPL_SPAN):
+        return _emit_matmul_int4w_fp32_raw(compiler, M, N, K, a_addr, b_addr, c_addr, group, a_stride, depth, indirect_b)
+    key = (M, N, K, group, a_stride, depth, _gemm_a_rows(compiler), compiler.tile_dim)
+    # Row-0 loads zero-fill the A SRAM slots from a constant zero tile; building it registers a constant in THIS
+    # compiler, so do that here (not inside the cached template) and map the template's zero address onto it.
+    zero = _const_tile_fp32(compiler, compiler.tile_dim, 0.0) if _gemm_a_rows(compiler) < compiler.tile_dim else 0
+    tpl = _INT4W_TEMPLATES.get(key)
+    if tpl is None:
+        saved = compiler.instruction_stream
+        compiler.instruction_stream = bytearray()
+        try:
+            _emit_matmul_int4w_fp32_raw(compiler, M, N, K, _TMPL_BASE["a"], _TMPL_BASE["b"], _TMPL_BASE["c"], group,
+                                        a_stride, depth, None, zero_addr=_TMPL_BASE["z"])
+            tpl = bytes(compiler.instruction_stream)
+        finally:
+            compiler.instruction_stream = saved
+        _INT4W_TEMPLATES[key] = tpl
+    src = {r: (b, _TMPL_SPAN) for r, b in _TMPL_BASE.items()}
+    dst = {"a": (a_addr, _TMPL_SPAN), "b": (b_addr, _TMPL_SPAN), "c": (c_addr, _TMPL_SPAN), "z": (zero, _TMPL_SPAN)}
+    compiler.instruction_stream.extend(_relocate_instructions(tpl, src, dst, 0, []))
+
+
+def _emit_matmul_int4w_fp32_raw(compiler, M, N, K, a_addr, b_addr, c_addr, group=32, a_stride=None,
+                                depth=3, indirect_b=None, zero_addr=None):
     """C(M,N) = A(M,K) fp32 @ dequant(B(K,N) int4) -> fp32 (ISA v1.9 INT4W).
 
     B is int4_weight_blob(): packed nibbles then (K/group, N) scale rows at
@@ -1072,7 +1110,7 @@ def _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, b_addr, c_addr, group=32,
 
     a_rows = _gemm_a_rows(compiler)
     if a_rows < T:
-        _emit_a_slot_zero_fill(compiler, a_slots, emit)
+        _emit_a_slot_zero_fill(compiler, a_slots, emit, zero_addr)
     for i in range(min(depth - 1, len(steps))):
         load(i)
     for i, (jn, kn) in enumerate(steps):

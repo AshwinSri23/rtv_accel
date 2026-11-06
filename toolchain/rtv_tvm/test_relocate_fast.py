@@ -81,10 +81,37 @@ def random_stream(rng, n, spans):
     return out.tobytes()
 
 
+def gemm_templates_equal():
+    """The templated INT4W GEMM emission is byte-identical to emitting it directly."""
+    from compiler_state import NPUCompiler, DType as CDType
+    hal = os.path.join(os.path.dirname(_HERE), "hal_config.json")
+    ok = True
+    cases = [(16, 32, 64, 32, None, 3, None), (1, 96, 224, 32, None, 3, 1), (16, 48, 96, 16, 192, 2, None),
+             (1, 704, 2816, 32, None, 3, 1), (1, 2816, 704, 32, None, 3, 1), (16, 64, 128, 32, None, 3, 1)]
+    for M, N, K, g, stride, depth, rows in cases:
+        comps = []
+        for direct in (False, True):
+            for warm in (0, 1):                  # 1: a SECOND, fresh compiler after the template exists (const state!)
+                c = NPUCompiler(hal)
+                c.dtype = CDType.FP32
+                c.instruction_stream = bytearray()
+                c.gemm_a_rows = rows
+                fn = tvm_backend._emit_matmul_int4w_fp32_raw if direct else tvm_backend._emit_matmul_int4w_fp32
+                fn(c, M, N, K, 0x123000, 0x5_4567_0000, 0x7_0000_1000, g, stride, depth)     # b above 4 GiB
+                fn(c, M, N, K, 0x2000, 0x300000, 0x9000000, g, stride, depth)
+                comps.append((bytes(c.instruction_stream), dict(c._const_regions), dict(c._const_cache),
+                              c.dram_bytes_needed))
+        same = all(x == comps[0] for x in comps)
+        ok &= same
+        print(f"{'PASS' if same else 'FAIL'}  templated INT4W GEMM == direct emission, stream AND constants, cold and warm "
+              f"(M={M} N={N} K={K} g{g} rows={rows}): {len(comps[0][0]) // 16} instrs")
+    return ok
+
+
 def main():
     rng = np.random.default_rng(7)
     spans = [(0x1000, 0x4000), (0x9000, 0x3000), (0x20000, 0x8000), (0x1_0000_0000 + 0x40000, 0x10000), (0x500000, 0x100)]
-    ok = True
+    ok = gemm_templates_equal()
     for trial in range(12):
         stream = random_stream(rng, 6000, spans)
         overlapping = trial % 3 == 2
