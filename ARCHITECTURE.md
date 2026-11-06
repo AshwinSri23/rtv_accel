@@ -234,6 +234,61 @@ None of this is needed to work on the current pipeline. It's recorded
 here only so the names remain findable: all of it is recoverable from
 git history if the INT8 work is ever revisited.
 
+## ISA coverage: one instruction set for the dense and the MoE model
+
+The hardware is fixed and the compiler adapts: Qwen3 (dense, SwiGLU) and Gemma-4-26B-A4B (dense GELU MLP in parallel
+with 128 experts, sandwich norms, sliding-window attention) run on the **same ISA**. Moving from Qwen3 to Gemma-4
+added no instruction and no hardware mode; what was new was composed from existing operations, done in the compiler,
+or done on the host.
+
+| Model feature | Implemented by | Qwen3 (dense) | Gemma-4 MoE |
+|---|---|---|---|
+| Linear layers | `COMPUTE_GEMM`, FP32 activations x FP32 / BF16W / INT8W / INT4W weights | yes | yes (INT4W g32, straight from Q4_0) |
+| RMSNorm | `REDUCE_SUMSQ`, `SCALAR_ALU` RMS_SCALE, `ELEMWISE_MUL` by the gain | 2 per layer + q/k norms | up to 7 per layer + q/k norms + a weightless V norm |
+| Softmax | `REDUCE_MAX`, `SCALAR_ALU` EXP_SUB, `REDUCE`, `SCALAR_DIV` | yes | yes |
+| SwiGLU | SiLU (`EXEC_ALU` SILU / LUT) x `ELEMWISE_MUL` | yes | not used |
+| GELU(tanh) | **composed**: mul, add, RELU, exp (`EXP_SUB`), Newton reciprocal, ~310 instructions per tile column | no | yes (dense MLP and every expert) |
+| RoPE | rotation tables (compile-time constants) + `ELEMWISE_MUL`/`ADD` | full | full (sliding layers) or partial "proportional" (full layers) |
+| Causal / tail mask | additive mask tile (`ELEMWISE_ADD`) | yes | yes |
+| Sliding window | **compiler only**: skip old KV tiles + a mask tile | no | yes (25 of 30 layers, 1024 keys) |
+| KV cache | `LOAD_TILE` / `STORE_TILE` append, contiguous V block | yes | yes (K=V on full layers) |
+| Addresses above 4 GiB | 36-bit `LOAD_TILE`/`STORE_TILE` (ISA v1.6) | not needed | needed (16.5 GB image) |
+| Routing, top-k of 128 | **host**, between two device programs per layer (softmax, top-k, renormalise) | no | yes |
+| Routing, top-1 | `REDUCE_ARGMAX` + `INDIRECT_ADDR` loads (ISA v1.7), no host trip | no | not used (Gemma needs top-8) |
+| Router logits, layer scalar, route weights | GEMM / constant tiles | -- | yes |
+| Embedding lookup, lm_head, softcap, sampling | host (FP32) | yes | yes |
+
+### What one decode layer costs (instructions)
+
+Measured by `toolchain/isa_coverage.py` on the real-sized per-layer programs (position 20, INT4W g32 weights):
+
+| Program | Instructions | `COMPUTE_GEMM` (INT4W) | `LOAD_TILE` | `EXEC_ALU` | `SCALAR_ALU` | `REDUCE` |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-0.6B, one dense layer | 384,448 | 61,440 | 158,491 | 1,664 | 384 | 410 |
+| Gemma-4 sliding layer: A (attention + dense MLP + router) | 1,312,570 | 204,864 | 539,369 | 10,096 | 1,864 | 1,640 |
+| Gemma-4 full layer: A (head_dim 512, 2 KV heads) | 1,658,126 | 261,184 | 682,757 | 10,736 | 1,992 | 1,756 |
+| Gemma-4: B (8 chosen experts + norms + residual), any layer | 1,252,154 | 185,856 | 509,022 | 21,824 | 1,056 | 370 |
+
+A sliding Gemma layer is A + B = 2.56 M instructions and a full layer 2.91 M, so one token through 25 sliding + 5 full
+layers is about **79 M instructions** (Qwen3-0.6B: 28 x 0.38 M = 10.8 M). Every `LOAD_TILE` is paired with a
+`WAIT_SYNC`, and weight streaming (`LOAD_TILE` + `COMPUTE_GEMM`) is about 98% of every program: the model is
+bandwidth-shaped, not ALU-shaped. These are instruction counts, not cycles or seconds.
+
+### Weak spots (what this table does not hide)
+
+- **GELU is composed, not native.** All elementwise and scalar work of the whole expert program B is 22,880
+  instructions out of 1.25 M (1.8%), and GELU is most of it, so by instruction count it is cheap. The caveat is that
+  instruction count is not time: its ~60 passes over a tile each pay a DMA round trip through DRAM. If a cycle-level
+  profile ever shows it matters, a general element-wise function unit is the one hardware change that would pay off.
+  Until then it stays composed.
+- **Top-k routing is on the host.** Each layer is two device programs with a host round trip between them (softmax,
+  top-k over 128 experts, renormalise), 60 program launches per token. The on-device path exists only for top-1
+  (`REDUCE_ARGMAX` + `INDIRECT_ADDR`); on-device top-8 would need new hardware (repeated argmax with masking, or a
+  top-k unit), or per-expert predication.
+- **Sliding window and K=V are compiler constructs**, so they cost nothing in hardware, but the stream's shape
+  changes at KV-tile boundaries (a derived-step cache has to restart there).
+- **Embedding table and lm_head stay on the host** in FP32 (2.9 GB). They are not part of the ISA story at all.
+
 ## Where to go next
 
 - **`TODO.md`** — the project's running history and roadmap: what's been

@@ -327,6 +327,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             if comp is None:
                 comp = program_a(rep, pos, None)
                 step_caches[k].observe(pos, comp)
+                if stats is not None:
+                    stats.setdefault("programs", {}).setdefault(f"A_{k[3]}", bytes(comp.instruction_stream))
             tpl = a_templates[k] = (pos, comp)
         comp = tpl[1]
         rep = rep_of[k]
@@ -358,6 +360,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
             if sum(1 for v in sent.values() if v[0] == "w") != top_k or sum(1 for v in sent.values() if v[0] == "s") != 1:
                 raise RuntimeError("could not locate the route-weight / layer-scalar constant tiles in program B")
             b_state.update(tpl=tpl, sent=sent, roles=b_roles(0, idx0))
+            if stats is not None:
+                stats.setdefault("programs", {})["B_experts"] = bytes(tpl.instruction_stream)
         tpl = b_state["tpl"]
         stream = tvm_backend._relocate_instructions(
             bytes(tpl.instruction_stream), b_state["roles"], b_roles(li, idx), 0, list(tpl._const_cache.values()))
@@ -422,7 +426,7 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
         finally:
             sess.close()
     if stats is not None:
-        stats.update({str(k): dict(c.stats) for k, c in step_caches.items()})
+        stats.update({str(k): dict(c.stats) for k, c in step_caches.items() if k != "programs"})
     return ids, per_step
 
 
