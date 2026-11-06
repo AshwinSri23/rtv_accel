@@ -14,7 +14,8 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
-from gguf_reader import GGUF  # noqa: E402
+from gguf_reader import GGUF, BLOCK, parse_q4_k, parse_q6_k, parse_q8_0  # noqa: E402
+import quant_planes  # noqa: E402
 
 
 class Q4Mat:
@@ -49,15 +50,62 @@ class Q4Mat:
         return np.ascontiguousarray(w.reshape(self.N, self.K).T)          # [K, N]
 
 
+class QMat:
+    """A [K, N] weight stored as Q4_K / Q8_0 / Q6_K blocks `raw` of shape (N, K/elems, block_bytes). It runs on the
+    INT4W hardware as planes plus a per-group correction (quant_planes); `spec()` builds that on demand."""
+
+    KIND = {"Q4_K": "q4k", "Q8_0": "q8_0", "Q6_K": "q6k"}
+
+    def __init__(self, raw, typ):
+        self.raw, self.typ, self.kind = raw, typ, self.KIND[typ]
+        elems, nbytes = BLOCK[typ]
+        assert raw.ndim == 3 and raw.shape[2] == nbytes and raw.dtype == np.uint8
+        self.N, self.K = raw.shape[0], raw.shape[1] * elems
+
+    def _parts(self):
+        """-> (q [K, N], s [K/g, N], m [K/g, N] or None, group)"""
+        T2 = lambda a: np.ascontiguousarray(a.T)  # noqa: E731
+        if self.typ == "Q4_K":
+            q, s, m = parse_q4_k(self.raw)
+            return T2(q), T2(s), T2(m), 32
+        if self.typ == "Q8_0":
+            q, s = parse_q8_0(self.raw)
+            return T2(q), T2(s), None, 32
+        q, s = parse_q6_k(self.raw)
+        return T2(q), T2(s), None, 16
+
+    def spec(self):
+        q, s, m, g = self._parts()
+        if self.typ == "Q4_K":
+            return quant_planes.asym4(q, s, m, g)
+        if self.typ == "Q8_0":
+            return quant_planes.sym8(q, s, g)
+        return quant_planes.sym6(q, s, g)
+
+    def dense(self):
+        q, s, m, g = self._parts()
+        sr = np.repeat(s, g, axis=0)
+        if self.typ == "Q4_K":
+            return (q.astype(np.float32) * sr - np.repeat(m, g, axis=0)).astype(np.float32)
+        off = 0.0 if self.typ == "Q8_0" else 32.0
+        return ((q.astype(np.float32) - off) * sr).astype(np.float32)
+
+
 def _q4(g, name, rows=None, expert=None):
+    """A lazy weight matrix from tensor `name` (Q4_0 -> Q4Mat, Q4_K / Q8_0 / Q6_K -> QMat)."""
     dims, typ, raw = g.raw(name)
-    assert typ == "Q4_0", (name, typ)
+    elems, nbytes = BLOCK[typ]
     k_in = dims[0]
     if expert is None:
-        r = raw.reshape(dims[1], k_in // 32, 18)
+        r = raw.reshape(dims[1], k_in // elems, nbytes)
     else:
-        r = raw.reshape(dims[2], dims[1], k_in // 32, 18)[expert]
-    return Q4Mat(r[rows] if rows is not None else r)
+        r = raw.reshape(dims[2], dims[1], k_in // elems, nbytes)[expert]
+    r = r[rows] if rows is not None else r
+    if typ == "Q4_0":
+        return Q4Mat(r)
+    if typ in QMat.KIND:
+        return QMat(r, typ)
+    raise NotImplementedError(f"{name}: GGUF type {typ} is not supported (Q4_0, Q4_K, Q8_0, Q6_K are)")
 
 
 def gguf_config(g):

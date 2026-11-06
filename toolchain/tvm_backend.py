@@ -594,12 +594,53 @@ def _emit_moe_block_fp32(compiler, hidden, inter, x_addr, normed_addr, experts,
     _emit_residual_add_fp32(compiler, x_addr, y, out_addr, hidden)
 
 
+GROUP_SUM_BLOB_GROUP = 16      # scale-row granularity of the group-sum matrices (any K that is a tile multiple)
+
+
+def group_sum_blob(K, group):
+    """INT4W blob of the 0/1 matrix G [K, Kg_pad] with G[k, k // group] = 1: x @ G is the per-group sum of the
+    activation (the correction term of quant_planes). Returns (blob uint8, Kg_pad)."""
+    pad = -(-(K // group) // 16) * 16
+    g = np.zeros((K, pad), np.int8)
+    g[np.arange(K), np.arange(K) // group] = 1
+    return int4_weight_blob(g, np.ones((K // GROUP_SUM_BLOB_GROUP, pad), np.float32)), pad
+
+
+def _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr):
+    """C = A @ W where W is a quant_planes weight: `spec` = dict(planes=[(blob_addr, group)], corr=(addr, group)|None).
+    Each plane is an ordinary INT4W GEMM; the planes and the correction are summed with FP32 adds. The correction is
+    (A @ G) @ C, G the group-membership matrix (compiler.group_sums[(K, group)] -> blob address) and C the FP32
+    [Kg_pad, N] matrix at spec["corr"][0]."""
+    terms = []
+    for i, (addr, group) in enumerate(spec["planes"]):
+        out = c_addr if i == 0 else compiler.alloc_staging(compiler.tile_dim * N * 4)
+        _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, addr, out, group)
+        terms.append(out)
+    if spec.get("corr"):
+        c_blob, group = spec["corr"]
+        g_blob = compiler.group_sums[(K, group)]
+        kg = -(-(K // group) // 16) * 16
+        Mt = compiler.tile_dim                     # the FP32 GEMM and the adds below work on whole tiles
+        xs = compiler.alloc_staging(Mt * kg * 4)
+        _emit_matmul_int4w_fp32(compiler, M, kg, K, a_addr, g_blob, xs, GROUP_SUM_BLOB_GROUP)
+        out = compiler.alloc_staging(Mt * N * 4)
+        _emit_matmul_fp32(compiler, Mt, N, kg, xs, c_blob, out)
+        terms.append(out)
+    for extra in terms[1:]:
+        _emit_residual_add_fp32(compiler, c_addr, extra, c_addr, N)      # in place
+
+
 def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
     """C = A @ W where W is a model WEIGHT matrix. FP32 normally; BF16 weights
     (half the DRAM and weight traffic, FP32 accumulate) when
     `compiler.bf16_weights` is set, in which case W must have been stored as BF16
     (build_kvcache_model_dram_image(..., bf16_weights=True))."""
     ptr = getattr(compiler, "indirect_weights_scalar", None)
+    spec = getattr(compiler, "qweights", {}).get(w_addr)
+    if spec is not None:                      # Q4_K / Q8_0 / Q6_K weight (quant_planes)
+        if ptr is not None:
+            raise NotImplementedError("planar quantised weights with on-device (indirect) MoE routing")
+        return _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr)
     if ptr is not None:
         if getattr(compiler, "bf16_weights", False):
             _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)

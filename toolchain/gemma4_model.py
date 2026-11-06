@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(_HERE, "rtv_tvm"))
 
 from compiler_state import NPUCompiler, DType, _padded  # noqa: E402
 from hf_loader import SafeTensorsModel                   # noqa: E402
+import quant_planes                                      # noqa: E402
 import tvm_backend                                       # noqa: E402
 from generate import _SimSession, _SESSION_HEADROOM      # noqa: E402
 from decode_step_cache import DecodeStepCache            # noqa: E402
@@ -151,7 +152,20 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
         img_f.write(memoryview(b))
         return a
 
+    qreg, gsums = {}, {}          # planar (Q4_K / Q8_0 / Q6_K) weights: primary address -> spec; (K, group) -> G blob
+
     def place(arr, quant=False):
+        if hasattr(arr, "spec"):                   # QMat: INT4W planes + per-group correction (quant_planes)
+            sp = arr.spec()
+            planes = [(place_bytes(tvm_backend.int4_weight_blob(v, s).tobytes()), g) for v, s, g in sp["planes"]]
+            reg = dict(planes=planes, corr=None)
+            if sp["corr"] is not None:
+                g = sp["corr"][1]
+                reg["corr"] = (place_bytes(quant_planes.corr_matrix(sp, arr.K).tobytes()), g)
+                if (arr.K, g) not in gsums:
+                    gsums[(arr.K, g)] = place_bytes(tvm_backend.group_sum_blob(arr.K, g)[0].tobytes())
+            qreg[planes[0][0]] = reg
+            return planes[0][0]
         if hasattr(arr, "blob"):                   # lazy Q4_0 weight (gemma4_gguf.Q4Mat): already INT4W g32
             if int4_group != 32:
                 raise ValueError("GGUF Q4_0 weights need int4_group=32")
@@ -215,6 +229,7 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
         c._dram_cursor = staging_base
         c.rms_eps = eps
         c.int4_group = int4_group
+        c.qweights, c.group_sums = qreg, gsums
         if not os.environ.get("RTV_FULL_A_TILES"):
             c.gemm_a_rows = 1        # decode: one real row, load 64 B of activation per GEMM step, not a 1 KB tile
         return c
@@ -280,18 +295,30 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
         return c
 
     # ---- relocation -------------------------------------------------------------------------------------------
+    def wroles(name, addr, K, N):
+        """The DRAM regions of one weight matrix: one region for INT4W g32, or one per plane (+ the correction)."""
+        reg = qreg.get(addr)
+        if reg is None:
+            return {name: (addr, _blob_bytes(K, N, int4_group))}
+        r = {f"{name}#p{i}": (a_, tvm_backend.int4_blob_nbytes(K, N, g)) for i, (a_, g) in enumerate(reg["planes"])}
+        if reg["corr"]:
+            r[f"{name}#c"] = (reg["corr"][0], quant_planes.kg_pad(K, reg["corr"][1]) * N * 4)
+        return r
+
     def a_roles(li, nt):
         lw, a = layers[li], L[li]
         hd, nkv = lw["head_dim"], lw["n_kv"]
         q_dim, kv_dim = n_heads * hd, nkv * hd
-        wb = lambda K, N: _blob_bytes(K, N, int4_group)  # noqa: E731
-        r = {"wq": (a["wq"], wb(hidden, q_dim)), "wk": (a["wk"], wb(hidden, kv_dim)),
-             "wo": (a["wo"], wb(q_dim, hidden)), "mlp_gate": (a["mlp_gate"], wb(hidden, inter)),
-             "mlp_up": (a["mlp_up"], wb(hidden, inter)), "mlp_down": (a["mlp_down"], wb(inter, hidden)),
-             "router": (a["router"], hidden * E_pad * 4),
+        r = {"router": (a["router"], hidden * E_pad * 4),
              "q_norm": (a["q_norm"], M * hd * 4), "k_norm": (a["k_norm"], M * hd * 4)}
+        r.update(wroles("wq", a["wq"], hidden, q_dim))
+        r.update(wroles("wk", a["wk"], hidden, kv_dim))
+        r.update(wroles("wo", a["wo"], q_dim, hidden))
+        r.update(wroles("mlp_gate", a["mlp_gate"], hidden, inter))
+        r.update(wroles("mlp_up", a["mlp_up"], hidden, inter))
+        r.update(wroles("mlp_down", a["mlp_down"], inter, hidden))
         if a["wv"] is not None:
-            r["wv"] = (a["wv"], wb(hidden, kv_dim))
+            r.update(wroles("wv", a["wv"], hidden, kv_dim))
         for g in ("g_in", "g_post_attn", "g_pre_ff", "g_post_ff1", "g_router", "g_pre_ff2"):
             r[g] = (a[g], M * hidden * 4)
         for h in range(nkv):
@@ -305,9 +332,9 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
         r = {"g_post_ff2": (a["g_post_ff2"], M * hidden * 4), "g_post_ff": (a["g_post_ff"], M * hidden * 4)}
         for j, e in enumerate(idx):
             ex = a["experts"][int(e)]
-            r[f"e{j}_gate"] = (ex["w_gate"], _blob_bytes(hidden, I, int4_group))
-            r[f"e{j}_up"] = (ex["w_up"], _blob_bytes(hidden, I, int4_group))
-            r[f"e{j}_down"] = (ex["w_down"], _blob_bytes(I, hidden, int4_group))
+            r.update(wroles(f"e{j}_gate", ex["w_gate"], hidden, I))
+            r.update(wroles(f"e{j}_up", ex["w_up"], hidden, I))
+            r.update(wroles(f"e{j}_down", ex["w_down"], I, hidden))
         return r
 
     def clone(tpl, stream, regions):
@@ -318,7 +345,10 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
         c._dram_cursor, c._staging_cursor, c._staging_peak = tpl._dram_cursor, tpl._staging_cursor, tpl._staging_peak
         return c
 
-    type_key = [(l["head_dim"], l["n_kv"], l["wv"] is not None, l["type"]) for l in layers]
+    kind = lambda m: None if m is None else getattr(m, "kind", "q4_0")  # noqa: E731
+    qsig = lambda l: tuple(kind(l[k]) for k in ("wq", "wk", "wv", "wo", "mlp_gate", "mlp_up", "mlp_down"))  # noqa: E731
+    esig = [tuple(kind(l["experts"][0][k]) for k in ("w_gate", "w_up", "w_down")) for l in layers]
+    type_key = [(l["head_dim"], l["n_kv"], l["wv"] is not None, l["type"]) + qsig(l) for l in layers]
     rep_of = {}
     for li, k in enumerate(type_key):
         rep_of.setdefault(k, li)
@@ -356,9 +386,11 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
     def b_program(li, idx, wts):
         if not reloc:
             return program_b(li, idx, wts)
-        if not b_state:
+        st = b_state.get(esig[li])               # one template per expert quantisation signature
+        if st is None:
+            rep = esig.index(esig[li])
             idx0 = list(range(top_k))
-            tpl = program_b(0, idx0, [SENT_W + j for j in range(top_k)], scalar=SENT_S)
+            tpl = program_b(rep, idx0, [SENT_W + j for j in range(top_k)], scalar=SENT_S)
             sent = {}
             for addr, data in tpl._const_regions.items():
                 v = np.frombuffer(data, np.float32)
@@ -370,15 +402,15 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
                         sent[addr] = ("s", 0)
             if sum(1 for v in sent.values() if v[0] == "w") != top_k or sum(1 for v in sent.values() if v[0] == "s") != 1:
                 raise RuntimeError("could not locate the route-weight / layer-scalar constant tiles in program B")
-            b_state.update(tpl=tpl, sent=sent, roles=b_roles(0, idx0))
+            st = b_state[esig[li]] = dict(tpl=tpl, sent=sent, roles=b_roles(rep, idx0))
             if stats is not None:
-                stats.setdefault("programs", {})["B_experts"] = bytes(tpl.instruction_stream)
-        tpl = b_state["tpl"]
+                stats.setdefault("programs", {}).setdefault("B_experts", bytes(tpl.instruction_stream))
+        tpl = st["tpl"]
         stream = tvm_backend._relocate_instructions(
-            bytes(tpl.instruction_stream), b_state["roles"], b_roles(li, idx), 0, list(tpl._const_cache.values()))
+            bytes(tpl.instruction_stream), st["roles"], b_roles(li, idx), 0, list(tpl._const_cache.values()))
         regions = dict(tpl._const_regions)
-        for addr, (kind, j) in b_state["sent"].items():
-            val = wts[j] if kind == "w" else layers[li]["layer_scalar"]
+        for addr, (kind_, j) in st["sent"].items():
+            val = wts[j] if kind_ == "w" else layers[li]["layer_scalar"]
             regions[addr] = np.full((M, hidden), val, np.float32).tobytes()
         return clone(tpl, stream, regions)
 

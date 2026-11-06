@@ -121,6 +121,30 @@ Caveat: today the embedding lookup and lm_head run on the host (the chip returns
 shrinks host memory. If lm_head moves on-device the INT8W GEMM already supports it (K=1024, N=151936, per-channel
 scale) with no new ISA.
 
+## 3f. Other GGUF quantisation types on the same hardware (2026-11-06)
+
+The chip multiplies a signed 4-bit value by one FP32 scale per (group of inputs, output column). Q4_K, Q8_0 and Q6_K are
+of the form `w = scale * (integer + offset)`, which is a sum of such 4-bit planes plus a constant per group
+(`toolchain/quant_planes.py`):
+
+| GGUF type | form | planes (INT4W) | correction per group |
+|---|---|---|---|
+| Q4_K | `s*q - m`, q 0..15, g32 | 1: (q-8, s) | `8s - m` |
+| Q8_0 | `s*q`, q -128..127, g32 | 2: (q>>4, 16s), (q&15 - 8, s) | `8s` |
+| Q6_K | `s*(q-32)`, q 0..63, g16 | 2: (q>>4 - 2, 16s), (q&15 - 8, s) | `8s` |
+
+The correction is `y[n] += sum_g xsum_g * c_g[n]` with `xsum = x @ G` (G the 0/1 group-membership matrix, itself an
+INT4W blob) and `c` an FP32 `[groups, N]` matrix: two small extra GEMMs. Everything is existing instructions;
+`_emit_weight_matmul_fp32` dispatches on a registry (`compiler.qweights`), relocation roles cover every plane and the
+correction, and layers whose matrices differ in scheme get their own program templates. Cost per matrix relative to
+Q4_0: Q4_K about +25% weight traffic (the correction matrix) and an extra GEMM chain; Q8_0 and Q6_K two planes, so about
+the traffic of INT8 (they are 8 and 6.5 bits per weight to begin with). Verified: exact to 3e-7 against the dequantised
+matrix on the chip for 1-row and full-tile shapes (`test_qweights`), block parsers equal a per-element loop written
+from the llama.cpp layouts and bit-identical to the `gguf` package, and the whole tiny Gemma-4 with every matrix in one
+scheme or a mix matches the same model with dequantised FP32 weights (`test_gemma4_quant_types`). Not done: on-device
+(indirect) MoE routing with planar weights, Q5_K / Q5_0 / Q4_1 (same method, not needed), and a run on a real K-quant
+GGUF (none is available locally).
+
 ## 4. Not done
 
 INT4 on a real trained MoE (only the tiny random one is tested); chip perplexity beyond 64 tokens; AWQ/outlier handling and group sizes other than a multiple of 16. Tracked in `TODO.md` Phase 2b.

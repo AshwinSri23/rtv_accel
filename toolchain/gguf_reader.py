@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """gguf_reader.py -- minimal dependency-free GGUF v3 reader (numpy only): metadata + lazy tensor access.
-Supports F32 / F16 / BF16 / Q4_0 / Q8_0 / Q6_K dequantisation, and raw Q4_0 access for the INT4W repack."""
+Supports F32 / F16 / BF16 / Q4_0 / Q8_0 / Q4_K / Q6_K dequantisation, and raw Q4_0 access for the INT4W repack."""
 import mmap
 import struct
 
@@ -10,7 +10,63 @@ _SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?
 GGML = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 12: "Q4_K", 13: "Q5_K",
         14: "Q6_K", 30: "BF16"}
 # (elements per block, bytes per block)
-BLOCK = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "Q4_0": (32, 18), "Q8_0": (32, 34), "Q6_K": (256, 210)}
+BLOCK = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "Q4_0": (32, 18), "Q8_0": (32, 34), "Q6_K": (256, 210),
+         "Q4_K": (256, 144)}
+
+
+# ---- block parsers shared by dequant and the INT4W-plane repack (gemma4_gguf.QMat) ------------------------------
+# All take `blocks` uint8 (..., nblk, block_bytes) and return element-ordered arrays over the input axis:
+#   q (..., nblk*elems), scales (..., nblk*elems/group), and for Q4_K the mins too.
+
+def _f16(b):
+    return np.ascontiguousarray(b).view(np.float16).astype(np.float32)[..., 0]
+
+
+def parse_q8_0(blocks):
+    """w = s * q, q int8, one scale per 32. -> q (..., n), s (..., n/32)"""
+    d = _f16(blocks[..., :2])
+    q = np.ascontiguousarray(blocks[..., 2:]).view(np.int8)
+    return q.reshape(q.shape[:-2] + (-1,)), d
+
+
+def parse_q4_k(blocks):
+    """w = s*q - m, q in 0..15, one (s, m) per 32 inside 256-superblocks. -> q (..., n), s, m (..., n/32)"""
+    d, dmin = _f16(blocks[..., 0:2]), _f16(blocks[..., 2:4])
+    sc12, qs = blocks[..., 4:16], blocks[..., 16:]
+    sc = np.empty(blocks.shape[:-1] + (8,), np.uint8)
+    mn = np.empty_like(sc)
+    for j in range(8):
+        if j < 4:
+            sc[..., j] = sc12[..., j] & 63
+            mn[..., j] = sc12[..., j + 4] & 63
+        else:
+            sc[..., j] = (sc12[..., j + 4] & 15) | ((sc12[..., j - 4] >> 6) << 4)
+            mn[..., j] = (sc12[..., j + 4] >> 4) | ((sc12[..., j] >> 6) << 4)
+    q = np.empty(blocks.shape[:-1] + (256,), np.uint8)
+    for j in range(4):                                   # 64-element chunks: low nibbles then high nibbles
+        chunk = qs[..., 32 * j:32 * j + 32]
+        q[..., 64 * j:64 * j + 32] = chunk & 15
+        q[..., 64 * j + 32:64 * j + 64] = chunk >> 4
+    s = d[..., None] * sc.astype(np.float32)
+    m = dmin[..., None] * mn.astype(np.float32)
+    return q.reshape(q.shape[:-2] + (-1,)), s.reshape(s.shape[:-2] + (-1,)), m.reshape(m.shape[:-2] + (-1,))
+
+
+def parse_q6_k(blocks):
+    """w = s * (q - 32), q in 0..63, one scale per 16. -> q (..., n), s (..., n/16)"""
+    ql, qh = blocks[..., :128], blocks[..., 128:192]
+    sc = np.ascontiguousarray(blocks[..., 192:208]).view(np.int8).astype(np.float32)
+    d = _f16(blocks[..., 208:210])
+    q = np.empty(blocks.shape[:-1] + (256,), np.uint8)
+    for h in range(2):
+        l = ql[..., 64 * h:64 * h + 64]
+        hh = qh[..., 32 * h:32 * h + 32]
+        q[..., 128 * h:128 * h + 32] = (l[..., :32] & 15) | (((hh >> 0) & 3) << 4)
+        q[..., 128 * h + 32:128 * h + 64] = (l[..., 32:] & 15) | (((hh >> 2) & 3) << 4)
+        q[..., 128 * h + 64:128 * h + 96] = (l[..., :32] >> 4) | (((hh >> 4) & 3) << 4)
+        q[..., 128 * h + 96:128 * h + 128] = (l[..., 32:] >> 4) | (((hh >> 6) & 3) << 4)
+    s = d[..., None] * sc
+    return q.reshape(q.shape[:-2] + (-1,)), s.reshape(s.shape[:-2] + (-1,))
 
 
 class GGUF:
@@ -95,27 +151,14 @@ class GGUF:
             c, d = self.q4_0_parts(name)
             return ((c.astype(np.float32) - 8.0) * d[..., None]).reshape(shape)
         if typ == "Q8_0":
-            b = raw.reshape(-1, 34)
-            d = b[:, :2].copy().view(np.float16).astype(np.float32)
-            q = b[:, 2:].copy().view(np.int8).astype(np.float32)
-            return (q * d).reshape(shape)
+            q, s = parse_q8_0(raw.reshape(-1, 1, 34))
+            return (q.astype(np.float32).reshape(-1, 32) * s.reshape(-1, 1)).reshape(shape)
+        if typ == "Q4_K":
+            q, s, m = parse_q4_k(raw.reshape(-1, 1, 144))
+            return (q.astype(np.float32).reshape(-1, 32) * s.reshape(-1, 1) - m.reshape(-1, 1)).reshape(shape)
         if typ == "Q6_K":
-            b = raw.reshape(-1, 210)
-            ql, qh, sc = b[:, :128], b[:, 128:192], b[:, 192:208].copy().view(np.int8)
-            d = b[:, 208:210].copy().view(np.float16).astype(np.float32)   # (nb,1)
-            out = np.empty((b.shape[0], 256), np.float32)
-            for h in range(2):                                   # two halves of 128
-                l = ql[:, 64 * h:64 * h + 64]
-                hh = qh[:, 32 * h:32 * h + 32]
-                s = sc[:, 8 * h:8 * h + 8].astype(np.float32)
-                q1 = ((l[:, :32] & 15) | (((hh >> 0) & 3) << 4)).astype(np.int32) - 32
-                q2 = ((l[:, 32:] & 15) | (((hh >> 2) & 3) << 4)).astype(np.int32) - 32
-                q3 = ((l[:, :32] >> 4) | (((hh >> 4) & 3) << 4)).astype(np.int32) - 32
-                q4 = ((l[:, 32:] >> 4) | (((hh >> 6) & 3) << 4)).astype(np.int32) - 32
-                for j, q in enumerate((q1, q2, q3, q4)):
-                    sj = np.repeat(s[:, 2 * j:2 * j + 2], 16, axis=1)
-                    out[:, 128 * h + 32 * j:128 * h + 32 * j + 32] = d * sj * q
-            return out.reshape(shape)
+            q, s = parse_q6_k(raw.reshape(-1, 1, 210))
+            return ((q.astype(np.float32) - 32.0).reshape(-1, 16) * s.reshape(-1, 1)).reshape(shape)
         raise NotImplementedError(typ)
 
 
