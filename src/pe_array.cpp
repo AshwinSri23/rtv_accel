@@ -36,6 +36,22 @@ static int8_t clamp8(int32_t v) {
     return static_cast<int8_t>(std::max(-128, std::min(127, v)));
 }
 
+// True when every element of the row compares == 0.0f (so the per-element `a == 0.0f` skip in the GEMM loops would
+// skip all of them). Decode loads one live activation row and zero-fills the other fifteen: this tests a dead row with
+// a few vector compares instead of one scalar load-and-branch per element. Same predicate as the scalar test (-0.0
+// is zero, NaN is not), so results are unchanged.
+static bool row_is_zero(const float* row, uint16_t K) {
+    uint16_t k = 0;
+#ifdef CHIP_SIM_USE_AVX2
+    const __m256 z = _mm256_setzero_ps();
+    for (; k + 8 <= K; k += 8)
+        if (_mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(row + k), z, _CMP_EQ_OQ)) != 0xFF) return false;
+#endif
+    for (; k < K; ++k)
+        if (row[k] != 0.0f) return false;
+    return true;
+}
+
 // ─── COMPUTE_GEMM ─────────────────────────────────────────────────────────────
 
 void PEArray::compute_gemm(MemoryController& mem,
@@ -69,7 +85,7 @@ void PEArray::compute_gemm(MemoryController& mem,
         if (!accumulate)
             std::memset(Cf, 0, static_cast<std::size_t>(nc) * sizeof(float));
         for (uint16_t i = 0; i < M; ++i)
-            for (uint16_t k = 0; k < K; ++k) {
+            for (uint16_t k = row_is_zero(Af + static_cast<std::size_t>(i) * K, K) ? K : 0; k < K; ++k) {
                 const float a = Af[i * K + k];
                 if (a == 0.0f) continue;
                 uint16_t j = 0;
@@ -120,7 +136,7 @@ void PEArray::compute_gemm(MemoryController& mem,
         if (!accumulate)
             std::memset(Cf, 0, static_cast<std::size_t>(nc) * sizeof(float));
         for (uint16_t i = 0; i < M; ++i)
-            for (uint16_t k = 0; k < K; ++k) {
+            for (uint16_t k = row_is_zero(Af + static_cast<std::size_t>(i) * K, K) ? K : 0; k < K; ++k) {
                 const float a = Af[i * K + k];
                 if (a == 0.0f) continue;
                 for (uint16_t j = 0; j < N; ++j) {
@@ -149,7 +165,7 @@ void PEArray::compute_gemm(MemoryController& mem,
         if (!accumulate)
             std::memset(Cf, 0, static_cast<std::size_t>(nc) * sizeof(float));
         for (uint16_t i = 0; i < M; ++i)
-            for (uint16_t k = 0; k < K; ++k) {
+            for (uint16_t k = row_is_zero(Af + static_cast<std::size_t>(i) * K, K) ? K : 0; k < K; ++k) {
                 const float a = Af[i * K + k];
                 if (a == 0.0f) continue;
                 for (uint16_t j = 0; j < N; ++j)
@@ -175,7 +191,7 @@ void PEArray::compute_gemm(MemoryController& mem,
         if (!accumulate)
             std::memset(Cf, 0, static_cast<std::size_t>(nc) * sizeof(float));
         for (uint16_t i = 0; i < M; ++i)
-            for (uint16_t k = 0; k < K; ++k) {
+            for (uint16_t k = row_is_zero(Af + static_cast<std::size_t>(i) * K, K) ? K : 0; k < K; ++k) {
                 const float a = Af[i * K + k];
                 if (a == 0.0f) continue;
                 for (uint16_t j = 0; j < N; ++j)
