@@ -313,6 +313,42 @@ prefill/batched paths, which have real rows.
   changes at KV-tile boundaries (a derived-step cache has to restart there).
 - **Embedding table and lm_head stay on the host** in FP32 (2.9 GB). They are not part of the ISA story at all.
 
+## Where the simulator spends its time (measured 2026-11-06)
+
+`perf stat` on `rtv_sim --serve` while it ran the real Gemma-4-26B (20 s window, one P-core):
+
+| Counter | Value | Reading |
+|---|---|---|
+| instructions per cycle | 5.3 | the core is busy with dense arithmetic, not stalled on memory |
+| dTLB load misses | 0.06% of loads | huge pages would gain nothing |
+| cache misses | ~0.35 G (about 1 GB/s of traffic) | far below memory bandwidth |
+| task-clock | 13.5 s of 20 s | the simulator idles about a third of the time, waiting for the Python driver |
+
+So the simulator is **compute-bound on one core**, not memory-bound and not (as first assumed) dominated by
+instruction decode. It uses one of the machine's 8 cores.
+
+**The INT4W GEMM was scalar code.** `PEArray::compute_gemm` had AVX2 (and NEON) only for the INT8 path; the FP32-activation
+x INT4-weight path that the real model runs, unpacking one nibble per iteration, was a plain loop. The INT4W path now
+processes eight output columns per step (`_mm256_srlv_epi32` to pull eight nibbles out of four bytes, sign-extend by
+xor/sub, convert, multiply by the scale row, multiply by the activation, add into C).
+
+Why the result is bit-identical rather than merely close: every output element still accumulates over K in the same
+order, and each lane does exactly the scalar steps, `a * (float(q) * scale)` then `+=`, as separately rounded
+operations. No FMA is enabled for `rtv_pe` (only `-mavx2`); enabling `-mfma` would let the compiler fuse them and change
+the rounding, so it must stay off here. Checked against the original loop on 32 cases (shapes with N not a multiple of 8,
+with and without accumulate, with zero rows): 0 mismatches.
+
+Microbenchmark, the common decode GEMM (16x64x16, one live row, the other fifteen zero and skipped): 0.98 us -> 0.26 us
+per call, **3.8x**. That is the kernel only; the effect on whole-token time depends on the share of time spent in these
+GEMMs and has to be measured on the model (see TODO.md).
+
+Remaining ideas, in order of expected value: (1) the same vectorisation for the BF16W, INT8W and FP32 paths (they may
+already be auto-vectorised at -O3; not checked); (2) threading the GEMM across output columns, since 7 of 8 cores are
+idle (tiles are 16x16..., so the handoff cost has to be small); (3) an integrated-GPU kernel (shared memory means no copy
+cost, but launch overhead dominates unless many tiles are batched per launch). The Intel NPU is INT8-oriented and does not
+fit the FP32 x INT4-with-group-scale semantics. Two things that were considered and are NOT worth doing: huge pages (TLB
+misses are negligible) and reducing memory traffic (cache-miss traffic is about 1 GB/s).
+
 ## Where to go next
 
 - **`TODO.md`** — the project's running history and roadmap: what's been

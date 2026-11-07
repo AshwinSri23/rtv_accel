@@ -72,7 +72,29 @@ void PEArray::compute_gemm(MemoryController& mem,
             for (uint16_t k = 0; k < K; ++k) {
                 const float a = Af[i * K + k];
                 if (a == 0.0f) continue;
-                for (uint16_t j = 0; j < N; ++j) {
+                uint16_t j = 0;
+#ifdef CHIP_SIM_USE_AVX2
+                // Eight output columns per step. N is even, so k*N is even and every 8-aligned j starts on a
+                // byte boundary: four bytes hold the eight nibbles (low nibble = even column). Per lane the
+                // operations are exactly the scalar ones -- (float(q) * scale) first, then a * that, then +=,
+                // each separately rounded (no FMA is enabled) -- so the result is bit-identical to the loop below.
+                {
+                    const __m256 av = _mm256_set1_ps(a);
+                    const __m256i shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+                    const __m256i lo4 = _mm256_set1_epi32(0xF), eight = _mm256_set1_epi32(8);
+                    float* crow = Cf + static_cast<std::size_t>(i) * N;
+                    for (; j + 8 <= N; j += 8) {
+                        uint32_t packed;
+                        std::memcpy(&packed, Bp + ((static_cast<uint32_t>(k) * N + j) >> 1), 4);
+                        __m256i q = _mm256_and_si256(
+                            _mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(packed)), shifts), lo4);
+                        q = _mm256_sub_epi32(_mm256_xor_si256(q, eight), eight);      // sign-extend the nibble
+                        const __m256 w = _mm256_mul_ps(_mm256_cvtepi32_ps(q), _mm256_loadu_ps(Sf + j));
+                        _mm256_storeu_ps(crow + j, _mm256_add_ps(_mm256_loadu_ps(crow + j), _mm256_mul_ps(av, w)));
+                    }
+                }
+#endif
+                for (; j < N; ++j) {
                     const uint32_t idx = static_cast<uint32_t>(k) * N + j;
                     const uint8_t byte = Bp[idx >> 1];
                     int q = (idx & 1) ? (byte >> 4) : (byte & 0xF);
