@@ -113,6 +113,21 @@ You need: a C++17 compiler and CMake; Python with Apache TVM in a virtual enviro
 root (see `TESTING.md`); and for the big model, the Q4_0 GGUF file, about 16 GB of free disk space for the memory image
 (`~/.cache/rtv_accel`), and roughly 24 GB of free RAM while it runs.
 
+**One-time setup of the Python environment.** The compiler lives in a virtual environment named `.venv-tvm` in the
+repository root. This is how the current one was made (Python 3.14), written down here because the repository has no
+install script:
+
+```
+python3 -m venv --system-site-packages .venv-tvm
+.venv-tvm/bin/pip install apache-tvm==0.26.0 ml_dtypes numpy scipy tokenizers safetensors jinja2 transformers psutil
+```
+
+The environment needs `apache-tvm` (the compiler framework), `numpy`, `tokenizers` and `jinja2` (the chat prompt
+template), `safetensors` (reading Hugging Face checkpoints) and `transformers` (used only for its tokenizer; PyTorch is
+not needed and not installed). Comparisons against Hugging Face's reference model need PyTorch and run in a separate
+environment. I wrote these steps from the existing environment and have not tried them on a clean machine, so expect to
+adjust a version if one is no longer available.
+
 **Build the simulator and run the tests**
 
 ```

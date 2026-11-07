@@ -10,10 +10,16 @@ works) or the spec doc (the exact hardware details).
 This project is two things bolted together: a **simulated chip** (a
 pretend NPU — a "neural processing unit," a chip specialized for the
 matrix math neural networks need) and a **compiler** that takes a real,
-pretrained language model (Qwen3-0.6B, a small but real open-weight LLM)
-and translates it into the raw instructions that pretend chip understands
-— so the whole pipeline can be run and checked, even though the physical
-chip doesn't exist.
+pretrained language model and translates it into the raw instructions
+that pretend chip understands — so the whole pipeline can be run and
+checked, even though the physical chip doesn't exist. Two real models
+have been taken through it: **Qwen3-0.6B**, a small dense model that
+the project started with, and **Gemma-4-26B-A4B**, a 26-billion-parameter
+mixture-of-experts model (128 experts per layer, 8 used per token) that
+is now the main target. `README.md` has the short version of how each
+runs, how to run them, and what has and has not been verified. This
+document is the longer tour; its earlier parts were written around
+Qwen3 and describe the dense path, which the Gemma path reuses.
 
 Think of it like building a video game console emulator (the simulator)
 and a game compiler (the toolchain) for a console that was designed on
