@@ -189,9 +189,13 @@ suite already proves is correct.
 
 ## The one fact that explains almost everything else
 
-**The chip's instruction set has no loops, no branches, and no
-computed/indirect addresses.** Every instruction's exact memory address
-has to be baked in at compile time. This sounds like a strange
+**The chip's instruction set has no loops and no branches, and (apart
+from one narrow exception added later, see below) no computed
+addresses.** Every instruction's exact memory address has to be baked
+in at compile time. The exception is ISA v1.7's `INDIRECT_ADDR`, which
+adds one SRAM-held offset to a load or store address (used for on-device
+top-1 expert routing); it reaches at most about 8 GiB and does not
+change the rest of this section. This sounds like a strange
 limitation, but it's realistic for a certain style of real accelerator
 (some real NPUs work exactly this way, trading flexibility for
 predictability and speed) — and it's the reason for almost every
@@ -312,9 +316,10 @@ prefill/batched paths, which have real rows.
   profile ever shows it matters, a general element-wise function unit is the one hardware change that would pay off.
   Until then it stays composed.
 - **Top-k routing is on the host.** Each layer is two device programs with a host round trip between them (softmax,
-  top-k over 128 experts, renormalise), 60 program launches per token. The on-device path exists only for top-1
-  (`REDUCE_ARGMAX` + `INDIRECT_ADDR`); on-device top-8 would need new hardware (repeated argmax with masking, or a
-  top-k unit), or per-expert predication.
+  top-k over 128 experts, renormalise), 60 program launches per token. The on-device path in the tree exists only for
+  top-1 (`REDUCE_ARGMAX` + `INDIRECT_ADDR`). On-device top-8 was prototyped with the existing instructions (repeated
+  argmax with an indirect-store mask) and worked, but it cannot reach Gemma's experts: see the note on indirect
+  addressing in "Where the simulator spends its time" below.
 - **Sliding window and K=V are compiler constructs**, so they cost nothing in hardware, but the stream's shape
   changes at KV-tile boundaries (a derived-step cache has to restart there).
 - **Embedding table and lm_head stay on the host** in FP32 (2.9 GB). They are not part of the ISA story at all.
