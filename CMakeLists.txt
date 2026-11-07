@@ -148,6 +148,7 @@ if(EXISTS ${RTV_TVM_PY})
         test_stream_cache        # codegen instruction-stream cache: cached == uncached byte for byte
         test_gemma4_model        # tiny random Gemma-4 (sandwich norms, dense+experts, K=V, partial RoPE, softcap) vs Hugging Face
         test_qweights            # Q4_K / Q8_0 / Q6_K style weights as INT4W planes + a group-sum correction (no ISA change)
+        test_moe_ondevice_planar # on-device top-1 MoE routing with planar (K-quant style) experts: one stream, offset on every plane + correction
         test_gemma4_quant_types  # GGUF Q4_K/Q8_0/Q6_K block parsers; whole tiny Gemma-4 on each scheme and a mix, vs dequantised FP32
         test_relocate_fast       # _relocate_instructions (binary search, LOAD/STORE rows only) == the plain mask-per-region algorithm
         test_gemma4_chat         # multi-turn session: reuse the KV cache of a common prefix, rewind on divergence

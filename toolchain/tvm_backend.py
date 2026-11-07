@@ -606,15 +606,19 @@ def group_sum_blob(K, group):
     return int4_weight_blob(g, np.ones((K // GROUP_SUM_BLOB_GROUP, pad), np.float32)), pad
 
 
-def _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr):
+def _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr, indirect_b=None):
     """C = A @ W where W is a quant_planes weight: `spec` = dict(planes=[(blob_addr, group)], corr=(addr, group)|None).
+    indirect_b (ISA v1.7, on-device MoE routing): SRAM address of the uint32 byte offset that selects the expert. It is
+    added to every per-expert load -- each plane and the FP32 correction matrix -- so the caller must lay an expert's
+    planes and correction at the same offsets from its base, with one stride between experts. The group-sum matrix
+    depends only on K, is shared by all experts, and is loaded without the offset.
     Each plane is an ordinary INT4W GEMM; the planes and the correction are summed with FP32 adds. The correction is
     (A @ G) @ C, G the group-membership matrix (compiler.group_sums[(K, group)] -> blob address) and C the FP32
     [Kg_pad, N] matrix at spec["corr"][0]."""
     terms = []
     for i, (addr, group) in enumerate(spec["planes"]):
         out = c_addr if i == 0 else compiler.alloc_staging(compiler.tile_dim * N * 4)
-        _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, addr, out, group)
+        _emit_matmul_int4w_fp32(compiler, M, N, K, a_addr, addr, out, group, indirect_b=indirect_b)
         terms.append(out)
     if spec.get("corr"):
         c_blob, group = spec["corr"]
@@ -624,7 +628,7 @@ def _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr):
         xs = compiler.alloc_staging(Mt * kg * 4)
         _emit_matmul_int4w_fp32(compiler, M, kg, K, a_addr, g_blob, xs, GROUP_SUM_BLOB_GROUP)
         out = compiler.alloc_staging(Mt * N * 4)
-        _emit_matmul_fp32(compiler, Mt, N, kg, xs, c_blob, out)
+        _emit_matmul_fp32(compiler, Mt, N, kg, xs, c_blob, out, indirect_b=indirect_b)
         terms.append(out)
     for extra in terms[1:]:
         _emit_residual_add_fp32(compiler, c_addr, extra, c_addr, N)      # in place
@@ -638,9 +642,7 @@ def _emit_weight_matmul_fp32(compiler, M, N, K, a_addr, w_addr, c_addr):
     ptr = getattr(compiler, "indirect_weights_scalar", None)
     spec = getattr(compiler, "qweights", {}).get(w_addr)
     if spec is not None:                      # Q4_K / Q8_0 / Q6_K weight (quant_planes)
-        if ptr is not None:
-            raise NotImplementedError("planar quantised weights with on-device (indirect) MoE routing")
-        return _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr)
+        return _emit_qweight_matmul(compiler, M, N, K, a_addr, spec, c_addr, indirect_b=ptr)
     if ptr is not None:
         if getattr(compiler, "bf16_weights", False):
             _emit_matmul_bf16w_fp32(compiler, M, N, K, a_addr, w_addr, c_addr, indirect_b=ptr)

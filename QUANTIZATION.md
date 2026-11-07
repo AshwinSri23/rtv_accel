@@ -141,8 +141,11 @@ Q4_0: Q4_K about +25% weight traffic (the correction matrix) and an extra GEMM c
 the traffic of INT8 (they are 8 and 6.5 bits per weight to begin with). Verified: exact to 3e-7 against the dequantised
 matrix on the chip for 1-row and full-tile shapes (`test_qweights`), block parsers equal a per-element loop written
 from the llama.cpp layouts and bit-identical to the `gguf` package, and the whole tiny Gemma-4 with every matrix in one
-scheme or a mix matches the same model with dequantised FP32 weights (`test_gemma4_quant_types`). Not done: on-device
-(indirect) MoE routing with planar weights, Q5_K / Q5_0 / Q4_1 (same method, not needed), and a run on a real K-quant
+scheme or a mix matches the same model with dequantised FP32 weights (`test_gemma4_quant_types`). On-device top-1 MoE routing
+(ISA v1.7) also works with planar experts (`test_moe_ondevice_planar`, error ~4e-7, all experts chosen by one fixed
+stream): the offset register is added to each plane and to the FP32 correction matrix, the group-sum matrix is shared and
+loaded without it, and the layout contract is that an expert's planes and correction sit at the same offsets from its base
+with one stride between experts. Not done: Q5_K / Q5_0 / Q4_1 (same method, not needed), and a run on a real K-quant
 GGUF (none is available locally).
 
 ## 4. Not done
