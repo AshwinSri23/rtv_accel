@@ -102,6 +102,24 @@ def _blob_bytes(K, N, int4_group):
     return tvm_backend.int4_blob_nbytes(K, N, int4_group) if int4_group else K * N * 4
 
 
+def _default_compile_workers(image_bytes):
+    """How many compile-ahead workers to start: at most 3 and at most half the cores, and only as many as the free
+    memory allows once the simulator has loaded the whole DRAM image. A worker on the full 26B model is about 3-4 GB
+    resident (it inherits the placed weights' tables), and on a 31 GB machine three of them next to the 16 GB image
+    ran the machine out of memory and the kernel killed the simulator. 4 GB of margin is kept for everything else."""
+    cap = min(3, max(0, (os.cpu_count() or 1) // 2 - 1))
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) * 1024
+                break
+        else:
+            return cap
+    except OSError:
+        return cap
+    return int(max(0, min(cap, (avail - image_bytes - (4 << 30)) // (5 << 30))))
+
+
 _COMPILE_JOB = None
 
 
@@ -379,7 +397,7 @@ def open_gemma4(source, max_total, sim, hal, verbose=False, int4_group=0, trace=
     # (GIL). They depend only on (layer type, position), never on the token, so forked workers compile the programs
     # of the current and next KV tiles while this process drives the simulator. Workers inherit the placed weights
     # and layer tables copy-on-write; they return only the compiler state a derived step needs.
-    n_workers = int(os.environ.get("RTV_COMPILE_WORKERS", min(3, max(0, (os.cpu_count() or 1) // 2 - 1))))
+    n_workers = int(os.environ.get("RTV_COMPILE_WORKERS", _default_compile_workers(image_bytes)))
     pool, ahead = None, {}
     if reloc and n_workers > 0:
         import concurrent.futures as cf

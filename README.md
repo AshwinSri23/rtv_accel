@@ -146,8 +146,8 @@ and each turn only processes the tokens it has not already seen. An empty line e
 Qwen3-0.6B (it needs the checkpoint downloaded; very slow for all 28 layers).
 
 **Memory note.** The simulator holds the whole 16 GB image. The compiler can also use extra worker processes to compile
-ahead (`RTV_COMPILE_WORKERS`, default up to 3). On a 31 GB machine, set `RTV_COMPILE_WORKERS=0` or `1` for the full
-model, or the system may run out of memory.
+ahead (`RTV_COMPILE_WORKERS`). By default the number is chosen from the free memory (1 for the full model on a 31 GB
+machine, up to 3 for small models); set `RTV_COMPILE_WORKERS=0` to turn them off if memory is tight.
 
 ## What has been verified, and what has not
 
