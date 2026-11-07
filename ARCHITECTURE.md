@@ -363,6 +363,15 @@ share, i.e. a few percent of wall time at best, and each GEMM is so small (0.13 
 than it saves unless many GEMMs were batched per handoff. Not built. The larger remaining lever is the Python side
 (a position-independent attention program would remove the per-tile compile).
 
+On-device top-8 routing was prototyped and then dropped (2026-11-06; the code is in commit 574e341 and reverted in
+4a99261). It works with the existing ISA: k rounds of REDUCE_ARGMAX, each followed by an INDIRECT_ADDR store of -1e30
+that masks the winner, indirect loads of the chosen logits and per-expert scales, a softmax among the k, and each
+weight broadcast to a tile by a GEMM against a ones row; top-8 of 128 matched the host to 2e-6 on one fixed stream
+(`test_moe_topk_ondevice`). It cannot reach Gemma-4-26B's experts: an indirect transfer adds a 32-bit SRAM offset to a
+32-bit instruction address (the `dram_hi` bits hold the pointer's SRAM address), so it addresses at most 8 GiB, while
+the experts are about 14 GB of the 16.5 GB image. Using it for the 26B model would need an ISA change (pointer address
+narrowed to 12 bits so `dram_hi` extends the DRAM address again); nothing a compiler layout can fix.
+
 Two things that were considered and are NOT worth doing: huge pages (TLB
 misses are negligible) and reducing memory traffic (cache-miss traffic is about 1 GB/s).
 
