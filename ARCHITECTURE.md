@@ -346,7 +346,18 @@ Remaining ideas, in order of expected value: (1) the same vectorisation for the 
 already be auto-vectorised at -O3; not checked); (2) threading the GEMM across output columns, since 7 of 8 cores are
 idle (tiles are 16x16..., so the handoff cost has to be small); (3) an integrated-GPU kernel (shared memory means no copy
 cost, but launch overhead dominates unless many tiles are batched per launch). The Intel NPU is INT8-oriented and does not
-fit the FP32 x INT4-with-group-scale semantics. Two things that were considered and are NOT worth doing: huge pages (TLB
+fit the FP32 x INT4-with-group-scale semantics. Measured after the changes above (6-layer / 40-position real-model run, 107 s -> 84 s overall): skipping all-zero
+activation rows (the decode path loads one live row of 16) took the kernel from 0.26 to 0.13 us and the run to 84.5 s;
+one memcpy per contiguous tile load/store changed nothing measurable; link-time optimisation across the decoder,
+dispatcher and simulator (the per-instruction decode and dispatch is about 20% of simulator time) gave 83.4 s -> 82.4 s,
+which is inside run-to-run noise, so it was not adopted. What remains of the simulator is `compute_gemm` (~35%), tile
+copies (~25%) and instruction decode/dispatch (~20%), and the simulator is only about a third of wall time: the rest is
+the Python compiler. Column-parallel threading of the GEMM is therefore bounded by roughly 35% x 2/3 of the simulator
+share, i.e. a few percent of wall time at best, and each GEMM is so small (0.13 us) that thread handoff would cost more
+than it saves unless many GEMMs were batched per handoff. Not built. The larger remaining lever is the Python side
+(a position-independent attention program would remove the per-tile compile).
+
+Two things that were considered and are NOT worth doing: huge pages (TLB
 misses are negligible) and reducing memory traffic (cache-miss traffic is about 1 GB/s).
 
 ## Where to go next
