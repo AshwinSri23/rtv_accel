@@ -37,10 +37,14 @@ void MemoryController::load_tile(uint64_t dram_addr, uint16_t sram_addr,
     if (sram_end > SRAM_BYTES)
         throw std::out_of_range("load_tile: SRAM address out of range");
 
-    for (uint16_t r = 0; r < rows; ++r) {
-        std::memcpy(_sram.data() + sram_addr + r * cols,
-                    _dram.data() + dram_addr + static_cast<std::size_t>(r) * stride,
-                    cols);
+    if (stride == cols) {            // rows are contiguous in both: one copy (the usual weight-tile case)
+        std::memcpy(_sram.data() + sram_addr, _dram.data() + dram_addr, static_cast<std::size_t>(rows) * cols);
+    } else {
+        for (uint16_t r = 0; r < rows; ++r) {
+            std::memcpy(_sram.data() + sram_addr + r * cols,
+                        _dram.data() + dram_addr + static_cast<std::size_t>(r) * stride,
+                        cols);
+        }
     }
     _cycles += _dram_latency + static_cast<uint64_t>(rows) * cols;
 }
@@ -61,10 +65,14 @@ void MemoryController::store_tile(uint16_t sram_addr, uint64_t dram_addr,
             throw std::out_of_range("store_tile: DRAM address out of range");
     }
 
-    for (uint16_t r = 0; r < rows; ++r) {
-        std::memcpy(_dram.data() + dram_addr + static_cast<std::size_t>(r) * stride,
-                    _sram.data() + sram_addr + r * cols,
-                    cols);
+    if (stride == cols) {
+        std::memcpy(_dram.data() + dram_addr, _sram.data() + sram_addr, static_cast<std::size_t>(rows) * cols);
+    } else {
+        for (uint16_t r = 0; r < rows; ++r) {
+            std::memcpy(_dram.data() + dram_addr + static_cast<std::size_t>(r) * stride,
+                        _sram.data() + sram_addr + r * cols,
+                        cols);
+        }
     }
     _cycles += _dram_latency + static_cast<uint64_t>(rows) * cols;
 }
