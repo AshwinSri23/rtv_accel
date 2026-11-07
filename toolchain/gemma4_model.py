@@ -533,6 +533,8 @@ def generate_gemma4(source, prompt_ids, n_new, sim, hal, verbose=False, int4_gro
                 el = time.time() - t0
                 print(f"  scored {pos + 1}/{total} positions, {el / 60:.1f} min elapsed, "
                       f"~{el / (pos + 1) * (total - pos - 1) / 60:.0f} min left at the average pace", file=sys.stderr, flush=True)
+                if os.environ.get("RTV_SCORE_PARTIAL"):      # keep what was scored if the run dies (e.g. OOM)
+                    json.dump(score_out, open(os.environ["RTV_SCORE_PARTIAL"], "w"))
             if score_out is not None and pos + 1 < len(prompt_ids):
                 lg = s.head(h)
                 top = np.argsort(-lg)[:5]
