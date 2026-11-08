@@ -57,7 +57,7 @@ jobs:
         run: |
           python3 -m venv .venv-tvm
           .venv-tvm/bin/pip install --quiet --upgrade pip
-          .venv-tvm/bin/pip install --quiet numpy apache-tvm==0.26.0 tokenizers
+          .venv-tvm/bin/pip install --quiet numpy apache-tvm==0.26.0 "apache-tvm-ffi<0.1.15" tokenizers
 
       - name: Configure
         run: cmake -B build
@@ -91,7 +91,7 @@ jobs:
         run: |
           python3 -m venv .venv-tvm
           .venv-tvm/bin/pip install --quiet --upgrade pip
-          .venv-tvm/bin/pip install --quiet numpy apache-tvm==0.26.0 tokenizers
+          .venv-tvm/bin/pip install --quiet numpy apache-tvm==0.26.0 "apache-tvm-ffi<0.1.15" tokenizers
 
       - name: Configure
         run: cmake -B build

@@ -119,9 +119,10 @@ install script:
 
 ```
 python3 -m venv --system-site-packages .venv-tvm
-.venv-tvm/bin/pip install apache-tvm==0.26.0 ml_dtypes numpy scipy tokenizers safetensors jinja2 transformers psutil
+.venv-tvm/bin/pip install apache-tvm==0.26.0 "apache-tvm-ffi<0.1.15" ml_dtypes numpy scipy tokenizers safetensors jinja2 transformers psutil
 ```
 
+`apache-tvm-ffi` is pinned below 0.1.15 on purpose: 0.1.15 and later crash TVM 0.26.0 (segfault in `Tensorize`).
 The environment needs `apache-tvm` (the compiler framework), `numpy`, `tokenizers` and `jinja2` (the chat prompt
 template), `safetensors` (reading Hugging Face checkpoints) and `transformers` (used only for its tokenizer; PyTorch is
 not needed and not installed). Comparisons against Hugging Face's reference model need PyTorch and run in a separate
